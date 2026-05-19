@@ -6,17 +6,17 @@
 //! > One trait, two backends, zero ceremony.
 //!
 //! Borsalino provides a minimal synchronous GPU compute interface
-//! for the Industrial Algebra ecosystem. Write Metal Shading Language
-//! kernels, dispatch them on Metal or Vulkan hardware, read the results
+//! for the Industrial Algebra ecosystem. Write WGSL compute kernels,
+//! dispatch them on Metal or Vulkan hardware, read the results
 //! back — no bind groups, no pipeline layouts, no descriptor sets.
 //!
 //! ## Design
 //!
 //! - **Synchronous**: `dispatch()` blocks until the GPU finishes.
 //!   No async runtime, no callback hell, no completion handlers.
-//! - **MSL-first**: Kernels are authored in Metal Shading Language.
-//!   The Vulkan backend JIT-translates to SPIR-V via `glslangValidator`
-//!   or a built-in translator (future).
+//! - **WGSL-first**: Kernels are authored in WGSL (WebGPU Shading Language).
+//!   The Metal backend translates to MSL via naga; the Vulkan backend
+//!   translates to SPIR-V via naga.
 //! - **Minimal surface area**: Four operations — create buffers, compile
 //!   shaders, dispatch, read results. That's it.
 //! - **Zero-cost abstraction**: No allocation, no validation, no safety
@@ -27,19 +27,19 @@
 //! ```ignore
 //! use borsalino::GpuBackend;
 //!
-//! // Metal Shading Language kernel source
-//! let msl = r#"
-//!     #include <metal_stdlib>
-//!     using namespace metal;
-//!     kernel void add_one(device const float* input [[buffer(0)]],
-//!                         device float* output [[buffer(1)]],
-//!                         uint id [[thread_position_in_grid]]) {
-//!         output[id] = input[id] + 1.0;
+//! // WGSL compute kernel
+//! let wgsl = r#"
+//!     @compute @workgroup_size(256)
+//!     fn add_one(@builtin(global_invocation_id) gid: vec3<u32>,
+//!                @storage(0) input: array<f32>,
+//!                @storage(1) output: array<f32>) {
+//!         let i = gid.x;
+//!         output[i] = input[i] + 1.0;
 //!     }
 //! "#;
 //!
 //! let mut gpu = borsalino::init()?;
-//! let pipeline = gpu.compile("add_one", msl)?;
+//! let pipeline = gpu.compile("add_one", wgsl)?;
 //! let input = gpu.create_buffer(&[1.0f32, 2.0, 3.0, 4.0])?;
 //! let output = gpu.create_buffer_uninit::<f32>(4)?;
 //! gpu.dispatch(&pipeline, &[&input, &output], (1, 1, 1))?;
@@ -53,11 +53,11 @@
 //! | Feature    | Platform       | Status     |
 //! |------------|----------------|------------|
 //! | `metal`    | macOS          | ✅ Active  |
-//! | `vulkan`   | Linux, Windows | 🔨 Planned |
+//! | `vulkan`   | Linux, Windows | ✅ Active  |
 //!
-//! The Metal backend requires no external dependencies — it calls
-//! the Metal framework directly via `objc_msgSend`. The Vulkan
-//! backend will use `vulkano` for safe Rust wrappers.
+//! The Metal backend requires no external dependencies beyond naga —
+//! it calls the Metal framework directly via `objc_msgSend`.
+//! The Vulkan backend uses `ash` for raw Vulkan FFI.
 //!
 //! ## Safety
 //!
@@ -81,7 +81,7 @@ use std::ffi::c_void;
 
 /// Handle to a compiled compute pipeline.
 ///
-/// Created by [`GpuBackend::compile`] from MSL source. Wraps a
+/// Created by [`GpuBackend::compile`] from WGSL source. Wraps a
 /// backend-specific pipeline object (Metal `MTLComputePipelineState`,
 /// Vulkan `VkPipeline`). Opaque to callers.
 ///
@@ -161,8 +161,8 @@ impl Drop for GpuBuffer {
 /// # Buffer binding
 ///
 /// Buffers are bound by position in the `dispatch` call's `buffers`
-/// slice — `buffers[0]` maps to `[[buffer(0)]]` in MSL, `buffers[1]`
-/// maps to `[[buffer(1)]]`, etc.
+/// slice — `buffers[0]` maps to `@storage(0)` in WGSL, `buffers[1]`
+/// maps to `@storage(1)`, etc.
 ///
 /// # Thread groups
 ///
@@ -177,12 +177,12 @@ pub trait GpuBackend: Sized {
     /// On Vulkan, returns the first available discrete GPU.
     fn init() -> Result<Self>;
 
-    /// Compile Metal Shading Language source into a compute pipeline.
+    /// Compile WGSL source into a compute pipeline.
     ///
-    /// The `entry_point` is the kernel function name in the MSL source.
+    /// The `entry_point` is the kernel function name in the WGSL source.
     /// Compilation happens at call time — cache the [`ComputePipeline`]
     /// if dispatching repeatedly.
-    fn compile(&self, entry_point: &str, msl_source: &str) -> Result<ComputePipeline>;
+    fn compile(&self, entry_point: &str, wgsl_source: &str) -> Result<ComputePipeline>;
 
     /// Allocate a GPU buffer and upload initial data.
     fn create_buffer<T: bytemuck::Pod>(&self, data: &[T]) -> Result<GpuBuffer>;
@@ -196,7 +196,7 @@ pub trait GpuBackend: Sized {
     /// via [`dispatch_ex`](GpuBackend::dispatch_ex).
     ///
     /// Buffers are bound to the kernel in slice order: `buffers[0]`
-    /// → `[[buffer(0)]]`, `buffers[1]` → `[[buffer(1)]]`, etc.
+    /// → `@storage(0)`, `buffers[1]` → `@storage(1)`, etc.
     ///
     /// Blocks until the GPU completes the dispatch and the results
     /// are visible to the CPU.
@@ -234,7 +234,7 @@ impl GpuBackend for VulkanStub {
     fn init() -> Result<Self> {
         Err(GpuError::NoBackend)
     }
-    fn compile(&self, _entry: &str, _msl: &str) -> Result<ComputePipeline> {
+    fn compile(&self, _entry: &str, _wgsl: &str) -> Result<ComputePipeline> {
         Err(GpuError::NoBackend)
     }
     fn create_buffer<T: bytemuck::Pod>(&self, _data: &[T]) -> Result<GpuBuffer> {
@@ -280,7 +280,7 @@ impl GpuBackend for NoBackendStub {
     fn init() -> Result<Self> {
         Err(GpuError::NoBackend)
     }
-    fn compile(&self, _entry: &str, _msl: &str) -> Result<ComputePipeline> {
+    fn compile(&self, _entry: &str, _wgsl: &str) -> Result<ComputePipeline> {
         Err(GpuError::NoBackend)
     }
     fn create_buffer<T: bytemuck::Pod>(&self, _data: &[T]) -> Result<GpuBuffer> {

@@ -12,18 +12,15 @@ categories = ["hardware-support", "mathematics"]
 [features]
 default = []
 metal = []
-vulkan = ["dep:vulkano", "dep:vulkano-shaders"]
+vulkan = ["dep:ash"]
 
 [dependencies]
 thiserror = "2"
 bytemuck = { version = "1", features = ["derive"] }
+naga = { version = "27", features = ["wgsl-in", "spv-out", "msl-out"] }
 
-# Vulkan backend (Linux/Windows)
-vulkano = { version = "0.34", optional = true }
-vulkano-shaders = { version = "0.34", optional = true }
-
-[target.'cfg(target_os = "macos")'.dependencies]
-# Metal backend: raw FFI, no crate dependency.
-# Uses objc_msgSend directly through extern "C" blocks.
+# Vulkan backend (Linux/Windows) — raw FFI via ash
+[target.'cfg(any(target_os = "linux", target_os = "windows"))'.dependencies]
+ash = { version = "0.38", optional = true }
 
 [dev-dependencies]

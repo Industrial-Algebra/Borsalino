@@ -331,7 +331,7 @@ impl GpuBackend for MetalBackend {
         })
     }
 
-    fn compile(&self, entry_point: &str, msl_source: &str) -> Result<ComputePipeline> {
+    fn compile(&self, entry_point: &str, wgsl_source: &str) -> Result<ComputePipeline> {
         let sels = selectors();
         let dev = self.device.ptr.as_ptr();
 
