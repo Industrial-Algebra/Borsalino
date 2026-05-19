@@ -20,8 +20,14 @@
 //! - N× `VkDescriptorSet` (pre-allocated, updated per dispatch)
 //! - 1× `VkCommandPool` with `RESET_COMMAND_BUFFER_BIT`
 
+use naga::back::spv;
+use naga::front::wgsl;
+use naga::valid::{Capabilities, ValidationFlags, Validator};
+
 use ash::vk;
 use ash::Entry;
+
+use std::ffi::CString;
 
 use crate::{ComputePipeline, GpuBuffer, GpuBackend, GpuError, Result};
 
@@ -57,7 +63,6 @@ pub struct VulkanBackend {
     /// Physical device memory properties (for buffer memory type selection).
     memory_properties: vk::PhysicalDeviceMemoryProperties,
     /// Universal pipeline layout — N storage buffer bindings, shared by all pipelines.
-    #[allow(dead_code)]
     pipeline_layout: vk::PipelineLayout,
     /// Descriptor set layout for N storage buffers.
     #[allow(dead_code)]
@@ -121,6 +126,32 @@ impl Drop for VulkanBufferInner {
         }
     }
 }
+
+// ═══════════════════════════════════════════════════════════════════
+// Pipeline inner type
+// ═══════════════════════════════════════════════════════════════════
+
+/// Internal state for a Vulkan compute pipeline, stored behind the opaque
+/// `ComputePipeline.raw` pointer.
+struct VulkanPipelineInner {
+    pipeline: vk::Pipeline,
+    /// Clone of the logical device, used for destroy in drop.
+    device: ash::Device,
+}
+
+/// Drop function stored in [`ComputePipeline`] — destroys the Vulkan pipeline.
+fn drop_vulkan_pipeline(raw: *mut std::ffi::c_void) {
+    if !raw.is_null() {
+        unsafe {
+            let inner = Box::from_raw(raw as *mut VulkanPipelineInner);
+            inner.device.destroy_pipeline(inner.pipeline, None);
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Buffer drop/contents functions
+// ═══════════════════════════════════════════════════════════════════
 
 /// Drop function stored in [`GpuBuffer`] — drops the `Box<VulkanBufferInner>`.
 fn drop_vulkan_buffer(raw: *mut std::ffi::c_void) {
@@ -462,8 +493,94 @@ impl GpuBackend for VulkanBackend {
         })
     }
 
-    fn compile(&self, _entry_point: &str, _wgsl_source: &str) -> Result<ComputePipeline> {
-        todo!("Task 5: shader compilation")
+    fn compile(&self, entry_point: &str, wgsl_source: &str) -> Result<ComputePipeline> {
+        // Step 1: Parse WGSL → naga IR
+        let module = wgsl::parse_str(wgsl_source).map_err(|e| {
+            GpuError::CompileFailed {
+                entry: entry_point.into(),
+                message: e.emit_to_string(wgsl_source),
+            }
+        })?;
+
+        // Step 2: Validate the module
+        let mut validator =
+            Validator::new(ValidationFlags::all(), Capabilities::all());
+        let info = validator.validate(&module).map_err(|e| {
+            GpuError::CompileFailed {
+                entry: entry_point.into(),
+                message: e.emit_to_string(wgsl_source),
+            }
+        })?;
+
+        // Step 3: Emit SPIR-V
+        let spv_words = spv::write_vec(
+            &module,
+            &info,
+            &spv::Options::default(),
+            None,
+        )
+        .map_err(|e| GpuError::CompileFailed {
+            entry: entry_point.into(),
+            message: format!("SPIR-V emission failed: {e}"),
+        })?;
+
+        // Step 4: Create Vulkan shader module
+        let shader_info = vk::ShaderModuleCreateInfo::default()
+            .code(&spv_words);
+
+        let shader_module = unsafe {
+            self.device
+                .create_shader_module(&shader_info, None)
+                .map_err(|e| GpuError::CompileFailed {
+                    entry: entry_point.into(),
+                    message: format!("vkCreateShaderModule: {e}"),
+                })?
+        };
+
+        // Step 5: Create compute pipeline
+        let entry_name =
+            CString::new(entry_point).map_err(|_| GpuError::CompileFailed {
+                entry: entry_point.into(),
+                message: "entry point name contains null byte".into(),
+            })?;
+
+        let stage_info = vk::PipelineShaderStageCreateInfo::default()
+            .module(shader_module)
+            .name(&entry_name)
+            .stage(vk::ShaderStageFlags::COMPUTE);
+
+        let pipeline_info = vk::ComputePipelineCreateInfo::default()
+            .stage(stage_info)
+            .layout(self.pipeline_layout);
+
+        let pipelines = unsafe {
+            self.device
+                .create_compute_pipelines(
+                    vk::PipelineCache::null(),
+                    std::slice::from_ref(&pipeline_info),
+                    None,
+                )
+                .map_err(|(_pipelines, err)| GpuError::PipelineFailed {
+                    entry: entry_point.into(),
+                    message: format!("vkCreateComputePipelines: {err}"),
+                })?
+        };
+
+        // Step 6: Destroy the shader module (pipeline owns the compiled code)
+        unsafe {
+            self.device.destroy_shader_module(shader_module, None);
+        }
+
+        // Step 7: Wrap in opaque handle
+        let inner = Box::new(VulkanPipelineInner {
+            pipeline: pipelines[0],
+            device: self.device.clone(),
+        });
+
+        Ok(ComputePipeline {
+            raw: Box::into_raw(inner) as *mut std::ffi::c_void,
+            drop_fn: drop_vulkan_pipeline,
+        })
     }
 
     fn create_buffer<T: bytemuck::Pod>(&self, data: &[T]) -> Result<GpuBuffer> {
