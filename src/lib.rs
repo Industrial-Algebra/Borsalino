@@ -72,6 +72,8 @@
 mod error;
 #[cfg(all(feature = "metal", target_os = "macos"))]
 mod metal;
+#[cfg(all(feature = "vulkan", not(target_os = "macos")))]
+mod vulkan;
 
 pub use error::{GpuError, Result};
 
@@ -223,47 +225,7 @@ pub trait GpuBackend: Sized {
     fn read_buffer<T: bytemuck::Pod>(&self, buffer: &GpuBuffer) -> Result<Vec<T>>;
 }
 
-// ── Stub backends (compile-time sentinels) ────────────────────────
-
-/// Stub backend for Vulkan — not yet implemented.
-#[cfg(all(feature = "vulkan", not(target_os = "macos")))]
-pub struct VulkanStub;
-
-#[cfg(all(feature = "vulkan", not(target_os = "macos")))]
-impl GpuBackend for VulkanStub {
-    fn init() -> Result<Self> {
-        Err(GpuError::NoBackend)
-    }
-    fn compile(&self, _entry: &str, _wgsl: &str) -> Result<ComputePipeline> {
-        Err(GpuError::NoBackend)
-    }
-    fn create_buffer<T: bytemuck::Pod>(&self, _data: &[T]) -> Result<GpuBuffer> {
-        Err(GpuError::NoBackend)
-    }
-    fn create_buffer_uninit<T: bytemuck::Pod>(&self, _len: usize) -> Result<GpuBuffer> {
-        Err(GpuError::NoBackend)
-    }
-    fn dispatch(
-        &self,
-        _pipeline: &ComputePipeline,
-        _buffers: &[&GpuBuffer],
-        _workgroups: (u32, u32, u32),
-    ) -> Result<()> {
-        Err(GpuError::NoBackend)
-    }
-    fn dispatch_ex(
-        &self,
-        _pipeline: &ComputePipeline,
-        _buffers: &[&GpuBuffer],
-        _workgroups: (u32, u32, u32),
-        _threads_per_group: (u32, u32, u32),
-    ) -> Result<()> {
-        Err(GpuError::NoBackend)
-    }
-    fn read_buffer<T: bytemuck::Pod>(&self, _buffer: &GpuBuffer) -> Result<Vec<T>> {
-        Err(GpuError::NoBackend)
-    }
-}
+// ── Stub backend (compile-time sentinel) ──────────────────────────
 
 /// Stub backend — no GPU backend compiled for this target.
 #[cfg(not(any(
@@ -325,8 +287,8 @@ pub fn init() -> Result<metal::MetalBackend> {
 
 /// Initialise the Vulkan backend (Linux/Windows).
 #[cfg(all(feature = "vulkan", not(target_os = "macos")))]
-pub fn init() -> Result<VulkanStub> {
-    Err(GpuError::NoBackend)
+pub fn init() -> Result<vulkan::VulkanBackend> {
+    vulkan::VulkanBackend::init()
 }
 
 /// Stub backend — returned by `init()` when no GPU backend is available.
