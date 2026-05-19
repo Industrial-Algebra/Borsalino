@@ -53,7 +53,6 @@ pub struct VulkanBackend {
     /// Logical device handle.
     device: ash::Device,
     /// Compute queue handle.
-    #[allow(dead_code)]
     queue: vk::Queue,
     /// Queue family index for the compute queue.
     #[allow(dead_code)]
@@ -68,13 +67,10 @@ pub struct VulkanBackend {
     #[allow(dead_code)]
     descriptor_set_layout: vk::DescriptorSetLayout,
     /// Descriptor pool for storage buffer descriptor sets.
-    #[allow(dead_code)]
     descriptor_pool: vk::DescriptorPool,
-    /// Pre-allocated descriptor sets (one per buffer binding index).
-    #[allow(dead_code)]
-    descriptor_sets: Vec<vk::DescriptorSet>,
+    /// Pre-allocated descriptor set with N storage buffer bindings.
+    descriptor_set: vk::DescriptorSet,
     /// Command pool with `RESET_COMMAND_BUFFER_BIT`.
-    #[allow(dead_code)]
     command_pool: vk::CommandPool,
 }
 
@@ -444,24 +440,19 @@ impl GpuBackend for VulkanBackend {
                 })?
         };
 
-        // ── Pre-allocate descriptor sets ───────────────────────────
-
-        let set_layouts: Vec<vk::DescriptorSetLayout> =
-            (0..Self::MAX_BUFFER_BINDINGS)
-                .map(|_| descriptor_set_layout)
-                .collect();
+        // ── Pre-allocate descriptor set ───────────────────────────
 
         let set_info = vk::DescriptorSetAllocateInfo::default()
             .descriptor_pool(descriptor_pool)
-            .set_layouts(&set_layouts);
+            .set_layouts(std::slice::from_ref(&descriptor_set_layout));
 
-        let descriptor_sets = unsafe {
+        let descriptor_set = unsafe {
             device
                 .allocate_descriptor_sets(&set_info)
                 .map_err(|e| {
-                    GpuError::InitFailed(format!("allocate descriptor sets: {e}"))
+                    GpuError::InitFailed(format!("allocate descriptor set: {e}"))
                 })?
-        };
+        }[0];
 
         // ── Command pool ───────────────────────────────────────────
 
@@ -488,7 +479,7 @@ impl GpuBackend for VulkanBackend {
             pipeline_layout,
             descriptor_set_layout,
             descriptor_pool,
-            descriptor_sets,
+            descriptor_set,
             command_pool,
         })
     }
@@ -686,12 +677,191 @@ impl GpuBackend for VulkanBackend {
 
     fn dispatch_ex(
         &self,
-        _pipeline: &ComputePipeline,
-        _buffers: &[&GpuBuffer],
-        _workgroups: (u32, u32, u32),
+        pipeline: &ComputePipeline,
+        buffers: &[&GpuBuffer],
+        workgroups: (u32, u32, u32),
         _threads_per_group: (u32, u32, u32),
     ) -> Result<()> {
-        todo!("Task 6: dispatch")
+        let nbuffers = buffers.len();
+        if nbuffers > Self::MAX_BUFFER_BINDINGS as usize {
+            return Err(GpuError::InvalidBinding {
+                message: format!(
+                    "{nbuffers} buffers exceeds max {}",
+                    Self::MAX_BUFFER_BINDINGS
+                ),
+            });
+        }
+
+        // ── Allocate command buffer ───────────────────────────────
+
+        let alloc_info = vk::CommandBufferAllocateInfo::default()
+            .command_pool(self.command_pool)
+            .level(vk::CommandBufferLevel::PRIMARY)
+            .command_buffer_count(1);
+
+        let cmd = unsafe {
+            self.device
+                .allocate_command_buffers(&alloc_info)
+                .map_err(|e| GpuError::DispatchFailed {
+                    message: format!("vkAllocateCommandBuffers: {e}"),
+                })?
+        }[0];
+
+        // ── Begin command buffer ──────────────────────────────────
+
+        let begin_info = vk::CommandBufferBeginInfo::default()
+            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+
+        unsafe {
+            self.device
+                .begin_command_buffer(cmd, &begin_info)
+                .map_err(|e| GpuError::DispatchFailed {
+                    message: format!("vkBeginCommandBuffer: {e}"),
+                })?;
+        }
+
+        // ── Bind pipeline ─────────────────────────────────────────
+
+        unsafe {
+            let vk_pipeline =
+                (*(pipeline.raw as *const VulkanPipelineInner)).pipeline;
+            self.device.cmd_bind_pipeline(
+                cmd,
+                vk::PipelineBindPoint::COMPUTE,
+                vk_pipeline,
+            );
+        }
+
+        // ── Update descriptor set + bind ──────────────────────────
+
+        let mut buffer_infos: Vec<vk::DescriptorBufferInfo> =
+            Vec::with_capacity(nbuffers);
+        let mut writes: Vec<vk::WriteDescriptorSet> =
+            Vec::with_capacity(nbuffers);
+
+        // Keep buffer_infos alive on the heap — the writes reference them
+        for buf in buffers.iter() {
+            let inner = unsafe {
+                &*(buf.raw as *const VulkanBufferInner)
+            };
+            buffer_infos.push(
+                vk::DescriptorBufferInfo::default()
+                    .buffer(inner.buffer)
+                    .offset(0)
+                    .range(vk::WHOLE_SIZE),
+            );
+        }
+
+        for (i, buf_info) in buffer_infos.iter().enumerate() {
+            writes.push(
+                vk::WriteDescriptorSet::default()
+                    .dst_set(self.descriptor_set)
+                    .dst_binding(i as u32)
+                    .dst_array_element(0)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .buffer_info(std::slice::from_ref(buf_info)),
+            );
+        }
+
+        unsafe {
+            self.device
+                .update_descriptor_sets(&writes, &[]);
+        }
+
+        unsafe {
+            self.device.cmd_bind_descriptor_sets(
+                cmd,
+                vk::PipelineBindPoint::COMPUTE,
+                self.pipeline_layout,
+                0,
+                std::slice::from_ref(&self.descriptor_set),
+                &[],
+            );
+        }
+
+        // ── Dispatch ──────────────────────────────────────────────
+
+        unsafe {
+            self.device.cmd_dispatch(
+                cmd,
+                workgroups.0,
+                workgroups.1,
+                workgroups.2,
+            );
+        }
+
+        // ── Memory barrier (shader write → host read) ─────────────
+
+        let barrier = vk::MemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+            .dst_access_mask(vk::AccessFlags::HOST_READ);
+
+        unsafe {
+            self.device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::HOST,
+                vk::DependencyFlags::empty(),
+                std::slice::from_ref(&barrier),
+                &[],
+                &[],
+            );
+        }
+
+        // ── End command buffer ────────────────────────────────────
+
+        unsafe {
+            self.device
+                .end_command_buffer(cmd)
+                .map_err(|e| GpuError::DispatchFailed {
+                    message: format!("vkEndCommandBuffer: {e}"),
+                })?;
+        }
+
+        // ── Submit + fence + wait ─────────────────────────────────
+
+        let fence_info = vk::FenceCreateInfo::default();
+        let fence = unsafe {
+            self.device
+                .create_fence(&fence_info, None)
+                .map_err(|e| GpuError::DispatchFailed {
+                    message: format!("vkCreateFence: {e}"),
+                })?
+        };
+
+        let submit_info = vk::SubmitInfo::default()
+            .command_buffers(std::slice::from_ref(&cmd));
+
+        unsafe {
+            self.device
+                .queue_submit(self.queue, &[submit_info], fence)
+                .map_err(|e| GpuError::DispatchFailed {
+                    message: format!("vkQueueSubmit: {e}"),
+                })?;
+
+            self.device
+                .wait_for_fences(
+                    std::slice::from_ref(&fence),
+                    true,
+                    u64::MAX,
+                )
+                .map_err(|e| GpuError::DispatchFailed {
+                    message: format!("vkWaitForFences: {e}"),
+                })?;
+        }
+
+        // ── Cleanup ───────────────────────────────────────────────
+
+        unsafe {
+            self.device
+                .free_command_buffers(
+                    self.command_pool,
+                    std::slice::from_ref(&cmd),
+                );
+            self.device.destroy_fence(fence, None);
+        }
+
+        Ok(())
     }
 
     fn read_buffer<T: bytemuck::Pod>(&self, buffer: &GpuBuffer) -> Result<Vec<T>> {
