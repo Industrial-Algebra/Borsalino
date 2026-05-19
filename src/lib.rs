@@ -1,0 +1,341 @@
+// Copyright (C) 2026 Industrial Algebra
+// SPDX-License-Identifier: AGPL-3.0-only
+
+//! # Borsalino — Thin GPU Compute Abstraction
+//!
+//! > One trait, two backends, zero ceremony.
+//!
+//! Borsalino provides a minimal synchronous GPU compute interface
+//! for the Industrial Algebra ecosystem. Write Metal Shading Language
+//! kernels, dispatch them on Metal or Vulkan hardware, read the results
+//! back — no bind groups, no pipeline layouts, no descriptor sets.
+//!
+//! ## Design
+//!
+//! - **Synchronous**: `dispatch()` blocks until the GPU finishes.
+//!   No async runtime, no callback hell, no completion handlers.
+//! - **MSL-first**: Kernels are authored in Metal Shading Language.
+//!   The Vulkan backend JIT-translates to SPIR-V via `glslangValidator`
+//!   or a built-in translator (future).
+//! - **Minimal surface area**: Four operations — create buffers, compile
+//!   shaders, dispatch, read results. That's it.
+//! - **Zero-cost abstraction**: No allocation, no validation, no safety
+//!   checks beyond what the GPU driver provides.
+//!
+//! ## Quick Start
+//!
+//! ```ignore
+//! use borsalino::GpuBackend;
+//!
+//! // Metal Shading Language kernel source
+//! let msl = r#"
+//!     #include <metal_stdlib>
+//!     using namespace metal;
+//!     kernel void add_one(device const float* input [[buffer(0)]],
+//!                         device float* output [[buffer(1)]],
+//!                         uint id [[thread_position_in_grid]]) {
+//!         output[id] = input[id] + 1.0;
+//!     }
+//! "#;
+//!
+//! let mut gpu = borsalino::init()?;
+//! let pipeline = gpu.compile("add_one", msl)?;
+//! let input = gpu.create_buffer(&[1.0f32, 2.0, 3.0, 4.0])?;
+//! let output = gpu.create_buffer_uninit::<f32>(4)?;
+//! gpu.dispatch(&pipeline, &[&input, &output], (1, 1, 1))?;
+//! let result = gpu.read_buffer(&output)?;
+//! assert_eq!(result, vec![2.0, 3.0, 4.0, 5.0]);
+//! # Ok::<(), borsalino::GpuError>(())
+//! ```
+//!
+//! ## Backends
+//!
+//! | Feature    | Platform       | Status     |
+//! |------------|----------------|------------|
+//! | `metal`    | macOS          | ✅ Active  |
+//! | `vulkan`   | Linux, Windows | 🔨 Planned |
+//!
+//! The Metal backend requires no external dependencies — it calls
+//! the Metal framework directly via `objc_msgSend`. The Vulkan
+//! backend will use `vulkano` for safe Rust wrappers.
+//!
+//! ## Safety
+//!
+//! The GPU driver layer uses `unsafe` for FFI. The public API is
+//! safe — buffer bounds are checked, shader compilation errors
+//! are surfaced as `GpuError`, and dispatch parameters are validated
+//! before hitting the driver.
+
+#![warn(missing_docs)]
+#![warn(clippy::all)]
+
+mod error;
+#[cfg(all(feature = "metal", target_os = "macos"))]
+mod metal;
+
+pub use error::{GpuError, Result};
+
+// ── Opaque handle types ───────────────────────────────────────────
+
+use std::ffi::c_void;
+
+/// Handle to a compiled compute pipeline.
+///
+/// Created by [`GpuBackend::compile`] from MSL source. Wraps a
+/// backend-specific pipeline object (Metal `MTLComputePipelineState`,
+/// Vulkan `VkPipeline`). Opaque to callers.
+///
+/// Pipelines are cheap to clone — the underlying GPU objects
+/// are reference-counted by the backend runtime.
+///
+/// # Drop behaviour
+///
+/// When dropped, the pipeline releases its GPU resources via
+/// the backend-specific drop function stored at construction time.
+pub struct ComputePipeline {
+    pub(crate) raw: *mut c_void,
+    pub(crate) drop_fn: fn(*mut c_void),
+}
+
+impl std::fmt::Debug for ComputePipeline {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ComputePipeline")
+            .field("raw", &self.raw)
+            .finish()
+    }
+}
+
+unsafe impl Send for ComputePipeline {}
+unsafe impl Sync for ComputePipeline {}
+
+impl Drop for ComputePipeline {
+    fn drop(&mut self) {
+        (self.drop_fn)(self.raw);
+    }
+}
+
+/// Handle to a GPU buffer.
+///
+/// Created by [`GpuBackend::create_buffer`] or
+/// [`GpuBackend::create_buffer_uninit`]. Wraps a backend-specific
+/// buffer object (Metal `MTLBuffer`, Vulkan `VkBuffer`).
+///
+/// # Drop behaviour
+///
+/// When dropped, the buffer releases its GPU resources.
+pub struct GpuBuffer {
+    pub(crate) raw: *mut c_void,
+    pub(crate) len: usize,
+    pub(crate) element_size: usize,
+    pub(crate) drop_fn: fn(*mut c_void),
+    #[allow(dead_code)] // Used via dynamic dispatch in backend read_buffer impls
+    pub(crate) contents_fn: fn(*mut c_void) -> *const c_void,
+}
+
+impl std::fmt::Debug for GpuBuffer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GpuBuffer")
+            .field("raw", &self.raw)
+            .field("len", &self.len)
+            .field("element_size", &self.element_size)
+            .finish()
+    }
+}
+
+unsafe impl Send for GpuBuffer {}
+unsafe impl Sync for GpuBuffer {}
+
+impl Drop for GpuBuffer {
+    fn drop(&mut self) {
+        (self.drop_fn)(self.raw);
+    }
+}
+
+// ── Trait ─────────────────────────────────────────────────────────
+
+/// Backend-agnostic GPU compute interface.
+///
+/// Each backend implements this trait. Callers use [`init`] to
+/// get the right backend for the current platform.
+///
+/// # Buffer binding
+///
+/// Buffers are bound by position in the `dispatch` call's `buffers`
+/// slice — `buffers[0]` maps to `[[buffer(0)]]` in MSL, `buffers[1]`
+/// maps to `[[buffer(1)]]`, etc.
+///
+/// # Thread groups
+///
+/// The `workgroups` parameter is `(groups_x, groups_y, groups_z)`.
+/// Each workgroup contains `threads_per_group` threads (default 256).
+/// Use [`dispatch_ex`](GpuBackend::dispatch_ex) to specify a custom
+/// threadgroup size.
+pub trait GpuBackend: Sized {
+    /// Initialise the GPU backend.
+    ///
+    /// On macOS Metal, returns the system default Metal device.
+    /// On Vulkan, returns the first available discrete GPU.
+    fn init() -> Result<Self>;
+
+    /// Compile Metal Shading Language source into a compute pipeline.
+    ///
+    /// The `entry_point` is the kernel function name in the MSL source.
+    /// Compilation happens at call time — cache the [`ComputePipeline`]
+    /// if dispatching repeatedly.
+    fn compile(&self, entry_point: &str, msl_source: &str) -> Result<ComputePipeline>;
+
+    /// Allocate a GPU buffer and upload initial data.
+    fn create_buffer<T: bytemuck::Pod>(&self, data: &[T]) -> Result<GpuBuffer>;
+
+    /// Allocate an uninitialised GPU buffer of `len` elements.
+    fn create_buffer_uninit<T: bytemuck::Pod>(&self, len: usize) -> Result<GpuBuffer>;
+
+    /// Dispatch a compute pipeline across `workgroups` thread groups.
+    ///
+    /// Each workgroup contains 256 threads (1D layout) unless overridden
+    /// via [`dispatch_ex`](GpuBackend::dispatch_ex).
+    ///
+    /// Buffers are bound to the kernel in slice order: `buffers[0]`
+    /// → `[[buffer(0)]]`, `buffers[1]` → `[[buffer(1)]]`, etc.
+    ///
+    /// Blocks until the GPU completes the dispatch and the results
+    /// are visible to the CPU.
+    fn dispatch(
+        &self,
+        pipeline: &ComputePipeline,
+        buffers: &[&GpuBuffer],
+        workgroups: (u32, u32, u32),
+    ) -> Result<()>;
+
+    /// Dispatch with explicit threadgroup size.
+    ///
+    /// Like [`dispatch`](GpuBackend::dispatch), but each workgroup contains
+    /// `threads_per_group` threads rather than the default 256.
+    fn dispatch_ex(
+        &self,
+        pipeline: &ComputePipeline,
+        buffers: &[&GpuBuffer],
+        workgroups: (u32, u32, u32),
+        threads_per_group: (u32, u32, u32),
+    ) -> Result<()>;
+
+    /// Read the contents of a GPU buffer back to the CPU.
+    fn read_buffer<T: bytemuck::Pod>(&self, buffer: &GpuBuffer) -> Result<Vec<T>>;
+}
+
+// ── Stub backends (compile-time sentinels) ────────────────────────
+
+/// Stub backend for Vulkan — not yet implemented.
+#[cfg(all(feature = "vulkan", not(target_os = "macos")))]
+pub struct VulkanStub;
+
+#[cfg(all(feature = "vulkan", not(target_os = "macos")))]
+impl GpuBackend for VulkanStub {
+    fn init() -> Result<Self> {
+        Err(GpuError::NoBackend)
+    }
+    fn compile(&self, _entry: &str, _msl: &str) -> Result<ComputePipeline> {
+        Err(GpuError::NoBackend)
+    }
+    fn create_buffer<T: bytemuck::Pod>(&self, _data: &[T]) -> Result<GpuBuffer> {
+        Err(GpuError::NoBackend)
+    }
+    fn create_buffer_uninit<T: bytemuck::Pod>(&self, _len: usize) -> Result<GpuBuffer> {
+        Err(GpuError::NoBackend)
+    }
+    fn dispatch(
+        &self,
+        _pipeline: &ComputePipeline,
+        _buffers: &[&GpuBuffer],
+        _workgroups: (u32, u32, u32),
+    ) -> Result<()> {
+        Err(GpuError::NoBackend)
+    }
+    fn dispatch_ex(
+        &self,
+        _pipeline: &ComputePipeline,
+        _buffers: &[&GpuBuffer],
+        _workgroups: (u32, u32, u32),
+        _threads_per_group: (u32, u32, u32),
+    ) -> Result<()> {
+        Err(GpuError::NoBackend)
+    }
+    fn read_buffer<T: bytemuck::Pod>(&self, _buffer: &GpuBuffer) -> Result<Vec<T>> {
+        Err(GpuError::NoBackend)
+    }
+}
+
+/// Stub backend — no GPU backend compiled for this target.
+#[cfg(not(any(
+    all(feature = "metal", target_os = "macos"),
+    all(feature = "vulkan", not(target_os = "macos"))
+)))]
+pub struct NoBackendStub;
+
+#[cfg(not(any(
+    all(feature = "metal", target_os = "macos"),
+    all(feature = "vulkan", not(target_os = "macos"))
+)))]
+impl GpuBackend for NoBackendStub {
+    fn init() -> Result<Self> {
+        Err(GpuError::NoBackend)
+    }
+    fn compile(&self, _entry: &str, _msl: &str) -> Result<ComputePipeline> {
+        Err(GpuError::NoBackend)
+    }
+    fn create_buffer<T: bytemuck::Pod>(&self, _data: &[T]) -> Result<GpuBuffer> {
+        Err(GpuError::NoBackend)
+    }
+    fn create_buffer_uninit<T: bytemuck::Pod>(&self, _len: usize) -> Result<GpuBuffer> {
+        Err(GpuError::NoBackend)
+    }
+    fn dispatch(
+        &self,
+        _pipeline: &ComputePipeline,
+        _buffers: &[&GpuBuffer],
+        _workgroups: (u32, u32, u32),
+    ) -> Result<()> {
+        Err(GpuError::NoBackend)
+    }
+    fn dispatch_ex(
+        &self,
+        _pipeline: &ComputePipeline,
+        _buffers: &[&GpuBuffer],
+        _workgroups: (u32, u32, u32),
+        _threads_per_group: (u32, u32, u32),
+    ) -> Result<()> {
+        Err(GpuError::NoBackend)
+    }
+    fn read_buffer<T: bytemuck::Pod>(&self, _buffer: &GpuBuffer) -> Result<Vec<T>> {
+        Err(GpuError::NoBackend)
+    }
+}
+
+// ── Top-level initialiser ─────────────────────────────────────────
+
+/// Initialise the best available GPU backend for the current platform.
+///
+/// - macOS: Metal (requires `metal` feature, enabled by default on macOS)
+/// - Linux/Windows: Vulkan (requires `vulkan` feature)
+/// - Otherwise: returns [`GpuError::NoBackend`]
+#[cfg(all(feature = "metal", target_os = "macos"))]
+pub fn init() -> Result<metal::MetalBackend> {
+    metal::MetalBackend::init()
+}
+
+/// Initialise the Vulkan backend (Linux/Windows).
+#[cfg(all(feature = "vulkan", not(target_os = "macos")))]
+pub fn init() -> Result<VulkanStub> {
+    Err(GpuError::NoBackend)
+}
+
+/// Stub backend — returned by `init()` when no GPU backend is available.
+/// Exists solely to give `Result<impl GpuBackend>` a concrete type in
+/// the fallback compilation path.
+#[cfg(not(any(
+    all(feature = "metal", target_os = "macos"),
+    all(feature = "vulkan", not(target_os = "macos"))
+)))]
+pub fn init() -> Result<NoBackendStub> {
+    Err(GpuError::NoBackend)
+}

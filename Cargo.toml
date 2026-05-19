@@ -1,0 +1,29 @@
+[package]
+name = "borsalino"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Thin GPU compute abstraction — Metal and Vulkan backends for Industrial Algebra"
+license = "AGPL-3.0-only"
+repository = "https://github.com/industrial-algebra/Borsalino"
+keywords = ["gpu", "compute", "metal", "vulkan", "shader"]
+categories = ["hardware-support", "mathematics"]
+
+[features]
+default = []
+metal = []
+vulkan = ["dep:vulkano", "dep:vulkano-shaders"]
+
+[dependencies]
+thiserror = "2"
+bytemuck = { version = "1", features = ["derive"] }
+
+# Vulkan backend (Linux/Windows)
+vulkano = { version = "0.34", optional = true }
+vulkano-shaders = { version = "0.34", optional = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# Metal backend: raw FFI, no crate dependency.
+# Uses objc_msgSend directly through extern "C" blocks.
+
+[dev-dependencies]
