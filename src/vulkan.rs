@@ -44,9 +44,6 @@ pub struct VulkanBackend {
     _entry: Entry,
     /// Vulkan instance handle.
     instance: ash::Instance,
-    /// Selected physical device.
-    #[allow(dead_code)]
-    physical_device: vk::PhysicalDevice,
     /// Logical device handle.
     device: ash::Device,
     /// Compute queue handle.
@@ -55,6 +52,10 @@ pub struct VulkanBackend {
     /// Queue family index for the compute queue.
     #[allow(dead_code)]
     queue_family_index: u32,
+    /// Minimum storage buffer offset alignment (from device limits).
+    min_storage_buffer_offset_alignment: vk::DeviceSize,
+    /// Physical device memory properties (for buffer memory type selection).
+    memory_properties: vk::PhysicalDeviceMemoryProperties,
     /// Universal pipeline layout — N storage buffer bindings, shared by all pipelines.
     #[allow(dead_code)]
     pipeline_layout: vk::PipelineLayout,
@@ -90,6 +91,54 @@ impl Drop for VulkanBackend {
             self.instance.destroy_instance(None);
         }
     }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Buffer inner type
+// ═══════════════════════════════════════════════════════════════════
+
+/// Internal state for a Vulkan GPU buffer, stored behind the opaque
+/// `GpuBuffer.raw` pointer.
+struct VulkanBufferInner {
+    buffer: vk::Buffer,
+    memory: vk::DeviceMemory,
+    _size: vk::DeviceSize,
+    /// Persistently mapped host pointer. Valid until the buffer is dropped.
+    mapped: *mut std::ffi::c_void,
+    /// Clone of the logical device, used for destroy / unmap in drop.
+    device: ash::Device,
+}
+
+unsafe impl Send for VulkanBufferInner {}
+unsafe impl Sync for VulkanBufferInner {}
+
+impl Drop for VulkanBufferInner {
+    fn drop(&mut self) {
+        unsafe {
+            // vkFreeMemory implicitly unmaps
+            self.device.destroy_buffer(self.buffer, None);
+            self.device.free_memory(self.memory, None);
+        }
+    }
+}
+
+/// Drop function stored in [`GpuBuffer`] — drops the `Box<VulkanBufferInner>`.
+fn drop_vulkan_buffer(raw: *mut std::ffi::c_void) {
+    if !raw.is_null() {
+        unsafe {
+            drop(Box::from_raw(raw as *mut VulkanBufferInner));
+        }
+    }
+}
+
+/// Contents function stored in [`GpuBuffer`] — returns the persistently
+/// mapped host pointer.
+fn contents_vulkan_buffer(raw: *mut std::ffi::c_void) -> *const std::ffi::c_void {
+    if raw.is_null() {
+        return std::ptr::null();
+    }
+    let inner = unsafe { &*(raw as *const VulkanBufferInner) };
+    inner.mapped
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -176,6 +225,97 @@ unsafe fn create_device(
 }
 
 // ═══════════════════════════════════════════════════════════════════
+// Buffer helpers
+// ═══════════════════════════════════════════════════════════════════
+
+/// Round `val` up to the nearest multiple of `alignment`.
+fn align_up(val: vk::DeviceSize, alignment: vk::DeviceSize) -> vk::DeviceSize {
+    val.div_ceil(alignment) * alignment
+}
+
+/// Find a memory type index that satisfies the required type filter and
+/// desired property flags.
+fn find_memory_type_index(
+    memory_properties: &vk::PhysicalDeviceMemoryProperties,
+    type_filter: u32,
+    required_properties: vk::MemoryPropertyFlags,
+) -> Result<u32> {
+    for i in 0..memory_properties.memory_type_count {
+        if (type_filter & (1 << i)) != 0
+            && memory_properties.memory_types[i as usize]
+                .property_flags
+                .contains(required_properties)
+        {
+            return Ok(i);
+        }
+    }
+    Err(GpuError::BufferCreationFailed {
+        message: "no suitable memory type found".into(),
+    })
+}
+
+/// Allocate a Vulkan buffer with the given size and usage flags.
+///
+/// Returns `(buffer, memory, mapped_ptr)`.
+unsafe fn allocate_buffer(
+    device: &ash::Device,
+    memory_properties: &vk::PhysicalDeviceMemoryProperties,
+    size: vk::DeviceSize,
+    usage: vk::BufferUsageFlags,
+) -> Result<(vk::Buffer, vk::DeviceMemory, *mut std::ffi::c_void)> {
+    let buffer_info = vk::BufferCreateInfo::default()
+        .size(size)
+        .usage(usage)
+        .sharing_mode(vk::SharingMode::EXCLUSIVE);
+
+    let buffer = unsafe {
+        device
+            .create_buffer(&buffer_info, None)
+            .map_err(|e| GpuError::BufferCreationFailed {
+                message: format!("vkCreateBuffer: {e}"),
+            })?
+    };
+
+    let mem_reqs = unsafe { device.get_buffer_memory_requirements(buffer) };
+
+    let mem_type_index = find_memory_type_index(
+        memory_properties,
+        mem_reqs.memory_type_bits,
+        vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+    )?;
+
+    let alloc_info = vk::MemoryAllocateInfo::default()
+        .allocation_size(mem_reqs.size)
+        .memory_type_index(mem_type_index);
+
+    let memory = unsafe {
+        device
+            .allocate_memory(&alloc_info, None)
+            .map_err(|e| GpuError::BufferCreationFailed {
+                message: format!("vkAllocateMemory: {e}"),
+            })?
+    };
+
+    unsafe {
+        device
+            .bind_buffer_memory(buffer, memory, 0)
+            .map_err(|e| GpuError::BufferCreationFailed {
+                message: format!("vkBindBufferMemory: {e}"),
+            })?;
+    }
+
+    let mapped = unsafe {
+        device
+            .map_memory(memory, 0, size, vk::MemoryMapFlags::empty())
+            .map_err(|e| GpuError::BufferCreationFailed {
+                message: format!("vkMapMemory: {e}"),
+            })?
+    };
+
+    Ok((buffer, memory, mapped))
+}
+
+// ═══════════════════════════════════════════════════════════════════
 // GpuBackend implementation
 // ═══════════════════════════════════════════════════════════════════
 
@@ -205,21 +345,31 @@ impl GpuBackend for VulkanBackend {
         let (physical_device, queue_family_index) =
             unsafe { pick_physical_device(&instance)? };
 
+        // Query device properties before creating logical device
+        let device_props =
+            unsafe { instance.get_physical_device_properties(physical_device) };
+        let memory_properties = unsafe {
+            instance.get_physical_device_memory_properties(physical_device)
+        };
+        let min_storage_buffer_offset_alignment =
+            device_props.limits.min_storage_buffer_offset_alignment;
+
         let (device, queue) = unsafe {
             create_device(&instance, physical_device, queue_family_index)?
         };
 
         // ── Descriptor set layout (N storage buffers) ──────────────
 
-        let bindings: Vec<vk::DescriptorSetLayoutBinding> = (0..Self::MAX_BUFFER_BINDINGS)
-            .map(|i| {
-                vk::DescriptorSetLayoutBinding::default()
-                    .binding(i)
-                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                    .descriptor_count(1)
-                    .stage_flags(vk::ShaderStageFlags::COMPUTE)
-            })
-            .collect();
+        let bindings: Vec<vk::DescriptorSetLayoutBinding> =
+            (0..Self::MAX_BUFFER_BINDINGS)
+                .map(|i| {
+                    vk::DescriptorSetLayoutBinding::default()
+                        .binding(i)
+                        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                        .descriptor_count(1)
+                        .stage_flags(vk::ShaderStageFlags::COMPUTE)
+                })
+                .collect();
 
         let dsl_info =
             vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
@@ -299,10 +449,11 @@ impl GpuBackend for VulkanBackend {
         Ok(Self {
             _entry: entry,
             instance,
-            physical_device,
             device,
             queue,
             queue_family_index,
+            min_storage_buffer_offset_alignment,
+            memory_properties,
             pipeline_layout,
             descriptor_set_layout,
             descriptor_pool,
@@ -315,12 +466,96 @@ impl GpuBackend for VulkanBackend {
         todo!("Task 5: shader compilation")
     }
 
-    fn create_buffer<T: bytemuck::Pod>(&self, _data: &[T]) -> Result<GpuBuffer> {
-        todo!("Task 4: buffer lifecycle")
+    fn create_buffer<T: bytemuck::Pod>(&self, data: &[T]) -> Result<GpuBuffer> {
+        let element_size = std::mem::size_of::<T>();
+        let byte_len = std::mem::size_of_val(data) as vk::DeviceSize;
+
+        // Pad to satisfy minStorageBufferOffsetAlignment
+        let aligned_size = if byte_len == 0 {
+            self.min_storage_buffer_offset_alignment
+        } else {
+            align_up(byte_len, self.min_storage_buffer_offset_alignment)
+        };
+
+        let usage = vk::BufferUsageFlags::STORAGE_BUFFER
+            | vk::BufferUsageFlags::TRANSFER_SRC
+            | vk::BufferUsageFlags::TRANSFER_DST;
+
+        let (buffer, memory, mapped) = unsafe {
+            allocate_buffer(
+                &self.device,
+                &self.memory_properties,
+                aligned_size,
+                usage,
+            )?
+        };
+
+        // Upload initial data
+        if byte_len > 0 {
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    data.as_ptr() as *const std::ffi::c_void,
+                    mapped,
+                    byte_len as usize,
+                );
+            }
+        }
+
+        let inner = Box::new(VulkanBufferInner {
+            buffer,
+            memory,
+            _size: aligned_size,
+            mapped,
+            device: self.device.clone(),
+        });
+
+        Ok(GpuBuffer {
+            raw: Box::into_raw(inner) as *mut std::ffi::c_void,
+            len: data.len(),
+            element_size,
+            drop_fn: drop_vulkan_buffer,
+            contents_fn: contents_vulkan_buffer,
+        })
     }
 
-    fn create_buffer_uninit<T: bytemuck::Pod>(&self, _len: usize) -> Result<GpuBuffer> {
-        todo!("Task 4: buffer lifecycle")
+    fn create_buffer_uninit<T: bytemuck::Pod>(&self, len: usize) -> Result<GpuBuffer> {
+        let element_size = std::mem::size_of::<T>();
+        let byte_len = (len * element_size) as vk::DeviceSize;
+
+        let aligned_size = if byte_len == 0 {
+            self.min_storage_buffer_offset_alignment
+        } else {
+            align_up(byte_len, self.min_storage_buffer_offset_alignment)
+        };
+
+        let usage = vk::BufferUsageFlags::STORAGE_BUFFER
+            | vk::BufferUsageFlags::TRANSFER_SRC
+            | vk::BufferUsageFlags::TRANSFER_DST;
+
+        let (buffer, memory, mapped) = unsafe {
+            allocate_buffer(
+                &self.device,
+                &self.memory_properties,
+                aligned_size,
+                usage,
+            )?
+        };
+
+        let inner = Box::new(VulkanBufferInner {
+            buffer,
+            memory,
+            _size: aligned_size,
+            mapped,
+            device: self.device.clone(),
+        });
+
+        Ok(GpuBuffer {
+            raw: Box::into_raw(inner) as *mut std::ffi::c_void,
+            len,
+            element_size,
+            drop_fn: drop_vulkan_buffer,
+            contents_fn: contents_vulkan_buffer,
+        })
     }
 
     fn dispatch(
@@ -342,7 +577,15 @@ impl GpuBackend for VulkanBackend {
         todo!("Task 6: dispatch")
     }
 
-    fn read_buffer<T: bytemuck::Pod>(&self, _buffer: &GpuBuffer) -> Result<Vec<T>> {
-        todo!("Task 4: buffer lifecycle")
+    fn read_buffer<T: bytemuck::Pod>(&self, buffer: &GpuBuffer) -> Result<Vec<T>> {
+        let contents = (buffer.contents_fn)(buffer.raw) as *const T;
+        if contents.is_null() {
+            return Err(GpuError::BufferReadFailed {
+                message: "buffer contents pointer is null".into(),
+            });
+        }
+        let slice =
+            unsafe { std::slice::from_raw_parts(contents, buffer.len) };
+        Ok(slice.to_vec())
     }
 }
