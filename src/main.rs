@@ -5,7 +5,8 @@
 //!
 //! Run with:
 //! ```sh
-//! cargo run --features metal
+//! cargo run --features metal    # macOS
+//! cargo run --features vulkan   # Linux/Windows
 //! ```
 
 use borsalino::GpuBackend;
@@ -13,14 +14,14 @@ use borsalino::GpuBackend;
 fn main() -> Result<(), borsalino::GpuError> {
     let gpu = borsalino::init()?;
 
-    let msl = r#"
-        #include <metal_stdlib>
-        using namespace metal;
-        kernel void saxpy(device const float* x    [[buffer(0)]],
-                          device const float* y    [[buffer(1)]],
-                          device float*       out  [[buffer(2)]],
-                          uint id [[thread_position_in_grid]]) {
-            out[id] = 2.5 * x[id] + y[id];
+    let wgsl = r#"
+        @compute @workgroup_size(256)
+        fn saxpy(@builtin(global_invocation_id) gid: vec3<u32>,
+                 @storage(0) x: array<f32>,
+                 @storage(1) y: array<f32>,
+                 @storage(2) out: array<f32>) {
+            let i = gid.x;
+            out[i] = 2.5 * x[i] + y[i];
         }
     "#;
 
@@ -33,7 +34,7 @@ fn main() -> Result<(), borsalino::GpuError> {
         .map(|(xi, yi)| 2.5 * xi + yi)
         .collect();
 
-    let pipeline = gpu.compile("saxpy", msl)?;
+    let pipeline = gpu.compile("saxpy", wgsl)?;
     let buf_x = gpu.create_buffer(&x)?;
     let buf_y = gpu.create_buffer(&y)?;
     let buf_out = gpu.create_buffer_uninit::<f32>(n)?;

@@ -8,7 +8,7 @@
 //!
 //! ## FFI surface
 //!
-//! 3 extern functions, 19 selectors, 0 crate dependencies.
+//! 3 extern functions, 19 selectors, 1 crate dependency (naga for WGSL→MSL translation).
 //!
 //! | Function | Role |
 //! |----------|------|
@@ -19,6 +19,10 @@
 
 use std::ffi::{c_void, CString};
 use std::ptr::NonNull;
+
+use naga::back::msl;
+use naga::front::wgsl;
+use naga::valid::{Capabilities, ValidationFlags, Validator};
 
 use crate::{ComputePipeline, GpuBuffer, GpuBackend, GpuError, Result};
 
@@ -332,12 +336,35 @@ impl GpuBackend for MetalBackend {
     }
 
     fn compile(&self, entry_point: &str, wgsl_source: &str) -> Result<ComputePipeline> {
+        // Step 0: Translate WGSL → MSL via naga
+        let module = wgsl::parse_str(wgsl_source).map_err(|e| GpuError::CompileFailed {
+            entry: entry_point.into(),
+            message: e.emit_to_string(wgsl_source),
+        })?;
+
+        let mut validator = Validator::new(ValidationFlags::all(), Capabilities::all());
+        let info = validator.validate(&module).map_err(|e| GpuError::CompileFailed {
+            entry: entry_point.into(),
+            message: e.emit_to_string(wgsl_source),
+        })?;
+
+        let (msl_source, _) = msl::write_string(
+            &module,
+            &info,
+            &msl::Options::default(),
+            &msl::PipelineOptions::default(),
+        )
+        .map_err(|e| GpuError::CompileFailed {
+            entry: entry_point.into(),
+            message: format!("MSL emission failed: {e}"),
+        })?;
+
         let sels = selectors();
         let dev = self.device.ptr.as_ptr();
 
         unsafe {
             // Step 1: MTLLibrary from source
-            let ns_src = nsstring(msl_source);
+            let ns_src = nsstring(&msl_source);
             let mut err: *mut c_void = std::ptr::null_mut();
             let library = msg_new_library(
                 dev,
@@ -586,17 +613,17 @@ mod tests {
             }
         };
 
-        let msl = r#"
-            #include <metal_stdlib>
-            using namespace metal;
-            kernel void add_one(device const float* input  [[buffer(0)]],
-                                device float*       output [[buffer(1)]],
-                                uint id [[thread_position_in_grid]]) {
-                output[id] = input[id] + 1.0;
+        let wgsl = r#"
+            @compute @workgroup_size(256)
+            fn add_one(@builtin(global_invocation_id) gid: vec3<u32>,
+                       @storage(0) input: array<f32>,
+                       @storage(1) output: array<f32>) {
+                let i = gid.x;
+                output[i] = input[i] + 1.0;
             }
         "#;
 
-        let pipeline = backend.compile("add_one", msl).unwrap();
+        let pipeline = backend.compile("add_one", wgsl).unwrap();
         let input = backend.create_buffer(&[1.0f32, 2.0, 3.0, 4.0]).unwrap();
         let output = backend.create_buffer_uninit::<f32>(4).unwrap();
         backend
@@ -617,13 +644,13 @@ mod tests {
             }
         };
 
-        let msl = r#"
-            #include <metal_stdlib>
-            using namespace metal;
-            kernel void scale(device const float* input  [[buffer(0)]],
-                              device float*       output [[buffer(1)]],
-                              uint id [[thread_position_in_grid]]) {
-                output[id] = input[id] * 2.5;
+        let wgsl = r#"
+            @compute @workgroup_size(256)
+            fn scale(@builtin(global_invocation_id) gid: vec3<u32>,
+                     @storage(0) input: array<f32>,
+                     @storage(1) output: array<f32>) {
+                let i = gid.x;
+                output[i] = input[i] * 2.5;
             }
         "#;
 
@@ -631,7 +658,7 @@ mod tests {
         let input_data: Vec<f32> = (0..n).map(|i| i as f32).collect();
         let expected: Vec<f32> = input_data.iter().map(|x| x * 2.5).collect();
 
-        let pipeline = backend.compile("scale", msl).unwrap();
+        let pipeline = backend.compile("scale", wgsl).unwrap();
         let input = backend.create_buffer(&input_data).unwrap();
         let output = backend.create_buffer_uninit::<f32>(n).unwrap();
 
