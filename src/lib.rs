@@ -29,10 +29,11 @@
 //!
 //! // WGSL compute kernel
 //! let wgsl = r#"
+//!     @group(0) @binding(0) var<storage, read> input: array<f32>;
+//!     @group(0) @binding(1) var<storage, read_write> output: array<f32>;
+//!
 //!     @compute @workgroup_size(256)
-//!     fn add_one(@builtin(global_invocation_id) gid: vec3<u32>,
-//!                @storage(0) input: array<f32>,
-//!                @storage(1) output: array<f32>) {
+//!     fn add_one(@builtin(global_invocation_id) gid: vec3<u32>) {
 //!         let i = gid.x;
 //!         output[i] = input[i] + 1.0;
 //!     }
@@ -163,8 +164,8 @@ impl Drop for GpuBuffer {
 /// # Buffer binding
 ///
 /// Buffers are bound by position in the `dispatch` call's `buffers`
-/// slice — `buffers[0]` maps to `@storage(0)` in WGSL, `buffers[1]`
-/// maps to `@storage(1)`, etc.
+/// slice — `buffers[0]` maps to `@group(0) @binding(0)` in WGSL,
+/// `buffers[1]` maps to `@group(0) @binding(1)`, etc.
 ///
 /// # Thread groups
 ///
@@ -198,7 +199,7 @@ pub trait GpuBackend: Sized {
     /// via [`dispatch_ex`](GpuBackend::dispatch_ex).
     ///
     /// Buffers are bound to the kernel in slice order: `buffers[0]`
-    /// → `@storage(0)`, `buffers[1]` → `@storage(1)`, etc.
+    /// → `@group(0) @binding(0)`, `buffers[1]` → `@group(0) @binding(1)`, etc.
     ///
     /// Blocks until the GPU completes the dispatch and the results
     /// are visible to the CPU.

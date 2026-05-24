@@ -614,10 +614,11 @@ mod tests {
         };
 
         let wgsl = r#"
+            @group(0) @binding(0) var<storage, read> input: array<f32>;
+            @group(0) @binding(1) var<storage, read_write> output: array<f32>;
+
             @compute @workgroup_size(256)
-            fn add_one(@builtin(global_invocation_id) gid: vec3<u32>,
-                       @storage(0) input: array<f32>,
-                       @storage(1) output: array<f32>) {
+            fn add_one(@builtin(global_invocation_id) gid: vec3<u32>) {
                 let i = gid.x;
                 output[i] = input[i] + 1.0;
             }
@@ -645,10 +646,11 @@ mod tests {
         };
 
         let wgsl = r#"
+            @group(0) @binding(0) var<storage, read> input: array<f32>;
+            @group(0) @binding(1) var<storage, read_write> output: array<f32>;
+
             @compute @workgroup_size(256)
-            fn scale(@builtin(global_invocation_id) gid: vec3<u32>,
-                     @storage(0) input: array<f32>,
-                     @storage(1) output: array<f32>) {
+            fn scale(@builtin(global_invocation_id) gid: vec3<u32>) {
                 let i = gid.x;
                 output[i] = input[i] * 2.5;
             }

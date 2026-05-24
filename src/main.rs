@@ -15,11 +15,12 @@ fn main() -> Result<(), borsalino::GpuError> {
     let gpu = borsalino::init()?;
 
     let wgsl = r#"
+        @group(0) @binding(0) var<storage, read> x: array<f32>;
+        @group(0) @binding(1) var<storage, read> y: array<f32>;
+        @group(0) @binding(2) var<storage, read_write> out: array<f32>;
+
         @compute @workgroup_size(256)
-        fn saxpy(@builtin(global_invocation_id) gid: vec3<u32>,
-                 @storage(0) x: array<f32>,
-                 @storage(1) y: array<f32>,
-                 @storage(2) out: array<f32>) {
+        fn saxpy(@builtin(global_invocation_id) gid: vec3<u32>) {
             let i = gid.x;
             out[i] = 2.5 * x[i] + y[i];
         }

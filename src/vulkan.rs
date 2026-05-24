@@ -876,3 +876,135 @@ impl GpuBackend for VulkanBackend {
         Ok(slice.to_vec())
     }
 }
+
+// ═══════════════════════════════════════════════════════════════════
+// Tests
+// ═══════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn device_init() {
+        match VulkanBackend::init() {
+            Ok(_) => {}
+            Err(GpuError::InitFailed(msg)) => {
+                eprintln!("Vulkan init failed (expected in CI/headless): {msg}");
+            }
+            Err(GpuError::NoBackend) => {
+                eprintln!("no Vulkan backend (expected on macOS)");
+            }
+            Err(e) => panic!("unexpected error: {e}"),
+        }
+    }
+
+    #[test]
+    fn add_one_kernel() {
+        let backend = match VulkanBackend::init() {
+            Ok(b) => b,
+            Err(_) => {
+                eprintln!("skipping: no Vulkan device");
+                return;
+            }
+        };
+
+        let wgsl = r#"
+            @group(0) @binding(0) var<storage, read> input: array<f32>;
+            @group(0) @binding(1) var<storage, read_write> output: array<f32>;
+
+            @compute @workgroup_size(256)
+            fn add_one(@builtin(global_invocation_id) gid: vec3<u32>) {
+                let i = gid.x;
+                output[i] = input[i] + 1.0;
+            }
+        "#;
+
+        let pipeline = backend.compile("add_one", wgsl).unwrap();
+        let input = backend.create_buffer(&[1.0f32, 2.0, 3.0, 4.0]).unwrap();
+        let output = backend.create_buffer_uninit::<f32>(4).unwrap();
+        backend
+            .dispatch(&pipeline, &[&input, &output], (1, 1, 1))
+            .unwrap();
+
+        let result: Vec<f32> = backend.read_buffer(&output).unwrap();
+        assert_eq!(result, vec![2.0, 3.0, 4.0, 5.0]);
+    }
+
+    #[test]
+    fn vector_scale_1024() {
+        let backend = match VulkanBackend::init() {
+            Ok(b) => b,
+            Err(_) => {
+                eprintln!("skipping: no Vulkan device");
+                return;
+            }
+        };
+
+        let wgsl = r#"
+            @group(0) @binding(0) var<storage, read> input: array<f32>;
+            @group(0) @binding(1) var<storage, read_write> output: array<f32>;
+
+            @compute @workgroup_size(256)
+            fn scale(@builtin(global_invocation_id) gid: vec3<u32>) {
+                let i = gid.x;
+                output[i] = input[i] * 2.5;
+            }
+        "#;
+
+        let n: usize = 1024;
+        let input_data: Vec<f32> = (0..n).map(|i| i as f32).collect();
+        let expected: Vec<f32> = input_data.iter().map(|x| x * 2.5).collect();
+
+        let pipeline = backend.compile("scale", wgsl).unwrap();
+        let input = backend.create_buffer(&input_data).unwrap();
+        let output = backend.create_buffer_uninit::<f32>(n).unwrap();
+
+        backend
+            .dispatch(&pipeline, &[&input, &output], (4, 1, 1))
+            .unwrap();
+
+        let result: Vec<f32> = backend.read_buffer(&output).unwrap();
+        for (i, (&r, &e)) in result.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (r - e).abs() < 1e-6,
+                "mismatch at index {i}: got {r}, expected {e}"
+            );
+        }
+    }
+
+    #[test]
+    fn compile_error() {
+        let backend = match VulkanBackend::init() {
+            Ok(b) => b,
+            Err(_) => {
+                eprintln!("skipping: no Vulkan device");
+                return;
+            }
+        };
+
+        let bad_wgsl = "@compute fn broken( @storage(0) x: array<f32> ) { x[0] = ; }";
+        let result = backend.compile("broken", bad_wgsl);
+        assert!(result.is_err(), "expected compile error for invalid WGSL");
+        match result.unwrap_err() {
+            GpuError::CompileFailed { .. } => {}
+            e => panic!("expected CompileFailed, got {e:?}"),
+        }
+    }
+
+    #[test]
+    fn roundtrip_empty() {
+        let backend = match VulkanBackend::init() {
+            Ok(b) => b,
+            Err(_) => {
+                eprintln!("skipping: no Vulkan device");
+                return;
+            }
+        };
+
+        let buf = backend.create_buffer_uninit::<f32>(16).unwrap();
+        let result: Vec<f32> = backend.read_buffer(&buf).unwrap();
+        assert_eq!(result.len(), 16);
+        // Uninitialised — all zeroes is typical for fresh device memory
+    }
+}
