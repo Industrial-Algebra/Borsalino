@@ -126,4 +126,8 @@ cargo test --features metal
 
 ## License
 
-AGPL-3.0-only. Copyright (C) 2026 Industrial Algebra.
+AGPL-3.0-only OR Commercial. Copyright (C) 2026 Industrial Algebra.
+
+Dual-licensed: use under AGPL v3 for open-source projects, or obtain a
+commercial license for proprietary use. See [LICENSE](./LICENSE) and
+[LICENSE-COMMERCIAL](./LICENSE-COMMERCIAL).
