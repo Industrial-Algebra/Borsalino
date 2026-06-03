@@ -107,6 +107,7 @@ Bundles export to SMT-LIB2, Lean 4, and Kani verification backends.
 |---|---|---|
 | `hello_compute` | add_one kernel on 4 elements | `cargo run --example hello_compute --features vulkan` |
 | `saxpy` | SAXPY (a·x + y) on 1024 elements | `cargo run --example saxpy --features vulkan` |
+| `bench` | Cross-platform GPU benchmarks | `cargo run --example bench --features vulkan --release` |
 
 ## Testing
 
