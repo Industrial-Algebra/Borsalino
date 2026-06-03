@@ -56,7 +56,7 @@ cargo run --features vulkan --example hello_compute   # Linux / Windows
 |---|---|
 | `metal` | Metal backend (macOS only) |
 | `vulkan` | Vulkan backend via ash (Linux / Windows) |
-| `verify` | karpal-verify GPU obligation bundles |
+| `verify` | karpal-verify 0.5 GPU obligation bundles (SMT, Lean, Kani export) |
 
 ## Architecture
 
@@ -89,8 +89,8 @@ buffer position: `buffers[0]` → `@binding(0)`, `buffers[1]` → `@binding(1)`.
 
 ## Verification
 
-GPU safety properties are encoded as karpal-verify obligation bundles
-(feature `verify`):
+GPU safety properties are encoded as karpal-verify 0.5 obligation bundles
+(feature `verify`, fetches from crates.io):
 
 ```rust
 use borsalino::verify::{add_one_obligations, IsBufferAlignedTo16, Property};
