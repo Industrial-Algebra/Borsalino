@@ -163,7 +163,7 @@ unsafe fn sel(name: &str) -> *mut c_void {
 // ═══════════════════════════════════════════════════════════════════
 
 unsafe fn msg_id(receiver: *mut c_void, sel: *mut c_void) -> *mut c_void {
-    unsafe { msg_send_id_id(receiver, sel) }
+    unsafe { msg_send_id(receiver, sel) }
 }
 
 unsafe fn msg_id_id(
@@ -171,7 +171,7 @@ unsafe fn msg_id_id(
     sel: *mut c_void,
     arg: *mut c_void,
 ) -> *mut c_void {
-    unsafe { msg_send_id_id_id(receiver, sel, arg) }
+    unsafe { msg_send_id_id(receiver, sel, arg) }
 }
 
 unsafe fn msg_id_id_id(
