@@ -332,6 +332,8 @@ pub struct MetalBackend {
 
 impl MetalBackend {
     const STORAGE_MODE_SHARED: u64 = 0;
+    /// Buffer slot for the naga-generated sizes buffer (u32 array of element counts).
+    const SIZES_BUFFER_SLOT: msl::Slot = 30;
 }
 
 impl GpuBackend for MetalBackend {
@@ -377,10 +379,53 @@ impl GpuBackend for MetalBackend {
             message: e.emit_to_string(wgsl_source),
         })?;
 
+        // Build resource binding map: @group(0) @binding(N) → buffer(N)
+        let mut resources = msl::BindingMap::new();
+        for (_, global) in module.global_variables.iter() {
+            if let Some(ref binding) = global.binding {
+                let mutable = matches!(
+                    global.space,
+                    naga::AddressSpace::Storage { access }
+                        if access.contains(naga::StorageAccess::STORE)
+                );
+                resources.insert(
+                    naga::ResourceBinding {
+                        group: binding.group,
+                        binding: binding.binding,
+                    },
+                    msl::BindTarget {
+                        buffer: Some(binding.binding as msl::Slot),
+                        texture: None,
+                        sampler: None,
+                        external_texture: None,
+                        mutable,
+                    },
+                );
+            }
+        }
+
+        let entry_resources = msl::EntryPointResources {
+            resources,
+            push_constant_buffer: None,
+            sizes_buffer: Some(Self::SIZES_BUFFER_SLOT),
+        };
+
+        let mut msl_opts = msl::Options::default();
+        msl_opts.fake_missing_bindings = false;
+        msl_opts.bounds_check_policies = naga::proc::BoundsCheckPolicies {
+            index: naga::proc::BoundsCheckPolicy::Unchecked,
+            buffer: naga::proc::BoundsCheckPolicy::Unchecked,
+            image_load: naga::proc::BoundsCheckPolicy::Unchecked,
+            ..Default::default()
+        };
+        msl_opts
+            .per_entry_point_map
+            .insert(entry_point.into(), entry_resources);
+
         let (msl_source, _) = msl::write_string(
             &module,
             &info,
-            &msl::Options::default(),
+            &msl_opts,
             &msl::PipelineOptions::default(),
         )
         .map_err(|e| GpuError::CompileFailed {
@@ -568,6 +613,23 @@ impl GpuBackend for MetalBackend {
             // Set pipeline
             msg_void_id(encoder, sels.set_compute_pipeline_state, pipeline.raw);
 
+            // Bind sizes buffer (naga runtime array element counts)
+            let sizes: Vec<u32> = buffers.iter().map(|b| b.len as u32).collect();
+            let sizes_buf = msg_new_buffer(
+                self.device.ptr.as_ptr(),
+                sels.new_buffer_with_bytes,
+                sizes.as_ptr() as *const c_void,
+                (sizes.len() * 4) as u64,
+                Self::STORAGE_MODE_SHARED,
+            );
+            msg_set_buffer(
+                encoder,
+                sels.set_buffer_offset_at_index,
+                sizes_buf,
+                0,
+                Self::SIZES_BUFFER_SLOT as u64,
+            );
+
             // Bind buffers
             for (i, buf) in buffers.iter().enumerate() {
                 msg_set_buffer(
@@ -596,6 +658,7 @@ impl GpuBackend for MetalBackend {
             msg_void(cmd, sels.commit);
             msg_void(cmd, sels.wait_until_completed);
             msg_void(cmd, sels.release);
+            msg_void(sizes_buf, sels.release);
         }
 
         Ok(())
