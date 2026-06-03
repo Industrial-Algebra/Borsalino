@@ -1,16 +1,17 @@
 // Copyright (C) 2026 Industrial Algebra
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! Borsalino Metal backend benchmarks.
+//! Borsalino GPU backend benchmarks.
 //!
 //! # Run
 //!
 //! ```sh
-//! cargo run --example bench --features metal --release
+//! cargo run --example bench --features metal --release    # macOS
+//! cargo run --example bench --features vulkan --release   # Linux / Windows
 //! ```
 //!
 //! Measures: pipeline compilation, dispatch latency, throughput scaling,
-//! and buffer I/O overhead on the Metal backend.
+//! and buffer I/O overhead on the active GPU backend.
 
 use std::time::Instant;
 
@@ -106,9 +107,9 @@ fn print_results(results: &[BenchResult]) {
 
     for r in results {
         println!(
-            "{:<48} {:>10.3} {:>8} {:>8} {:>7.1}%",
+            "{:<48} {:>10} {:>8} {:>8} {:>7.1}%",
             r.name,
-            r.value,
+            format_time(r),
             r.unit,
             r.iters,
             if r.value > 0.0 { (r.stddev / r.value) * 100.0 } else { 0.0 }
@@ -125,11 +126,20 @@ fn scale_unit(n: u32) -> (&'static str, f64) {
     }
 }
 
+fn format_time(result: &BenchResult) -> String {
+    let scale = match result.unit.as_str() {
+        "ms" => 1e3,
+        "µs" => 1e6,
+        _ => 1.0,
+    };
+    format!("{:.3} {}", result.value * scale, result.unit)
+}
+
 // ── Main ──────────────────────────────────────────────────────────
 
 fn main() -> Result<(), borsalino::GpuError> {
     let gpu = borsalino::init()?;
-    println!("Borsalino Metal Benchmarks");
+    println!("Borsalino GPU Benchmarks");
     println!("==========================");
     println!();
 
