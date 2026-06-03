@@ -1,8 +1,8 @@
 # Borsalino — Handoff Document
 
-**Date:** 2026-05-19
-**Repository:** `/home/elliotthall/working/industrial-algebra/Borsalino`
-**Status:** Metal + Vulkan backends complete, verification Phase 2 partial
+**Date:** 2026-06-03
+**Repository:** `/Users/justincobb/working/personal/Borsalino`
+**Status:** Metal backend fixed on Apple Silicon M3, benchmarks needed
 
 ---
 
@@ -16,7 +16,7 @@ A thin GPU compute abstraction for the Industrial Algebra ecosystem. One trait (
 |---|---|
 | `GpuBackend` trait | Complete |
 | Error types (`GpuError`, `Result<T>`) | Complete (10 variants) |
-| Metal backend (`metal.rs`) | Complete — WGSL→MSL via naga, raw objc_msgSend FFI |
+| Metal backend (`metal.rs`) | ✅ Fixed — WGSL→MSL via naga, MTLComputePipelineDescriptor, M3 verified |
 | Vulkan backend (`vulkan.rs`) | Complete — WGSL→SPIR-V via naga, raw ash FFI |
 | `ComputePipeline` / `GpuBuffer` handles | Opaque pointer + drop function pattern |
 | WGSL shader language | Standard `@group(0) @binding(N)` syntax |
@@ -25,10 +25,12 @@ A thin GPU compute abstraction for the Industrial Algebra ecosystem. One trait (
 | CI | None yet |
 | crate.io readiness | Not published |
 
-**Builds:** All feature combinations pass with zero warnings:
+**Builds:** All feature combinations compile:
 - `cargo check` / `cargo check --features metal` / `cargo check --features vulkan` / `cargo check --features verify`
-- `cargo clippy` passes on all
-- `cargo test --features "vulkan,verify"` — 9/9 tests pass
+- `cargo run --example hello_compute --features metal` — ✅ `add_one kernel: all correct`
+- `cargo run --example saxpy --features metal` — ✅ `SAXPY: 1024 elements, all correct`
+- `cargo test --features "vulkan,verify"` — 9/9 tests pass on Linux
+- Metal unit tests produce correct results, but SIGSEGV on test-thread exit (see Metal Fix note)
 
 ## 3. File Map
 
@@ -69,8 +71,17 @@ Kernels are authored in WGSL with `@group(0) @binding(N)` buffer declarations. N
 ### 4.3 Raw FFI
 
 Both backends use raw FFI with no wrapper crates:
-- Metal: `objc_msgSend` extern declarations, 18 cached selectors
+- Metal: `objc` 0.2 crate (`msg_send!` macro), `MTLCreateSystemDefaultDevice` extern, `MTLComputePipelineDescriptor` for pipeline creation
 - Vulkan: `ash` (generated Vulkan bindings), no safety wrappers
+
+### 4.6 Metal MSL post-processing
+
+Naga's MSL backend generates `device type_N const&` (reference to fixed-size array)
+which Metal 3 on Apple Silicon doesn't accept for pipeline creation.
+A post-processing step (`naga_msl_fixup`) converts this to pointer syntax
+(`device const float*`), strips unused structs (`_mslBufferSizes`, `add_oneInput`),
+and normalises `metal::uint3` to `uint3`. This is applied to all naga-generated
+MSL before compilation.
 
 ### 4.4 Synchronous dispatch
 
@@ -106,11 +117,15 @@ Per dispatch: allocate cmd buffer → begin → bind pipeline → update descrip
 4. `compile_error` — invalid WGSL → CompileFailed
 5. `roundtrip_empty` — zero-init buffer survives roundtrip
 
-### Metal tests (3 tests, macOS only — untested on Apple Silicon)
+### Metal tests (3 tests, Apple Silicon M3 — correct results, known cleanup issue)
 
-1. `device_init` — confirms MTLDevice or skips
-2. `add_one_kernel` — compile, dispatch, readback
-3. `vector_scale_1024` — 1024 elements, scale by 2.5
+1. `device_init` — confirms MTLDevice ✅
+2. `add_one_kernel` — compile, dispatch, readback → correct result `[2.0, 3.0, 4.0, 5.0]` ✅
+3. `vector_scale_1024` — 1024 elements, scale by 2.5 ✅
+
+**Known issue:** Test thread exit triggers SIGSEGV during Metal runtime cleanup.
+Production code on main thread (examples) does not exhibit this.
+Workaround: `std::mem::forget` on Metal objects at end of test functions.
 
 ### Verify tests (4 tests)
 
@@ -145,7 +160,7 @@ assert_eq!(result, vec![2.0, 3.0, 4.0, 5.0]);
 ## 8. Next Steps
 
 ### Must do
-1. **Test Metal backend on Apple Silicon.** Run `cargo test --features metal` on M3 Mac.
+1. ~~Test Metal backend on Apple Silicon.~~ ✅ Done — see Metal Fix below.
 2. **Kani harnesses.** Buffer roundtrip, alignment, workgroup divisibility.
 3. **Miri integration.** Buffer lifecycle safety (no UAF, no double-free).
 
@@ -153,9 +168,25 @@ assert_eq!(result, vec![2.0, 3.0, 4.0, 5.0]);
 4. **Real Industrial Algebra kernel.** Geometric product of 32-element multivectors.
 5. **Benchmark dispatch overhead.** Compare per-dispatch encoder cost vs cached encoder.
 6. **CI workflow.** GitHub Actions with Vulkan tests on self-hosted runner.
+7. **Fix Metal test thread cleanup SIGSEGV.** Investigate autorelease pool / thread-local cleanup.
 
 ### Could do
-7. **`dispatch_verified()` with `Proven<>` gates.** Phase 3 of verification.
-8. **amari-flynn statistical verification.** Kernel determinism, memory leak detection.
-9. **Vulkan timestamp queries.** `gpu.timestamp() -> Result<u64>` for profiling.
-10. **crate.io publication.**
+8. **`dispatch_verified()` with `Proven<>` gates.** Phase 3 of verification.
+9. **amari-flynn statistical verification.** Kernel determinism, memory leak detection.
+10. **Vulkan timestamp queries.** `gpu.timestamp() -> Result<u64>` for profiling.
+11. **crate.io publication.**
+
+## 9. Metal Fix Details (2026-06-03)
+
+Seven root causes were identified and fixed to get the Metal backend working on
+Apple Silicon M3 (macOS 15):
+
+| # | Issue | Fix |
+|---|-------|-----|
+| 1 | `sel`/`sel_impl` macros not imported for Rust 2024 | Added `use objc::{class, msg_send, sel, sel_impl}` |
+| 2 | `nsstring()` passed non-null-terminated `&str` to `stringWithUTF8String:` (UB) | Use `CString::new(s).unwrap()` for null-termination |
+| 3 | `nsstring()` double-retained autoreleased strings | Removed manual `retain`; let autorelease pool manage |
+| 4 | Naga MSL emitted `device type_N const&` incompatible with Metal 3 | Post-process MSL via `naga_msl_fixup()` to pointer syntax |
+| 5 | `newComputePipelineStateWithFunction:` crashes on M3 | Use `newComputePipelineStateWithDescriptor:` with `MTLComputePipelineDescriptor` |
+| 6 | `newBufferWithBytes:NULL` crashes on M3 | Use `newBufferWithLength:options:` for uninitialised buffers |
+| 7 | Test thread Metal cleanup SIGSEGV on exit | `std::mem::forget` workaround in tests; examples (main thread) work fine |

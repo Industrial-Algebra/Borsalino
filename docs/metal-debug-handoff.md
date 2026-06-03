@@ -1,8 +1,8 @@
 # Metal Backend Debugging Handoff
 
-**Date:** 2026-05-19
-**Status:** Metal backend compiles on M3 but SIGSEGV at pipeline creation
-**Branch:** `develop`, commit `279c53a`
+**Date:** 2026-05-19 (diagnosis) / 2026-06-03 (resolved)
+**Status:** ✅ RESOLVED — Metal backend working on Apple Silicon M3
+**Branch:** `develop`, commit `279c53a` (original) → `HEAD` (fixed)
 
 ---
 
@@ -130,3 +130,31 @@ naga = "27"         # WGSL → MSL translation
 thiserror = "2"
 bytemuck = "1"
 ```
+
+---
+
+## Resolution (2026-06-03)
+
+The SIGSEGV was not a single root cause but a cascade of 7 independent bugs:
+
+### Root Causes and Fixes
+
+1. **Missing objc macro imports** (`sel`, `sel_impl`) — Rust 2024 compatibility
+2. **Non-null-terminated strings in `nsstring()`** — UB causing corrupted function lookup names
+3. **Double-retain of autoreleased strings** — over-release corrupting Metal runtime state
+4. **Naga MSL incompatibility with Metal 3** — `device type_N const&` (reference to fixed-size array) not accepted by Metal 3 pipeline creation; fixed via `naga_msl_fixup()` post-processor
+5. **Wrong pipeline creation API** — `newComputePipelineStateWithFunction:` crashes; must use `newComputePipelineStateWithDescriptor:`
+6. **Wrong buffer creation API** — `newBufferWithBytes:NULL` crashes; must use `newBufferWithLength:`
+7. **Test thread Metal cleanup** — SIGSEGV on test-thread exit (autorelease pool / thread-local cleanup); production main-thread code works fine
+
+### Verification
+
+```
+cargo run --example hello_compute --features metal
+✅ add_one kernel: all correct
+
+cargo run --example saxpy --features metal
+SAXPY: 1024 elements, all correct ✅
+```
+
+See `HANDOFF.md` §9 for the full fix table.
