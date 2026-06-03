@@ -20,7 +20,7 @@ use naga::valid::{Capabilities, ValidationFlags, Validator};
 use objc::runtime::Object;
 use objc::{class, msg_send, sel, sel_impl};
 
-use crate::{ComputePipeline, GpuBuffer, GpuBackend, GpuError, Result};
+use crate::{ComputePipeline, GpuBuffer, GpuBackend, GpuError, Result, DispatchSpec};
 
 // ═══════════════════════════════════════════════════════════════════
 // Metal C symbol
@@ -212,7 +212,6 @@ pub struct MetalBackend {
 
 impl MetalBackend {
     const STORAGE_MODE_SHARED: u64 = 0;
-    const SIZES_BUFFER_SLOT: msl::Slot = 30;
 }
 
 impl GpuBackend for MetalBackend {
@@ -294,7 +293,7 @@ impl GpuBackend for MetalBackend {
         let entry_resources = msl::EntryPointResources {
             resources,
             push_constant_buffer: None,
-            sizes_buffer: Some(Self::SIZES_BUFFER_SLOT),
+            sizes_buffer: Some(30u8),
         };
 
         let mut msl_opts = msl::Options::default();
@@ -487,7 +486,6 @@ impl GpuBackend for MetalBackend {
         workgroups: (u32, u32, u32),
         _threads_per_group: (u32, u32, u32),
     ) -> Result<()> {
-        let dev = self.device.ptr.as_ptr();
         unsafe {
             let cmd: *mut c_void =
                 msg_send![obj(self.queue.ptr.as_ptr()), commandBuffer];
@@ -509,21 +507,6 @@ impl GpuBackend for MetalBackend {
             // Set pipeline
             let _: () =
                 msg_send![obj(encoder), setComputePipelineState: pipeline.raw];
-
-            // Bind sizes buffer (naga runtime array element counts)
-            let sizes: Vec<u32> = buffers.iter().map(|b| b.len as u32).collect();
-            let sizes_buf: *mut c_void = msg_send![
-                obj(dev),
-                newBufferWithBytes: sizes.as_ptr() as *const c_void
-                length: (sizes.len() * 4) as u64
-                options: Self::STORAGE_MODE_SHARED
-            ];
-            let _: () = msg_send![
-                obj(encoder),
-                setBuffer: sizes_buf
-                offset: 0u64
-                atIndex: Self::SIZES_BUFFER_SLOT as u64
-            ];
 
             // Bind user buffers
             for (i, buf) in buffers.iter().enumerate() {
@@ -547,7 +530,6 @@ impl GpuBackend for MetalBackend {
             let _: () = msg_send![obj(cmd), commit];
             let _: () = msg_send![obj(cmd), waitUntilCompleted];
             let _: () = msg_send![obj(cmd), release];
-            let _: () = msg_send![obj(sizes_buf), release];
         }
 
         Ok(())
@@ -566,6 +548,71 @@ impl GpuBackend for MetalBackend {
         let slice =
             unsafe { std::slice::from_raw_parts(contents, buffer.len) };
         Ok(slice.to_vec())
+    }
+
+    fn dispatch_many(&self, dispatches: &[crate::DispatchSpec<'_>]) -> Result<()> {
+        if dispatches.is_empty() {
+            return Ok(());
+        }
+
+        unsafe {
+            let cmd: *mut c_void =
+                msg_send![obj(self.queue.ptr.as_ptr()), commandBuffer];
+            if cmd.is_null() {
+                return Err(GpuError::DispatchFailed {
+                    message: "failed to create MTLCommandBuffer".into(),
+                });
+            }
+
+            let encoder: *mut c_void =
+                msg_send![obj(cmd), computeCommandEncoder];
+            if encoder.is_null() {
+                let _: () = msg_send![obj(cmd), release];
+                return Err(GpuError::DispatchFailed {
+                    message: "failed to create MTLComputeCommandEncoder".into(),
+                });
+            }
+
+            for spec in dispatches {
+                // Set pipeline
+                let _: () = msg_send![
+                    obj(encoder),
+                    setComputePipelineState: spec.pipeline.raw
+                ];
+
+                // Bind buffers
+                for (i, buf) in spec.buffers.iter().enumerate() {
+                    let _: () = msg_send![
+                        obj(encoder),
+                        setBuffer: buf.raw
+                        offset: 0u64
+                        atIndex: i as u64
+                    ];
+                }
+
+                // Dispatch
+                let _: () = msg_send![
+                    obj(encoder),
+                    dispatchThreadgroups: (
+                        spec.workgroups.0 as u64,
+                        spec.workgroups.1 as u64,
+                        spec.workgroups.2 as u64,
+                    )
+                    threadsPerThreadgroup: (
+                        spec.threads_per_group.0 as u64,
+                        spec.threads_per_group.1 as u64,
+                        spec.threads_per_group.2 as u64,
+                    )
+                ];
+            }
+
+            let _: () = msg_send![obj(encoder), endEncoding];
+            let _: () = msg_send![obj(cmd), commit];
+            let _: () = msg_send![obj(cmd), waitUntilCompleted];
+            let _: () = msg_send![obj(cmd), release];
+        }
+
+        Ok(())
     }
 }
 
