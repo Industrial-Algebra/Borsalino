@@ -305,11 +305,22 @@ unsafe fn allocate_buffer(
 
     let mem_reqs = unsafe { device.get_buffer_memory_requirements(buffer) };
 
+    // Prefer cached memory on discrete GPUs (avoids PCIe round-trips).
+    // Fall back to uncached coherent if not available (e.g. integrated GPUs).
+    let mut flags =
+        vk::MemoryPropertyFlags::HOST_VISIBLE
+            | vk::MemoryPropertyFlags::HOST_COHERENT
+            | vk::MemoryPropertyFlags::HOST_CACHED;
     let mem_type_index = find_memory_type_index(
         memory_properties,
         mem_reqs.memory_type_bits,
-        vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-    )?;
+        flags,
+    )
+    .or_else(|_| {
+        flags = vk::MemoryPropertyFlags::HOST_VISIBLE
+            | vk::MemoryPropertyFlags::HOST_COHERENT;
+        find_memory_type_index(memory_properties, mem_reqs.memory_type_bits, flags)
+    })?;
 
     let alloc_info = vk::MemoryAllocateInfo::default()
         .allocation_size(mem_reqs.size)
@@ -818,35 +829,22 @@ impl GpuBackend for VulkanBackend {
                 })?;
         }
 
-        // ── Submit + fence + wait ─────────────────────────────────
-
-        let fence_info = vk::FenceCreateInfo::default();
-        let fence = unsafe {
-            self.device
-                .create_fence(&fence_info, None)
-                .map_err(|e| GpuError::DispatchFailed {
-                    message: format!("vkCreateFence: {e}"),
-                })?
-        };
+        // ── Submit + wait ─────────────────────────────────────────
 
         let submit_info = vk::SubmitInfo::default()
             .command_buffers(std::slice::from_ref(&cmd));
 
         unsafe {
             self.device
-                .queue_submit(self.queue, &[submit_info], fence)
+                .queue_submit(self.queue, &[submit_info], vk::Fence::null())
                 .map_err(|e| GpuError::DispatchFailed {
                     message: format!("vkQueueSubmit: {e}"),
                 })?;
 
             self.device
-                .wait_for_fences(
-                    std::slice::from_ref(&fence),
-                    true,
-                    u64::MAX,
-                )
+                .queue_wait_idle(self.queue)
                 .map_err(|e| GpuError::DispatchFailed {
-                    message: format!("vkWaitForFences: {e}"),
+                    message: format!("vkQueueWaitIdle: {e}"),
                 })?;
         }
 
@@ -858,7 +856,6 @@ impl GpuBackend for VulkanBackend {
                     self.command_pool,
                     std::slice::from_ref(&cmd),
                 );
-            self.device.destroy_fence(fence, None);
         }
 
         Ok(())
