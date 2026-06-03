@@ -17,8 +17,8 @@ use std::ptr::NonNull;
 use naga::back::msl;
 use naga::front::wgsl;
 use naga::valid::{Capabilities, ValidationFlags, Validator};
-use objc::runtime::Sel;
-use objc::{class, msg_send, sel};
+use objc::runtime::Object;
+use objc::{class, msg_send};
 
 use crate::{ComputePipeline, GpuBuffer, GpuBackend, GpuError, Result};
 
@@ -33,71 +33,24 @@ unsafe extern "C" {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// Selector cache
+// Helpers
 // ═══════════════════════════════════════════════════════════════════
 
-struct Selectors {
-    new_buffer_with_bytes: Sel,
-    new_library_with_source: Sel,
-    new_function_with_name: Sel,
-    new_compute_pipeline_state: Sel,
-    new_command_queue: Sel,
-    command_buffer: Sel,
-    compute_command_encoder: Sel,
-    set_compute_pipeline_state: Sel,
-    set_buffer_offset_at_index: Sel,
-    dispatch_threadgroups: Sel,
-    end_encoding: Sel,
-    commit: Sel,
-    wait_until_completed: Sel,
-    contents: Sel,
-    retain: Sel,
-    release: Sel,
-    localized_description: Sel,
-    utf8_string: Sel,
+/// Cast a raw Metal object pointer to `*const Object` for `msg_send!`.
+unsafe fn obj(ptr: *mut c_void) -> *const Object {
+    ptr as *const Object
 }
 
-// SAFETY: Sel is a zero-sized wrapper around a registered selector pointer.
-unsafe impl Send for Selectors {}
-unsafe impl Sync for Selectors {}
-
-fn selectors() -> &'static Selectors {
-    use std::sync::OnceLock;
-    static SEL: OnceLock<Selectors> = OnceLock::new();
-    SEL.get_or_init(|| Selectors {
-        new_buffer_with_bytes: sel!(newBufferWithBytes:length:options:),
-        new_library_with_source: sel!(newLibraryWithSource:options:error:),
-        new_function_with_name: sel!(newFunctionWithName:),
-        new_compute_pipeline_state: sel!(newComputePipelineStateWithFunction:error:),
-        new_command_queue: sel!(newCommandQueue),
-        command_buffer: sel!(commandBuffer),
-        compute_command_encoder: sel!(computeCommandEncoder),
-        set_compute_pipeline_state: sel!(setComputePipelineState:),
-        set_buffer_offset_at_index: sel!(setBuffer:offset:atIndex:),
-        dispatch_threadgroups: sel!(dispatchThreadgroups:threadsPerThreadgroup:),
-        end_encoding: sel!(endEncoding),
-        commit: sel!(commit),
-        wait_until_completed: sel!(waitUntilCompleted),
-        contents: sel!(contents),
-        retain: sel!(retain),
-        release: sel!(release),
-        localized_description: sel!(localizedDescription),
-        utf8_string: sel!(UTF8String),
-    })
-}
-
-// ═══════════════════════════════════════════════════════════════════
-// NSString helpers
-// ═══════════════════════════════════════════════════════════════════
-
+/// Create an NSString from a Rust string.
 unsafe fn nsstring(s: &str) -> *mut c_void {
     let ns: *mut c_void = msg_send![class!(NSString), stringWithUTF8String:s.as_ptr()];
-    let _: *mut c_void = msg_send![ns, retain];
+    let _: *mut c_void = msg_send![obj(ns), retain];
     ns
 }
 
+/// Read an NSString into a Rust String.
 unsafe fn nsstring_read(ns: *mut c_void) -> String {
-    let utf8: *const std::ffi::c_char = msg_send![ns, UTF8String];
+    let utf8: *const std::ffi::c_char = msg_send![obj(ns), UTF8String];
     if utf8.is_null() {
         return "(null)".into();
     }
@@ -120,7 +73,7 @@ unsafe impl Sync for MetalDevice {}
 impl Drop for MetalDevice {
     fn drop(&mut self) {
         unsafe {
-            let _: () = msg_send![self.ptr.as_ptr(), release];
+            let _: () = msg_send![obj(self.ptr.as_ptr()), release];
         }
     }
 }
@@ -132,7 +85,7 @@ struct MetalQueue {
 impl Drop for MetalQueue {
     fn drop(&mut self) {
         unsafe {
-            let _: () = msg_send![self.ptr.as_ptr(), release];
+            let _: () = msg_send![obj(self.ptr.as_ptr()), release];
         }
     }
 }
@@ -140,7 +93,7 @@ impl Drop for MetalQueue {
 fn drop_pipeline(raw: *mut c_void) {
     if !raw.is_null() {
         unsafe {
-            let _: () = msg_send![raw, release];
+            let _: () = msg_send![obj(raw), release];
         }
     }
 }
@@ -148,7 +101,7 @@ fn drop_pipeline(raw: *mut c_void) {
 fn drop_buffer(raw: *mut c_void) {
     if !raw.is_null() {
         unsafe {
-            let _: () = msg_send![raw, release];
+            let _: () = msg_send![obj(raw), release];
         }
     }
 }
@@ -157,7 +110,7 @@ fn contents_of(raw: *mut c_void) -> *const c_void {
     if raw.is_null() {
         return std::ptr::null();
     }
-    unsafe { msg_send![raw, contents] }
+    unsafe { msg_send![obj(raw), contents] }
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -186,10 +139,10 @@ impl GpuBackend for MetalBackend {
         }
 
         let queue_ptr: *mut c_void =
-            unsafe { msg_send![device_ptr, newCommandQueue] };
+            unsafe { msg_send![obj(device_ptr), newCommandQueue] };
         if queue_ptr.is_null() {
             unsafe {
-                let _: () = msg_send![device_ptr, release];
+                let _: () = msg_send![obj(device_ptr), release];
             }
             return Err(GpuError::InitFailed(
                 "failed to create MTLCommandQueue".into(),
@@ -283,18 +236,19 @@ impl GpuBackend for MetalBackend {
             let ns_src = nsstring(&msl_source);
             let mut err: *mut c_void = std::ptr::null_mut();
             let library: *mut c_void = msg_send![
-                dev,
-                newLibraryWithSource:ns_src
-                options:std::ptr::null_mut::<c_void>()
-                error:&mut err
+                obj(dev),
+                newLibraryWithSource: ns_src
+                options: std::ptr::null_mut::<c_void>()
+                error: &mut err
             ];
-            let _: () = msg_send![ns_src, release];
+            let _: () = msg_send![obj(ns_src), release];
 
             if library.is_null() {
                 let msg = if !err.is_null() {
-                    let desc: *mut c_void = msg_send![err, localizedDescription];
+                    let desc: *mut c_void =
+                        msg_send![obj(err), localizedDescription];
                     let s = nsstring_read(desc);
-                    let _: () = msg_send![err, release];
+                    let _: () = msg_send![obj(err), release];
                     s
                 } else {
                     "unknown compilation error".into()
@@ -307,11 +261,12 @@ impl GpuBackend for MetalBackend {
 
             // Step 2: MTLFunction
             let ns_entry = nsstring(entry_point);
-            let func: *mut c_void = msg_send![library, newFunctionWithName:ns_entry];
-            let _: () = msg_send![ns_entry, release];
+            let func: *mut c_void =
+                msg_send![obj(library), newFunctionWithName: ns_entry];
+            let _: () = msg_send![obj(ns_entry), release];
 
             if func.is_null() {
-                let _: () = msg_send![library, release];
+                let _: () = msg_send![obj(library), release];
                 return Err(GpuError::PipelineFailed {
                     entry: entry_point.into(),
                     message: format!(
@@ -323,22 +278,23 @@ impl GpuBackend for MetalBackend {
             // Step 3: MTLComputePipelineState
             let mut perr: *mut c_void = std::ptr::null_mut();
             let pipeline: *mut c_void = msg_send![
-                dev,
-                newComputePipelineStateWithFunction:func
-                error:&mut perr
+                obj(dev),
+                newComputePipelineStateWithFunction: func
+                error: &mut perr
             ];
 
             if pipeline.is_null() {
                 let msg = if !perr.is_null() {
-                    let desc: *mut c_void = msg_send![perr, localizedDescription];
+                    let desc: *mut c_void =
+                        msg_send![obj(perr), localizedDescription];
                     let s = nsstring_read(desc);
-                    let _: () = msg_send![perr, release];
+                    let _: () = msg_send![obj(perr), release];
                     s
                 } else {
                     "unknown pipeline error".into()
                 };
-                let _: () = msg_send![func, release];
-                let _: () = msg_send![library, release];
+                let _: () = msg_send![obj(func), release];
+                let _: () = msg_send![obj(library), release];
                 return Err(GpuError::PipelineFailed {
                     entry: entry_point.into(),
                     message: msg,
@@ -346,8 +302,8 @@ impl GpuBackend for MetalBackend {
             }
 
             // Release intermediates
-            let _: () = msg_send![func, release];
-            let _: () = msg_send![library, release];
+            let _: () = msg_send![obj(func), release];
+            let _: () = msg_send![obj(library), release];
 
             Ok(ComputePipeline {
                 raw: pipeline,
@@ -366,10 +322,10 @@ impl GpuBackend for MetalBackend {
 
         let buf: *mut c_void = unsafe {
             msg_send![
-                dev,
-                newBufferWithBytes:data.as_ptr() as *const c_void
-                length:byte_len as u64
-                options:Self::STORAGE_MODE_SHARED
+                obj(dev),
+                newBufferWithBytes: data.as_ptr() as *const c_void
+                length: byte_len as u64
+                options: Self::STORAGE_MODE_SHARED
             ]
         };
 
@@ -401,10 +357,10 @@ impl GpuBackend for MetalBackend {
 
         let buf: *mut c_void = unsafe {
             msg_send![
-                dev,
-                newBufferWithBytes:std::ptr::null::<c_void>()
-                length:byte_len as u64
-                options:Self::STORAGE_MODE_SHARED
+                obj(dev),
+                newBufferWithBytes: std::ptr::null::<c_void>()
+                length: byte_len as u64
+                options: Self::STORAGE_MODE_SHARED
             ]
         };
 
@@ -437,20 +393,22 @@ impl GpuBackend for MetalBackend {
         pipeline: &ComputePipeline,
         buffers: &[&GpuBuffer],
         workgroups: (u32, u32, u32),
-        threads_per_group: (u32, u32, u32),
+        _threads_per_group: (u32, u32, u32),
     ) -> Result<()> {
         let dev = self.device.ptr.as_ptr();
         unsafe {
-            let cmd: *mut c_void = msg_send![self.queue.ptr.as_ptr(), commandBuffer];
+            let cmd: *mut c_void =
+                msg_send![obj(self.queue.ptr.as_ptr()), commandBuffer];
             if cmd.is_null() {
                 return Err(GpuError::DispatchFailed {
                     message: "failed to create MTLCommandBuffer".into(),
                 });
             }
 
-            let encoder: *mut c_void = msg_send![cmd, computeCommandEncoder];
+            let encoder: *mut c_void =
+                msg_send![obj(cmd), computeCommandEncoder];
             if encoder.is_null() {
-                let _: () = msg_send![cmd, release];
+                let _: () = msg_send![obj(cmd), release];
                 return Err(GpuError::DispatchFailed {
                     message: "failed to create MTLComputeCommandEncoder".into(),
                 });
@@ -458,46 +416,46 @@ impl GpuBackend for MetalBackend {
 
             // Set pipeline
             let _: () =
-                msg_send![encoder, setComputePipelineState:pipeline.raw];
+                msg_send![obj(encoder), setComputePipelineState: pipeline.raw];
 
             // Bind sizes buffer (naga runtime array element counts)
             let sizes: Vec<u32> = buffers.iter().map(|b| b.len as u32).collect();
             let sizes_buf: *mut c_void = msg_send![
-                dev,
-                newBufferWithBytes:sizes.as_ptr() as *const c_void
-                length:(sizes.len() * 4) as u64
-                options:Self::STORAGE_MODE_SHARED
+                obj(dev),
+                newBufferWithBytes: sizes.as_ptr() as *const c_void
+                length: (sizes.len() * 4) as u64
+                options: Self::STORAGE_MODE_SHARED
             ];
             let _: () = msg_send![
-                encoder,
-                setBuffer:sizes_buf
-                offset:0u64
-                atIndex:Self::SIZES_BUFFER_SLOT as u64
+                obj(encoder),
+                setBuffer: sizes_buf
+                offset: 0u64
+                atIndex: Self::SIZES_BUFFER_SLOT as u64
             ];
 
             // Bind user buffers
             for (i, buf) in buffers.iter().enumerate() {
                 let _: () = msg_send![
-                    encoder,
-                    setBuffer:buf.raw
-                    offset:0u64
-                    atIndex:i as u64
+                    obj(encoder),
+                    setBuffer: buf.raw
+                    offset: 0u64
+                    atIndex: i as u64
                 ];
             }
 
             // Dispatch
             let _: () = msg_send![
-                encoder,
-                dispatchThreadgroups:(workgroups.0 as u64, workgroups.1 as u64, workgroups.2 as u64)
-                threadsPerThreadgroup:(threads_per_group.0 as u64, threads_per_group.1 as u64, threads_per_group.2 as u64)
+                obj(encoder),
+                dispatchThreadgroups: (workgroups.0 as u64, workgroups.1 as u64, workgroups.2 as u64)
+                threadsPerThreadgroup: (_threads_per_group.0 as u64, _threads_per_group.1 as u64, _threads_per_group.2 as u64)
             ];
 
             // Finish
-            let _: () = msg_send![encoder, endEncoding];
-            let _: () = msg_send![cmd, commit];
-            let _: () = msg_send![cmd, waitUntilCompleted];
-            let _: () = msg_send![cmd, release];
-            let _: () = msg_send![sizes_buf, release];
+            let _: () = msg_send![obj(encoder), endEncoding];
+            let _: () = msg_send![obj(cmd), commit];
+            let _: () = msg_send![obj(cmd), waitUntilCompleted];
+            let _: () = msg_send![obj(cmd), release];
+            let _: () = msg_send![obj(sizes_buf), release];
         }
 
         Ok(())
