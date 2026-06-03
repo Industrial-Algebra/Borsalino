@@ -37,12 +37,19 @@ unsafe extern "C" {
     fn objc_getClass(name: *const std::ffi::c_char) -> *mut c_void;
     fn sel_registerName(name: *const std::ffi::c_char) -> *mut c_void;
 
-    // Typed objc_msgSend variants — each includes self + _cmd + method args.
-    // Properly declared for ARM64 ABI with explicit argument counts.
+    // Typed objc_msgSend variants — each in its own extern block to avoid
+    // clashing declaration warnings on ARM64. Each includes self + _cmd + args.
+}
+
+unsafe extern "C" {
     #[link_name = "objc_msgSend"]
     fn msg_send_id(self_: *mut c_void, sel: *mut c_void) -> *mut c_void;
+}
+unsafe extern "C" {
     #[link_name = "objc_msgSend"]
     fn msg_send_id_id(self_: *mut c_void, sel: *mut c_void, a1: *mut c_void) -> *mut c_void;
+}
+unsafe extern "C" {
     #[link_name = "objc_msgSend"]
     fn msg_send_id_id_id(
         self_: *mut c_void,
@@ -50,6 +57,8 @@ unsafe extern "C" {
         a1: *mut c_void,
         a2: *mut c_void,
     ) -> *mut c_void;
+}
+unsafe extern "C" {
     #[link_name = "objc_msgSend"]
     fn msg_send_id_buf(
         self_: *mut c_void,
@@ -58,6 +67,8 @@ unsafe extern "C" {
         length: u64,
         options: u64,
     ) -> *mut c_void;
+}
+unsafe extern "C" {
     #[link_name = "objc_msgSend"]
     fn msg_send_id_lib(
         self_: *mut c_void,
@@ -66,10 +77,16 @@ unsafe extern "C" {
         opts: *mut c_void,
         error_out: *mut *mut c_void,
     ) -> *mut c_void;
+}
+unsafe extern "C" {
     #[link_name = "objc_msgSend"]
     fn msg_send_void_id(self_: *mut c_void, sel: *mut c_void, a1: *mut c_void);
+}
+unsafe extern "C" {
     #[link_name = "objc_msgSend"]
     fn msg_send_void(self_: *mut c_void, sel: *mut c_void);
+}
+unsafe extern "C" {
     #[link_name = "objc_msgSend"]
     fn msg_send_set_buf(
         self_: *mut c_void,
@@ -78,6 +95,8 @@ unsafe extern "C" {
         offset: u64,
         index: u64,
     );
+}
+unsafe extern "C" {
     #[link_name = "objc_msgSend"]
     fn msg_send_dispatch(
         self_: *mut c_void,
@@ -89,6 +108,8 @@ unsafe extern "C" {
         ty: u64,
         tz: u64,
     );
+}
+unsafe extern "C" {
     #[link_name = "objc_msgSend"]
     fn msg_send_string(
         self_: *mut c_void,
