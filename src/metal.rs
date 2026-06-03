@@ -30,7 +30,7 @@ use crate::{ComputePipeline, GpuBuffer, GpuBackend, GpuError, Result};
 // Objective-C / Metal extern declarations
 // ═══════════════════════════════════════════════════════════════════
 
-extern "C" {
+unsafe extern "C" {
     fn MTLCreateSystemDefaultDevice() -> *mut c_void;
     fn objc_getClass(name: *const std::ffi::c_char) -> *mut c_void;
     fn sel_registerName(name: *const std::ffi::c_char) -> *mut c_void;
@@ -62,6 +62,11 @@ struct Selectors {
     utf8_string: *mut c_void,
 }
 
+// SAFETY: Selectors contains only opaque selector pointers obtained from
+// sel_registerName, which are constant after registration and trivially Send+Sync.
+unsafe impl Send for Selectors {}
+unsafe impl Sync for Selectors {}
+
 fn selectors() -> &'static Selectors {
     use std::sync::OnceLock;
     static SEL: OnceLock<Selectors> = OnceLock::new();
@@ -90,7 +95,7 @@ fn selectors() -> &'static Selectors {
 }
 
 unsafe fn sel(name: &str) -> *mut c_void {
-    sel_registerName(CString::new(name).unwrap().as_ptr())
+    unsafe { sel_registerName(CString::new(name).unwrap().as_ptr()) }
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -98,9 +103,11 @@ unsafe fn sel(name: &str) -> *mut c_void {
 // ═══════════════════════════════════════════════════════════════════
 
 unsafe fn msg_id(receiver: *mut c_void, sel: *mut c_void) -> *mut c_void {
-    std::mem::transmute::<_, extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void>(
-        objc_msgSend as *const (),
-    )(receiver, sel)
+    unsafe {
+        std::mem::transmute::<_, extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void>(
+            objc_msgSend as *const (),
+        )(receiver, sel)
+    }
 }
 
 unsafe fn msg_id_id(
@@ -108,9 +115,11 @@ unsafe fn msg_id_id(
     sel: *mut c_void,
     arg: *mut c_void,
 ) -> *mut c_void {
-    std::mem::transmute::<_, extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> *mut c_void>(
-        objc_msgSend as *const (),
-    )(receiver, sel, arg)
+    unsafe {
+        std::mem::transmute::<_, extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> *mut c_void>(
+            objc_msgSend as *const (),
+        )(receiver, sel, arg)
+    }
 }
 
 unsafe fn msg_id_id_id(
@@ -119,22 +128,28 @@ unsafe fn msg_id_id_id(
     arg1: *mut c_void,
     arg2: *mut c_void,
 ) -> *mut c_void {
-    std::mem::transmute::<
-        _,
-        extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void) -> *mut c_void,
-    >(objc_msgSend as *const ())(receiver, sel, arg1, arg2)
+    unsafe {
+        std::mem::transmute::<
+            _,
+            extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void) -> *mut c_void,
+        >(objc_msgSend as *const ())(receiver, sel, arg1, arg2)
+    }
 }
 
 unsafe fn msg_void_id(receiver: *mut c_void, sel: *mut c_void, arg: *mut c_void) {
-    std::mem::transmute::<_, extern "C" fn(*mut c_void, *mut c_void, *mut c_void)>(
-        objc_msgSend as *const (),
-    )(receiver, sel, arg);
+    unsafe {
+        std::mem::transmute::<_, extern "C" fn(*mut c_void, *mut c_void, *mut c_void)>(
+            objc_msgSend as *const (),
+        )(receiver, sel, arg);
+    }
 }
 
 unsafe fn msg_void(receiver: *mut c_void, sel: *mut c_void) {
-    std::mem::transmute::<_, extern "C" fn(*mut c_void, *mut c_void)>(
-        objc_msgSend as *const (),
-    )(receiver, sel);
+    unsafe {
+        std::mem::transmute::<_, extern "C" fn(*mut c_void, *mut c_void)>(
+            objc_msgSend as *const (),
+        )(receiver, sel);
+    }
 }
 
 unsafe fn msg_new_buffer(
@@ -144,10 +159,12 @@ unsafe fn msg_new_buffer(
     length: u64,
     options: u64,
 ) -> *mut c_void {
-    std::mem::transmute::<
-        _,
-        extern "C" fn(*mut c_void, *mut c_void, *const c_void, u64, u64) -> *mut c_void,
-    >(objc_msgSend as *const ())(receiver, sel, bytes, length, options)
+    unsafe {
+        std::mem::transmute::<
+            _,
+            extern "C" fn(*mut c_void, *mut c_void, *const c_void, u64, u64) -> *mut c_void,
+        >(objc_msgSend as *const ())(receiver, sel, bytes, length, options)
+    }
 }
 
 unsafe fn msg_new_library(
@@ -157,16 +174,18 @@ unsafe fn msg_new_library(
     opts: *mut c_void,
     error_out: *mut *mut c_void,
 ) -> *mut c_void {
-    std::mem::transmute::<
-        _,
-        extern "C" fn(
-            *mut c_void,
-            *mut c_void,
-            *mut c_void,
-            *mut c_void,
-            *mut *mut c_void,
-        ) -> *mut c_void,
-    >(objc_msgSend as *const ())(receiver, sel, source, opts, error_out)
+    unsafe {
+        std::mem::transmute::<
+            _,
+            extern "C" fn(
+                *mut c_void,
+                *mut c_void,
+                *mut c_void,
+                *mut c_void,
+                *mut *mut c_void,
+            ) -> *mut c_void,
+        >(objc_msgSend as *const ())(receiver, sel, source, opts, error_out)
+    }
 }
 
 unsafe fn msg_set_buffer(
@@ -176,9 +195,11 @@ unsafe fn msg_set_buffer(
     offset: u64,
     index: u64,
 ) {
-    std::mem::transmute::<_, extern "C" fn(*mut c_void, *mut c_void, *mut c_void, u64, u64)>(
-        objc_msgSend as *const (),
-    )(receiver, sel, buffer, offset, index);
+    unsafe {
+        std::mem::transmute::<_, extern "C" fn(*mut c_void, *mut c_void, *mut c_void, u64, u64)>(
+            objc_msgSend as *const (),
+        )(receiver, sel, buffer, offset, index);
+    }
 }
 
 unsafe fn msg_dispatch(
@@ -191,10 +212,12 @@ unsafe fn msg_dispatch(
     ty: u64,
     tz: u64,
 ) {
-    std::mem::transmute::<
-        _,
-        extern "C" fn(*mut c_void, *mut c_void, u64, u64, u64, u64, u64, u64),
-    >(objc_msgSend as *const ())(receiver, sel, gx, gy, gz, tx, ty, tz);
+    unsafe {
+        std::mem::transmute::<
+            _,
+            extern "C" fn(*mut c_void, *mut c_void, u64, u64, u64, u64, u64, u64),
+        >(objc_msgSend as *const ())(receiver, sel, gx, gy, gz, tx, ty, tz);
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -203,25 +226,29 @@ unsafe fn msg_dispatch(
 
 unsafe fn nsstring(s: &str) -> *mut c_void {
     let cstr = CString::new(s).unwrap();
-    let nsstring_class = objc_getClass(b"NSString\0".as_ptr() as *const _);
-    let init_sel = sel("stringWithUTF8String:");
+    let nsstring_class =
+        unsafe { objc_getClass(b"NSString\0".as_ptr() as *const _) };
+    let init_sel = unsafe { sel("stringWithUTF8String:") };
     let f: extern "C" fn(*mut c_void, *mut c_void, *const u8) -> *mut c_void =
-        std::mem::transmute(objc_msgSend as *const ());
+        unsafe { std::mem::transmute(objc_msgSend as *const ()) };
     let ns = f(nsstring_class, init_sel, cstr.as_ptr() as *const u8);
     // Retain — autorelease pool would free this
-    msg_id(ns, selectors().retain);
+    unsafe { msg_id(ns, selectors().retain) };
     ns
 }
 
 unsafe fn nsstring_read(ns: *mut c_void) -> String {
     let sels = selectors();
-    let utf8 = msg_id(ns, sels.utf8_string) as *const std::ffi::c_char;
+    let utf8 =
+        unsafe { msg_id(ns, sels.utf8_string) as *const std::ffi::c_char };
     if utf8.is_null() {
         return "(null)".into();
     }
-    std::ffi::CStr::from_ptr(utf8)
-        .to_string_lossy()
-        .into_owned()
+    unsafe {
+        std::ffi::CStr::from_ptr(utf8)
+            .to_string_lossy()
+            .into_owned()
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════
