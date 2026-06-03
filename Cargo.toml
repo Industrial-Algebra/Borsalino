@@ -25,6 +25,10 @@ naga = { version = "27", features = ["wgsl-in", "spv-out", "msl-out"] }
 karpal-verify = { version = "0.5", optional = true }
 karpal-proof = { version = "0.5", optional = true }
 
+# Metal backend (macOS) — objc crate for safe ARM64 msg_send dispatch
+[target.'cfg(target_os = "macos")'.dependencies]
+objc = "0.2"
+
 # Vulkan backend (Linux/Windows) — raw FFI via ash
 [target.'cfg(any(target_os = "linux", target_os = "windows"))'.dependencies]
 ash = { version = "0.38", optional = true }

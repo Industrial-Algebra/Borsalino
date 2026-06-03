@@ -3,119 +3,33 @@
 
 //! Metal GPU backend for Apple Silicon.
 //!
-//! Raw Objective-C FFI — no `metal-rs`, no `objc` crate, no `core-graphics`.
-//! Just `extern "C"` calls to the Metal framework and Objective-C runtime.
+//! Uses the `objc` crate for safe `msg_send!` dispatch on ARM64.
+//! All other FFI (MTLCreateSystemDefaultDevice, naga WGSL→MSL) is raw.
 //!
-//! ## FFI surface
+//! ## Dependencies
 //!
-//! 3 extern functions, 19 selectors, 1 crate dependency (naga for WGSL→MSL translation).
-//!
-//! | Function | Role |
-//! |----------|------|
-//! | `MTLCreateSystemDefaultDevice` | Get the default Metal GPU |
-//! | `objc_getClass` | Look up an ObjC class |
-//! | `sel_registerName` | Register a selector by name |
-//! | `objc_msgSend` | Universal message dispatch |
+//! - `objc` 0.2 — `msg_send!` macro, correctly handles ARM64 calling convention
+//! - `naga` 27 — WGSL → MSL translation
 
-use std::ffi::{c_void, CString};
+use std::ffi::c_void;
 use std::ptr::NonNull;
 
 use naga::back::msl;
 use naga::front::wgsl;
 use naga::valid::{Capabilities, ValidationFlags, Validator};
+use objc::runtime::Sel;
+use objc::{class, msg_send, sel};
 
 use crate::{ComputePipeline, GpuBuffer, GpuBackend, GpuError, Result};
 
 // ═══════════════════════════════════════════════════════════════════
-// Objective-C / Metal extern declarations
+// Metal C symbol
 // ═══════════════════════════════════════════════════════════════════
 
 #[link(name = "Metal", kind = "framework")]
 #[link(name = "Foundation", kind = "framework")]
 unsafe extern "C" {
     fn MTLCreateSystemDefaultDevice() -> *mut c_void;
-    fn objc_getClass(name: *const std::ffi::c_char) -> *mut c_void;
-    fn sel_registerName(name: *const std::ffi::c_char) -> *mut c_void;
-
-    // Typed objc_msgSend variants — each in its own extern block to avoid
-    // clashing declaration warnings on ARM64. Each includes self + _cmd + args.
-}
-
-unsafe extern "C" {
-    #[link_name = "objc_msgSend"]
-    fn msg_send_id(self_: *mut c_void, sel: *mut c_void) -> *mut c_void;
-}
-unsafe extern "C" {
-    #[link_name = "objc_msgSend"]
-    fn msg_send_id_id(self_: *mut c_void, sel: *mut c_void, a1: *mut c_void) -> *mut c_void;
-}
-unsafe extern "C" {
-    #[link_name = "objc_msgSend"]
-    fn msg_send_id_id_id(
-        self_: *mut c_void,
-        sel: *mut c_void,
-        a1: *mut c_void,
-        a2: *mut c_void,
-    ) -> *mut c_void;
-}
-unsafe extern "C" {
-    #[link_name = "objc_msgSend"]
-    fn msg_send_id_buf(
-        self_: *mut c_void,
-        sel: *mut c_void,
-        bytes: *const c_void,
-        length: u64,
-        options: u64,
-    ) -> *mut c_void;
-}
-unsafe extern "C" {
-    #[link_name = "objc_msgSend"]
-    fn msg_send_id_lib(
-        self_: *mut c_void,
-        sel: *mut c_void,
-        source: *mut c_void,
-        opts: *mut c_void,
-        error_out: *mut *mut c_void,
-    ) -> *mut c_void;
-}
-unsafe extern "C" {
-    #[link_name = "objc_msgSend"]
-    fn msg_send_void_id(self_: *mut c_void, sel: *mut c_void, a1: *mut c_void);
-}
-unsafe extern "C" {
-    #[link_name = "objc_msgSend"]
-    fn msg_send_void(self_: *mut c_void, sel: *mut c_void);
-}
-unsafe extern "C" {
-    #[link_name = "objc_msgSend"]
-    fn msg_send_set_buf(
-        self_: *mut c_void,
-        sel: *mut c_void,
-        buffer: *mut c_void,
-        offset: u64,
-        index: u64,
-    );
-}
-unsafe extern "C" {
-    #[link_name = "objc_msgSend"]
-    fn msg_send_dispatch(
-        self_: *mut c_void,
-        sel: *mut c_void,
-        gx: u64,
-        gy: u64,
-        gz: u64,
-        tx: u64,
-        ty: u64,
-        tz: u64,
-    );
-}
-unsafe extern "C" {
-    #[link_name = "objc_msgSend"]
-    fn msg_send_string(
-        self_: *mut c_void,
-        sel: *mut c_void,
-        s: *const u8,
-    ) -> *mut c_void;
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -123,136 +37,53 @@ unsafe extern "C" {
 // ═══════════════════════════════════════════════════════════════════
 
 struct Selectors {
-    new_buffer_with_bytes: *mut c_void,
-    new_library_with_source: *mut c_void,
-    new_function_with_name: *mut c_void,
-    new_compute_pipeline_state: *mut c_void,
-    new_command_queue: *mut c_void,
-    command_buffer: *mut c_void,
-    compute_command_encoder: *mut c_void,
-    set_compute_pipeline_state: *mut c_void,
-    set_buffer_offset_at_index: *mut c_void,
-    dispatch_threadgroups: *mut c_void,
-    end_encoding: *mut c_void,
-    commit: *mut c_void,
-    wait_until_completed: *mut c_void,
-    contents: *mut c_void,
-    retain: *mut c_void,
-    release: *mut c_void,
-    localized_description: *mut c_void,
-    utf8_string: *mut c_void,
+    new_buffer_with_bytes: Sel,
+    new_library_with_source: Sel,
+    new_function_with_name: Sel,
+    new_compute_pipeline_state: Sel,
+    new_command_queue: Sel,
+    command_buffer: Sel,
+    compute_command_encoder: Sel,
+    set_compute_pipeline_state: Sel,
+    set_buffer_offset_at_index: Sel,
+    dispatch_threadgroups: Sel,
+    end_encoding: Sel,
+    commit: Sel,
+    wait_until_completed: Sel,
+    contents: Sel,
+    retain: Sel,
+    release: Sel,
+    localized_description: Sel,
+    utf8_string: Sel,
 }
 
-// SAFETY: Selectors contains only opaque selector pointers obtained from
-// sel_registerName, which are constant after registration and trivially Send+Sync.
+// SAFETY: Sel is a zero-sized wrapper around a registered selector pointer.
 unsafe impl Send for Selectors {}
 unsafe impl Sync for Selectors {}
 
 fn selectors() -> &'static Selectors {
     use std::sync::OnceLock;
     static SEL: OnceLock<Selectors> = OnceLock::new();
-    SEL.get_or_init(|| unsafe {
-        Selectors {
-            new_buffer_with_bytes: sel("newBufferWithBytes:length:options:"),
-            new_library_with_source: sel("newLibraryWithSource:options:error:"),
-            new_function_with_name: sel("newFunctionWithName:"),
-            new_compute_pipeline_state: sel("newComputePipelineStateWithFunction:error:"),
-            new_command_queue: sel("newCommandQueue"),
-            command_buffer: sel("commandBuffer"),
-            compute_command_encoder: sel("computeCommandEncoder"),
-            set_compute_pipeline_state: sel("setComputePipelineState:"),
-            set_buffer_offset_at_index: sel("setBuffer:offset:atIndex:"),
-            dispatch_threadgroups: sel("dispatchThreadgroups:threadsPerThreadgroup:"),
-            end_encoding: sel("endEncoding"),
-            commit: sel("commit"),
-            wait_until_completed: sel("waitUntilCompleted"),
-            contents: sel("contents"),
-            retain: sel("retain"),
-            release: sel("release"),
-            localized_description: sel("localizedDescription"),
-            utf8_string: sel("UTF8String"),
-        }
+    SEL.get_or_init(|| Selectors {
+        new_buffer_with_bytes: sel!(newBufferWithBytes:length:options:),
+        new_library_with_source: sel!(newLibraryWithSource:options:error:),
+        new_function_with_name: sel!(newFunctionWithName:),
+        new_compute_pipeline_state: sel!(newComputePipelineStateWithFunction:error:),
+        new_command_queue: sel!(newCommandQueue),
+        command_buffer: sel!(commandBuffer),
+        compute_command_encoder: sel!(computeCommandEncoder),
+        set_compute_pipeline_state: sel!(setComputePipelineState:),
+        set_buffer_offset_at_index: sel!(setBuffer:offset:atIndex:),
+        dispatch_threadgroups: sel!(dispatchThreadgroups:threadsPerThreadgroup:),
+        end_encoding: sel!(endEncoding),
+        commit: sel!(commit),
+        wait_until_completed: sel!(waitUntilCompleted),
+        contents: sel!(contents),
+        retain: sel!(retain),
+        release: sel!(release),
+        localized_description: sel!(localizedDescription),
+        utf8_string: sel!(UTF8String),
     })
-}
-
-unsafe fn sel(name: &str) -> *mut c_void {
-    unsafe { sel_registerName(CString::new(name).unwrap().as_ptr()) }
-}
-
-// ═══════════════════════════════════════════════════════════════════
-// objc_msgSend typed wrappers
-// ═══════════════════════════════════════════════════════════════════
-
-unsafe fn msg_id(receiver: *mut c_void, sel: *mut c_void) -> *mut c_void {
-    unsafe { msg_send_id(receiver, sel) }
-}
-
-unsafe fn msg_id_id(
-    receiver: *mut c_void,
-    sel: *mut c_void,
-    arg: *mut c_void,
-) -> *mut c_void {
-    unsafe { msg_send_id_id(receiver, sel, arg) }
-}
-
-unsafe fn msg_id_id_id(
-    receiver: *mut c_void,
-    sel: *mut c_void,
-    arg1: *mut c_void,
-    arg2: *mut c_void,
-) -> *mut c_void {
-    unsafe { msg_send_id_id_id(receiver, sel, arg1, arg2) }
-}
-
-unsafe fn msg_void_id(receiver: *mut c_void, sel: *mut c_void, arg: *mut c_void) {
-    unsafe { msg_send_void_id(receiver, sel, arg) }
-}
-
-unsafe fn msg_void(receiver: *mut c_void, sel: *mut c_void) {
-    unsafe { msg_send_void(receiver, sel) }
-}
-
-unsafe fn msg_new_buffer(
-    receiver: *mut c_void,
-    sel: *mut c_void,
-    bytes: *const c_void,
-    length: u64,
-    options: u64,
-) -> *mut c_void {
-    unsafe { msg_send_id_buf(receiver, sel, bytes, length, options) }
-}
-
-unsafe fn msg_new_library(
-    receiver: *mut c_void,
-    sel: *mut c_void,
-    source: *mut c_void,
-    opts: *mut c_void,
-    error_out: *mut *mut c_void,
-) -> *mut c_void {
-    unsafe { msg_send_id_lib(receiver, sel, source, opts, error_out) }
-}
-
-unsafe fn msg_set_buffer(
-    receiver: *mut c_void,
-    sel: *mut c_void,
-    buffer: *mut c_void,
-    offset: u64,
-    index: u64,
-) {
-    unsafe { msg_send_set_buf(receiver, sel, buffer, offset, index) }
-}
-
-unsafe fn msg_dispatch(
-    receiver: *mut c_void,
-    sel: *mut c_void,
-    gx: u64,
-    gy: u64,
-    gz: u64,
-    tx: u64,
-    ty: u64,
-    tz: u64,
-) {
-    unsafe { msg_send_dispatch(receiver, sel, gx, gy, gz, tx, ty, tz) }
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -260,34 +91,23 @@ unsafe fn msg_dispatch(
 // ═══════════════════════════════════════════════════════════════════
 
 unsafe fn nsstring(s: &str) -> *mut c_void {
-    let cstr = CString::new(s).unwrap();
-    let nsstring_class =
-        unsafe { objc_getClass(b"NSString\0".as_ptr() as *const _) };
-    let init_sel = unsafe { sel("stringWithUTF8String:") };
-    let ns = unsafe {
-        msg_send_string(nsstring_class, init_sel, cstr.as_ptr() as *const u8)
-    };
-    // Retain — autorelease pool would free this
-    unsafe { msg_id(ns, selectors().retain) };
+    let ns: *mut c_void = msg_send![class!(NSString), stringWithUTF8String:s.as_ptr()];
+    let _: *mut c_void = msg_send![ns, retain];
     ns
 }
 
 unsafe fn nsstring_read(ns: *mut c_void) -> String {
-    let sels = selectors();
-    let utf8 =
-        unsafe { msg_id(ns, sels.utf8_string) as *const std::ffi::c_char };
+    let utf8: *const std::ffi::c_char = msg_send![ns, UTF8String];
     if utf8.is_null() {
         return "(null)".into();
     }
-    unsafe {
-        std::ffi::CStr::from_ptr(utf8)
-            .to_string_lossy()
-            .into_owned()
-    }
+    unsafe { std::ffi::CStr::from_ptr(utf8) }
+        .to_string_lossy()
+        .into_owned()
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// Internal Metal handles (not exposed to callers)
+// Internal Metal handles
 // ═══════════════════════════════════════════════════════════════════
 
 struct MetalDevice {
@@ -300,7 +120,7 @@ unsafe impl Sync for MetalDevice {}
 impl Drop for MetalDevice {
     fn drop(&mut self) {
         unsafe {
-            msg_void(self.ptr.as_ptr(), selectors().release);
+            let _: () = msg_send![self.ptr.as_ptr(), release];
         }
     }
 }
@@ -312,35 +132,32 @@ struct MetalQueue {
 impl Drop for MetalQueue {
     fn drop(&mut self) {
         unsafe {
-            msg_void(self.ptr.as_ptr(), selectors().release);
+            let _: () = msg_send![self.ptr.as_ptr(), release];
         }
     }
 }
 
-/// Drop a Metal pipeline state.
 fn drop_pipeline(raw: *mut c_void) {
     if !raw.is_null() {
         unsafe {
-            msg_void(raw, selectors().release);
+            let _: () = msg_send![raw, release];
         }
     }
 }
 
-/// Drop a Metal buffer.
 fn drop_buffer(raw: *mut c_void) {
     if !raw.is_null() {
         unsafe {
-            msg_void(raw, selectors().release);
+            let _: () = msg_send![raw, release];
         }
     }
 }
 
-/// Get the contents pointer of a Metal buffer.
 fn contents_of(raw: *mut c_void) -> *const c_void {
     if raw.is_null() {
         return std::ptr::null();
     }
-    unsafe { msg_id(raw, selectors().contents) }
+    unsafe { msg_send![raw, contents] }
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -348,16 +165,6 @@ fn contents_of(raw: *mut c_void) -> *const c_void {
 // ═══════════════════════════════════════════════════════════════════
 
 /// Metal GPU backend for Apple Silicon.
-///
-/// Holds a reference to the system default `MTLDevice` and a
-/// persistent `MTLCommandQueue`. Created via [`MetalBackend::init`].
-///
-/// # Platform
-///
-/// Only available on macOS with the `metal` feature enabled.
-/// The `MTLCreateSystemDefaultDevice` call returns null on
-/// Intel Macs without a Metal-capable GPU (rare) or in CI
-/// environments without GPU passthrough.
 pub struct MetalBackend {
     device: MetalDevice,
     queue: MetalQueue,
@@ -365,7 +172,6 @@ pub struct MetalBackend {
 
 impl MetalBackend {
     const STORAGE_MODE_SHARED: u64 = 0;
-    /// Buffer slot for the naga-generated sizes buffer (u32 array of element counts).
     const SIZES_BUFFER_SLOT: msl::Slot = 30;
 }
 
@@ -374,15 +180,16 @@ impl GpuBackend for MetalBackend {
         let device_ptr = unsafe { MTLCreateSystemDefaultDevice() };
         if device_ptr.is_null() {
             return Err(GpuError::InitFailed(
-                "MTLCreateSystemDefaultDevice returned null — no Metal-capable GPU".into(),
+                "MTLCreateSystemDefaultDevice returned null — no Metal-capable GPU"
+                    .into(),
             ));
         }
 
-        let sels = selectors();
-        let queue_ptr = unsafe { msg_id(device_ptr, sels.new_command_queue) };
+        let queue_ptr: *mut c_void =
+            unsafe { msg_send![device_ptr, newCommandQueue] };
         if queue_ptr.is_null() {
             unsafe {
-                msg_void(device_ptr, sels.release);
+                let _: () = msg_send![device_ptr, release];
             }
             return Err(GpuError::InitFailed(
                 "failed to create MTLCommandQueue".into(),
@@ -399,19 +206,25 @@ impl GpuBackend for MetalBackend {
         })
     }
 
-    fn compile(&self, entry_point: &str, wgsl_source: &str) -> Result<ComputePipeline> {
+    fn compile(
+        &self,
+        entry_point: &str,
+        wgsl_source: &str,
+    ) -> Result<ComputePipeline> {
         // Step 0: Translate WGSL → MSL via naga
-        eprintln!("[borsalino::metal] compile: entry_point={entry_point}");
-        let module = wgsl::parse_str(wgsl_source).map_err(|e| GpuError::CompileFailed {
-            entry: entry_point.into(),
-            message: e.emit_to_string(wgsl_source),
-        })?;
+        let module =
+            wgsl::parse_str(wgsl_source).map_err(|e| GpuError::CompileFailed {
+                entry: entry_point.into(),
+                message: e.emit_to_string(wgsl_source),
+            })?;
 
-        let mut validator = Validator::new(ValidationFlags::all(), Capabilities::all());
-        let info = validator.validate(&module).map_err(|e| GpuError::CompileFailed {
-            entry: entry_point.into(),
-            message: e.emit_to_string(wgsl_source),
-        })?;
+        let mut validator =
+            Validator::new(ValidationFlags::all(), Capabilities::all());
+        let info =
+            validator.validate(&module).map_err(|e| GpuError::CompileFailed {
+                entry: entry_point.into(),
+                message: e.emit_to_string(wgsl_source),
+            })?;
 
         // Build resource binding map: @group(0) @binding(N) → buffer(N)
         let mut resources = msl::BindingMap::new();
@@ -456,43 +269,32 @@ impl GpuBackend for MetalBackend {
             .per_entry_point_map
             .insert(entry_point.into(), entry_resources);
 
-        let (msl_source, _) = msl::write_string(
-            &module,
-            &info,
-            &msl_opts,
-            &msl::PipelineOptions::default(),
-        )
-        .map_err(|e| GpuError::CompileFailed {
-            entry: entry_point.into(),
-            message: format!("MSL emission failed: {e}"),
-        })?;
+        let (msl_source, _) =
+            msl::write_string(&module, &info, &msl_opts, &msl::PipelineOptions::default())
+                .map_err(|e| GpuError::CompileFailed {
+                    entry: entry_point.into(),
+                    message: format!("MSL emission failed: {e}"),
+                })?;
 
-        eprintln!("[borsalino::metal] MSL generated ({} bytes):\n{msl_source}", msl_source.len());
-
-        let sels = selectors();
         let dev = self.device.ptr.as_ptr();
 
         unsafe {
             // Step 1: MTLLibrary from source
-            eprintln!("[borsalino::metal] creating MTLLibrary...");
             let ns_src = nsstring(&msl_source);
-            eprintln!("[borsalino::metal] nsstring created");
             let mut err: *mut c_void = std::ptr::null_mut();
-            let library = msg_new_library(
+            let library: *mut c_void = msg_send![
                 dev,
-                sels.new_library_with_source,
-                ns_src,
-                std::ptr::null_mut(),
-                &mut err,
-            );
-            msg_void(ns_src, sels.release);
-            eprintln!("[borsalino::metal] library created, library={library:p}");
+                newLibraryWithSource:ns_src
+                options:std::ptr::null_mut::<c_void>()
+                error:&mut err
+            ];
+            let _: () = msg_send![ns_src, release];
 
             if library.is_null() {
                 let msg = if !err.is_null() {
-                    let desc = msg_id(err, sels.localized_description);
+                    let desc: *mut c_void = msg_send![err, localizedDescription];
                     let s = nsstring_read(desc);
-                    msg_void(err, sels.release);
+                    let _: () = msg_send![err, release];
                     s
                 } else {
                     "unknown compilation error".into()
@@ -504,42 +306,39 @@ impl GpuBackend for MetalBackend {
             }
 
             // Step 2: MTLFunction
-            eprintln!("[borsalino::metal] looking up function '{entry_point}'...");
             let ns_entry = nsstring(entry_point);
-            eprintln!("[borsalino::metal] entry nsstring created");
-            let func = msg_id_id(library, sels.new_function_with_name, ns_entry);
-            eprintln!("[borsalino::metal] func={func:p}");
-            msg_void(ns_entry, sels.release);
+            let func: *mut c_void = msg_send![library, newFunctionWithName:ns_entry];
+            let _: () = msg_send![ns_entry, release];
 
             if func.is_null() {
-                msg_void(library, sels.release);
+                let _: () = msg_send![library, release];
                 return Err(GpuError::PipelineFailed {
                     entry: entry_point.into(),
-                    message: format!("function '{entry_point}' not found in compiled library"),
+                    message: format!(
+                        "function '{entry_point}' not found in compiled library"
+                    ),
                 });
             }
 
             // Step 3: MTLComputePipelineState
-            eprintln!("[borsalino::metal] creating compute pipeline state...");
             let mut perr: *mut c_void = std::ptr::null_mut();
-            let pipeline = msg_id_id_id(
+            let pipeline: *mut c_void = msg_send![
                 dev,
-                sels.new_compute_pipeline_state,
-                func,
-                &mut perr as *mut _ as *mut c_void,
-            );
+                newComputePipelineStateWithFunction:func
+                error:&mut perr
+            ];
 
             if pipeline.is_null() {
                 let msg = if !perr.is_null() {
-                    let desc = msg_id(perr, sels.localized_description);
+                    let desc: *mut c_void = msg_send![perr, localizedDescription];
                     let s = nsstring_read(desc);
-                    msg_void(perr, sels.release);
+                    let _: () = msg_send![perr, release];
                     s
                 } else {
                     "unknown pipeline error".into()
                 };
-                msg_void(func, sels.release);
-                msg_void(library, sels.release);
+                let _: () = msg_send![func, release];
+                let _: () = msg_send![library, release];
                 return Err(GpuError::PipelineFailed {
                     entry: entry_point.into(),
                     message: msg,
@@ -547,8 +346,8 @@ impl GpuBackend for MetalBackend {
             }
 
             // Release intermediates
-            msg_void(func, sels.release);
-            msg_void(library, sels.release);
+            let _: () = msg_send![func, release];
+            let _: () = msg_send![library, release];
 
             Ok(ComputePipeline {
                 raw: pipeline,
@@ -557,19 +356,21 @@ impl GpuBackend for MetalBackend {
         }
     }
 
-    fn create_buffer<T: bytemuck::Pod>(&self, data: &[T]) -> Result<GpuBuffer> {
+    fn create_buffer<T: bytemuck::Pod>(
+        &self,
+        data: &[T],
+    ) -> Result<GpuBuffer> {
         let element_size = std::mem::size_of::<T>();
         let byte_len = data.len() * element_size;
-        let sels = selectors();
+        let dev = self.device.ptr.as_ptr();
 
-        let buf = unsafe {
-            msg_new_buffer(
-                self.device.ptr.as_ptr(),
-                sels.new_buffer_with_bytes,
-                data.as_ptr() as *const c_void,
-                byte_len as u64,
-                Self::STORAGE_MODE_SHARED,
-            )
+        let buf: *mut c_void = unsafe {
+            msg_send![
+                dev,
+                newBufferWithBytes:data.as_ptr() as *const c_void
+                length:byte_len as u64
+                options:Self::STORAGE_MODE_SHARED
+            ]
         };
 
         if buf.is_null() {
@@ -590,19 +391,21 @@ impl GpuBackend for MetalBackend {
         })
     }
 
-    fn create_buffer_uninit<T: bytemuck::Pod>(&self, len: usize) -> Result<GpuBuffer> {
+    fn create_buffer_uninit<T: bytemuck::Pod>(
+        &self,
+        len: usize,
+    ) -> Result<GpuBuffer> {
         let element_size = std::mem::size_of::<T>();
         let byte_len = len * element_size;
-        let sels = selectors();
+        let dev = self.device.ptr.as_ptr();
 
-        let buf = unsafe {
-            msg_new_buffer(
-                self.device.ptr.as_ptr(),
-                sels.new_buffer_with_bytes,
-                std::ptr::null(),
-                byte_len as u64,
-                Self::STORAGE_MODE_SHARED,
-            )
+        let buf: *mut c_void = unsafe {
+            msg_send![
+                dev,
+                newBufferWithBytes:std::ptr::null::<c_void>()
+                length:byte_len as u64
+                options:Self::STORAGE_MODE_SHARED
+            ]
         };
 
         if buf.is_null() {
@@ -636,85 +439,82 @@ impl GpuBackend for MetalBackend {
         workgroups: (u32, u32, u32),
         threads_per_group: (u32, u32, u32),
     ) -> Result<()> {
-        let sels = selectors();
+        let dev = self.device.ptr.as_ptr();
         unsafe {
-            let cmd = msg_id(self.queue.ptr.as_ptr(), sels.command_buffer);
+            let cmd: *mut c_void = msg_send![self.queue.ptr.as_ptr(), commandBuffer];
             if cmd.is_null() {
                 return Err(GpuError::DispatchFailed {
                     message: "failed to create MTLCommandBuffer".into(),
                 });
             }
 
-            let encoder = msg_id(cmd, sels.compute_command_encoder);
+            let encoder: *mut c_void = msg_send![cmd, computeCommandEncoder];
             if encoder.is_null() {
-                msg_void(cmd, sels.release);
+                let _: () = msg_send![cmd, release];
                 return Err(GpuError::DispatchFailed {
                     message: "failed to create MTLComputeCommandEncoder".into(),
                 });
             }
 
             // Set pipeline
-            msg_void_id(encoder, sels.set_compute_pipeline_state, pipeline.raw);
+            let _: () =
+                msg_send![encoder, setComputePipelineState:pipeline.raw];
 
             // Bind sizes buffer (naga runtime array element counts)
             let sizes: Vec<u32> = buffers.iter().map(|b| b.len as u32).collect();
-            let sizes_buf = msg_new_buffer(
-                self.device.ptr.as_ptr(),
-                sels.new_buffer_with_bytes,
-                sizes.as_ptr() as *const c_void,
-                (sizes.len() * 4) as u64,
-                Self::STORAGE_MODE_SHARED,
-            );
-            msg_set_buffer(
+            let sizes_buf: *mut c_void = msg_send![
+                dev,
+                newBufferWithBytes:sizes.as_ptr() as *const c_void
+                length:(sizes.len() * 4) as u64
+                options:Self::STORAGE_MODE_SHARED
+            ];
+            let _: () = msg_send![
                 encoder,
-                sels.set_buffer_offset_at_index,
-                sizes_buf,
-                0,
-                Self::SIZES_BUFFER_SLOT as u64,
-            );
+                setBuffer:sizes_buf
+                offset:0u64
+                atIndex:Self::SIZES_BUFFER_SLOT as u64
+            ];
 
-            // Bind buffers
+            // Bind user buffers
             for (i, buf) in buffers.iter().enumerate() {
-                msg_set_buffer(
+                let _: () = msg_send![
                     encoder,
-                    sels.set_buffer_offset_at_index,
-                    buf.raw,
-                    0,
-                    i as u64,
-                );
+                    setBuffer:buf.raw
+                    offset:0u64
+                    atIndex:i as u64
+                ];
             }
 
             // Dispatch
-            msg_dispatch(
+            let _: () = msg_send![
                 encoder,
-                sels.dispatch_threadgroups,
-                workgroups.0 as u64,
-                workgroups.1 as u64,
-                workgroups.2 as u64,
-                threads_per_group.0 as u64,
-                threads_per_group.1 as u64,
-                threads_per_group.2 as u64,
-            );
+                dispatchThreadgroups:(workgroups.0 as u64, workgroups.1 as u64, workgroups.2 as u64)
+                threadsPerThreadgroup:(threads_per_group.0 as u64, threads_per_group.1 as u64, threads_per_group.2 as u64)
+            ];
 
             // Finish
-            msg_void(encoder, sels.end_encoding);
-            msg_void(cmd, sels.commit);
-            msg_void(cmd, sels.wait_until_completed);
-            msg_void(cmd, sels.release);
-            msg_void(sizes_buf, sels.release);
+            let _: () = msg_send![encoder, endEncoding];
+            let _: () = msg_send![cmd, commit];
+            let _: () = msg_send![cmd, waitUntilCompleted];
+            let _: () = msg_send![cmd, release];
+            let _: () = msg_send![sizes_buf, release];
         }
 
         Ok(())
     }
 
-    fn read_buffer<T: bytemuck::Pod>(&self, buffer: &GpuBuffer) -> Result<Vec<T>> {
+    fn read_buffer<T: bytemuck::Pod>(
+        &self,
+        buffer: &GpuBuffer,
+    ) -> Result<Vec<T>> {
         let contents = (buffer.contents_fn)(buffer.raw) as *const T;
         if contents.is_null() {
             return Err(GpuError::BufferReadFailed {
                 message: "buffer contents pointer is null".into(),
             });
         }
-        let slice = unsafe { std::slice::from_raw_parts(contents, buffer.len) };
+        let slice =
+            unsafe { std::slice::from_raw_parts(contents, buffer.len) };
         Ok(slice.to_vec())
     }
 }
@@ -760,7 +560,8 @@ mod tests {
         "#;
 
         let pipeline = backend.compile("add_one", wgsl).unwrap();
-        let input = backend.create_buffer(&[1.0f32, 2.0, 3.0, 4.0]).unwrap();
+        let input =
+            backend.create_buffer(&[1.0f32, 2.0, 3.0, 4.0]).unwrap();
         let output = backend.create_buffer_uninit::<f32>(4).unwrap();
         backend
             .dispatch(&pipeline, &[&input, &output], (1, 1, 1))
