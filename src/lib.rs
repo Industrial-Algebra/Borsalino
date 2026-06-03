@@ -226,6 +226,39 @@ pub trait GpuBackend: Sized {
 
     /// Read the contents of a GPU buffer back to the CPU.
     fn read_buffer<T: bytemuck::Pod>(&self, buffer: &GpuBuffer) -> Result<Vec<T>>;
+
+    /// Dispatch multiple kernels in a single command buffer.
+    ///
+    /// Amortises command-buffer creation and GPU-sync overhead across
+    /// multiple dispatches. All dispatches execute before any results
+    /// are visible to the CPU.
+    ///
+    /// The default implementation calls [`dispatch`](GpuBackend::dispatch)
+    /// for each spec. Backends may override with a batched implementation.
+    fn dispatch_many(&self, dispatches: &[DispatchSpec<'_>]) -> Result<()> {
+        for spec in dispatches {
+            self.dispatch_ex(
+                spec.pipeline,
+                spec.buffers,
+                spec.workgroups,
+                spec.threads_per_group,
+            )?;
+        }
+        Ok(())
+    }
+}
+
+/// Spec for a single dispatch within [`GpuBackend::dispatch_many`].
+#[derive(Clone, Copy)]
+pub struct DispatchSpec<'a> {
+    /// The compiled compute pipeline.
+    pub pipeline: &'a ComputePipeline,
+    /// Buffers to bind, in `@group(0) @binding(N)` order.
+    pub buffers: &'a [&'a GpuBuffer],
+    /// Number of threadgroups in (x, y, z).
+    pub workgroups: (u32, u32, u32),
+    /// Threads per threadgroup (default: 256, 1, 1).
+    pub threads_per_group: (u32, u32, u32),
 }
 
 // ── Stub backend (compile-time sentinel) ──────────────────────────

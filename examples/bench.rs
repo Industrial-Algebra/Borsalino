@@ -297,6 +297,55 @@ fn main() -> Result<(), borsalino::GpuError> {
         results.push(bench);
     }
 
+    // ── Batched SAXPY (amortise dispatch overhead) ────────────
+
+    println!("--- Batched SAXPY (256 dispatches per command buffer) ---");
+
+    let batch_size: u32 = 256;
+
+    for &n in sizes {
+        let x: Vec<f32> = (0..n).map(|i| i as f32).collect();
+        let y: Vec<f32> = (0..n).map(|i| (n - i) as f32).collect();
+        let buf_x = gpu.create_buffer(&x)?;
+        let buf_y = gpu.create_buffer(&y)?;
+        let buf_out = gpu.create_buffer_uninit::<f32>(n as usize)?;
+        let wgs = workgroups_for(n, 256);
+        let iters = if n <= 262_144 { 50 } else { 10 };
+        let (unit, scale) = scale_unit(n);
+
+        let buffers: &[&borsalino::GpuBuffer] = &[&buf_x, &buf_y, &buf_out];
+        let spec = borsalino::DispatchSpec {
+            pipeline: &pipeline_saxpy,
+            buffers,
+            workgroups: (wgs, 1, 1),
+            threads_per_group: (256, 1, 1),
+        };
+        let specs: Vec<_> = (0..batch_size as usize).map(|_| spec).collect();
+
+        let bench = run_bench(
+            &format!("saxpy {n:>9} el ×{batch_size} batched"),
+            unit,
+            iters,
+            || {
+                gpu.dispatch_many(&specs).unwrap();
+            },
+        );
+
+        let total_el = n as f64 * batch_size as f64;
+        let total_ops = total_el * 3.0;
+        let elem_sec = total_el / bench.value;
+        let gflops = total_ops / bench.value / 1e9;
+        let per_dispatch = bench.value / batch_size as f64;
+        println!(
+            "  {n:>9} el  {:>8.3} {unit} total  {:>8.1} µs/dispatch  {:>8.2} GFLOPS  ±{:.1}%",
+            bench.value * scale,
+            per_dispatch * 1e6,
+            gflops,
+            (bench.stddev / bench.value) * 100.0
+        );
+        results.push(bench);
+    }
+
     // ── Summary table ─────────────────────────────────────────
 
     print_results(&results);
