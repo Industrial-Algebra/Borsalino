@@ -368,6 +368,7 @@ impl GpuBackend for MetalBackend {
 
     fn compile(&self, entry_point: &str, wgsl_source: &str) -> Result<ComputePipeline> {
         // Step 0: Translate WGSL → MSL via naga
+        eprintln!("[borsalino::metal] compile: entry_point={entry_point}");
         let module = wgsl::parse_str(wgsl_source).map_err(|e| GpuError::CompileFailed {
             entry: entry_point.into(),
             message: e.emit_to_string(wgsl_source),
@@ -433,12 +434,16 @@ impl GpuBackend for MetalBackend {
             message: format!("MSL emission failed: {e}"),
         })?;
 
+        eprintln!("[borsalino::metal] MSL generated ({} bytes):\n{msl_source}", msl_source.len());
+
         let sels = selectors();
         let dev = self.device.ptr.as_ptr();
 
         unsafe {
             // Step 1: MTLLibrary from source
+            eprintln!("[borsalino::metal] creating MTLLibrary...");
             let ns_src = nsstring(&msl_source);
+            eprintln!("[borsalino::metal] nsstring created");
             let mut err: *mut c_void = std::ptr::null_mut();
             let library = msg_new_library(
                 dev,
@@ -448,6 +453,7 @@ impl GpuBackend for MetalBackend {
                 &mut err,
             );
             msg_void(ns_src, sels.release);
+            eprintln!("[borsalino::metal] library created");
 
             if library.is_null() {
                 let msg = if !err.is_null() {
