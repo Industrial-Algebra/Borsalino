@@ -30,6 +30,8 @@ use crate::{ComputePipeline, GpuBuffer, GpuBackend, GpuError, Result};
 // Objective-C / Metal extern declarations
 // ═══════════════════════════════════════════════════════════════════
 
+#[link(name = "Metal", kind = "framework")]
+#[link(name = "Foundation", kind = "framework")]
 unsafe extern "C" {
     fn MTLCreateSystemDefaultDevice() -> *mut c_void;
     fn objc_getClass(name: *const std::ffi::c_char) -> *mut c_void;
