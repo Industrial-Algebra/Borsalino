@@ -453,7 +453,7 @@ impl GpuBackend for MetalBackend {
                 &mut err,
             );
             msg_void(ns_src, sels.release);
-            eprintln!("[borsalino::metal] library created");
+            eprintln!("[borsalino::metal] library created, library={library:p}");
 
             if library.is_null() {
                 let msg = if !err.is_null() {
@@ -471,8 +471,11 @@ impl GpuBackend for MetalBackend {
             }
 
             // Step 2: MTLFunction
+            eprintln!("[borsalino::metal] looking up function '{entry_point}'...");
             let ns_entry = nsstring(entry_point);
+            eprintln!("[borsalino::metal] entry nsstring created");
             let func = msg_id_id(library, sels.new_function_with_name, ns_entry);
+            eprintln!("[borsalino::metal] func={func:p}");
             msg_void(ns_entry, sels.release);
 
             if func.is_null() {
@@ -484,6 +487,7 @@ impl GpuBackend for MetalBackend {
             }
 
             // Step 3: MTLComputePipelineState
+            eprintln!("[borsalino::metal] creating compute pipeline state...");
             let mut perr: *mut c_void = std::ptr::null_mut();
             let pipeline = msg_id_id_id(
                 dev,
