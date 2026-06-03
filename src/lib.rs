@@ -80,6 +80,25 @@ mod vulkan;
 
 pub use error::{GpuError, Result};
 
+// ── Memory strategy ───────────────────────────────────────────────
+
+/// Memory allocation strategy for GPU buffers.
+///
+/// Controls whether buffer data lives in unified memory (shared with CPU)
+/// or dedicated GPU memory (VRAM), with automatic staging transfers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryStrategy {
+    /// Let the backend choose based on hardware capabilities.
+    /// Discrete GPUs get device-local memory; integrated/unified get host-visible.
+    Auto,
+    /// Force host-visible, host-coherent memory (unified memory systems).
+    /// Best for Apple Silicon, AMD APUs, and GB10.
+    Unified,
+    /// Force device-local memory with staging transfers (discrete GPUs).
+    /// Best for NVIDIA RTX, AMD RDNA, Intel Arc.
+    DeviceLocal,
+}
+
 // ── Opaque handle types ───────────────────────────────────────────
 
 use std::ffi::c_void;
@@ -180,7 +199,17 @@ pub trait GpuBackend: Sized {
     ///
     /// On macOS Metal, returns the system default Metal device.
     /// On Vulkan, returns the first available discrete GPU.
+    /// Memory strategy is auto-detected from hardware capabilities.
     fn init() -> Result<Self>;
+
+    /// Initialise with an explicit memory strategy.
+    ///
+    /// Overrides the automatic detection. Use [`MemoryStrategy::DeviceLocal`]
+    /// to force VRAM allocation on discrete GPUs, or [`MemoryStrategy::Unified`]
+    /// to force host-visible memory even when device-local is available.
+    fn init_with_strategy(_strategy: MemoryStrategy) -> Result<Self> {
+        Self::init()
+    }
 
     /// Compile WGSL source into a compute pipeline.
     ///
@@ -292,6 +321,15 @@ pub fn init() -> Result<metal::MetalBackend> {
 #[cfg(all(feature = "vulkan", not(target_os = "macos")))]
 pub fn init() -> Result<vulkan::VulkanBackend> {
     vulkan::VulkanBackend::init()
+}
+
+/// Initialise with device-local memory (forces VRAM allocation on discrete GPUs).
+///
+/// Equivalent to `init_with_strategy(MemoryStrategy::DeviceLocal)`.
+/// Use when you know you're on discrete hardware and want maximum throughput.
+#[cfg(all(feature = "vulkan", not(target_os = "macos")))]
+pub fn init_device_local() -> Result<vulkan::VulkanBackend> {
+    vulkan::VulkanBackend::init_with_strategy(MemoryStrategy::DeviceLocal)
 }
 
 /// Stub backend — returned by `init()` when no GPU backend is available.
