@@ -73,6 +73,7 @@
 mod error;
 #[cfg(all(feature = "metal", target_os = "macos"))]
 mod metal;
+#[cfg(feature = "verify")]
 pub mod verify;
 #[cfg(all(feature = "vulkan", not(target_os = "macos")))]
 mod vulkan;

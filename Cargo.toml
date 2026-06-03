@@ -13,12 +13,17 @@ categories = ["hardware-support", "mathematics"]
 default = []
 metal = []
 vulkan = ["dep:ash"]
-verify = []
+verify = ["dep:karpal-verify", "dep:karpal-proof"]
 
 [dependencies]
 thiserror = "2"
 bytemuck = { version = "1", features = ["derive"] }
 naga = { version = "27", features = ["wgsl-in", "spv-out", "msl-out"] }
+
+# Verification (GPU safety properties, obligation bundles)
+# For local development, add: path = "../karpal/karpal-verify"
+karpal-verify = { version = "0.5", optional = true }
+karpal-proof = { version = "0.5", optional = true }
 
 # Vulkan backend (Linux/Windows) — raw FFI via ash
 [target.'cfg(any(target_os = "linux", target_os = "windows"))'.dependencies]

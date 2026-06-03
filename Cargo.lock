@@ -50,6 +50,8 @@ version = "0.1.0"
 dependencies = [
  "ash",
  "bytemuck",
+ "karpal-proof",
+ "karpal-verify",
  "naga",
  "thiserror",
 ]
@@ -154,6 +156,64 @@ checksum = "d466e9454f08e4a911e14806c24e16fba1b4c121d1ea474396f396069cf949d9"
 dependencies = [
  "equivalent",
  "hashbrown 0.17.1",
+]
+
+[[package]]
+name = "karpal-algebra"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "015423e85d8778d4ee91a89d3fa8cd5e12b0d5ea8e432527172e2b06a07ee29e"
+dependencies = [
+ "karpal-core",
+]
+
+[[package]]
+name = "karpal-core"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2df04b5af9bde122fee5d7359cd15afedcbcdd54a2e4b969446fd8e5430ca656"
+
+[[package]]
+name = "karpal-proof"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a51d84a83dc578ccac1ed5cad493825427f129ffeabebe46b89febeed7fa6285"
+dependencies = [
+ "karpal-algebra",
+ "karpal-core",
+ "karpal-proof-derive",
+]
+
+[[package]]
+name = "karpal-proof-derive"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aba2d03289e10dd05fabee5658ff17fbca9aa2440d458d7b5beda9b7cec30b5f"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
+name = "karpal-verify"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a8a5b29e036beeac069fd35ea652e00a8fae3b318a043c5f9e1c5f9d9f159284"
+dependencies = [
+ "karpal-proof",
+ "karpal-verify-derive",
+]
+
+[[package]]
+name = "karpal-verify-derive"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "eef48c66632586152e59433db9e68bf8bee1f25b70c09623eaf7511dfe1adbc6"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
 ]
 
 [[package]]
