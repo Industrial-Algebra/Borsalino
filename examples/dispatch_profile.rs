@@ -154,7 +154,7 @@ fn main() -> Result<(), borsalino::GpuError> {
         gpu.create_buffer_uninit::<f32>(256)?,
         gpu.create_buffer_uninit::<f32>(256)?,
     ];
-    let buffers_8 = (0..8).map(|_| gpu.create_buffer_uninit::<f32>(256).unwrap()).collect::<Vec<_>>();
+    let _buffers_8 = (0..8).map(|_| gpu.create_buffer_uninit::<f32>(256).unwrap()).collect::<Vec<_>>();
 
     time_it("1 buffer", 200, || {
         gpu.dispatch(&pipeline, &[&out], (1, 1, 1)).unwrap();

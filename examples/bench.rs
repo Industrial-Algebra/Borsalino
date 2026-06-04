@@ -343,7 +343,7 @@ fn main() -> Result<(), borsalino::GpuError> {
 
         let total_el = n as f64 * batch_size as f64;
         let total_ops = total_el * 3.0;
-        let elem_sec = total_el / bench.value;
+        let _elem_sec = total_el / bench.value;
         let gflops = total_ops / bench.value / 1e9;
         let per_dispatch = bench.value / batch_size as f64;
         println!(
