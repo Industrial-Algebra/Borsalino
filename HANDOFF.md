@@ -190,3 +190,36 @@ Apple Silicon M3 (macOS 15):
 | 5 | `newComputePipelineStateWithFunction:` crashes on M3 | Use `newComputePipelineStateWithDescriptor:` with `MTLComputePipelineDescriptor` |
 | 6 | `newBufferWithBytes:NULL` crashes on M3 | Use `newBufferWithLength:options:` for uninitialised buffers |
 | 7 | Test thread Metal cleanup SIGSEGV on exit | `std::mem::forget` workaround in tests; examples (main thread) work fine |
+
+## 10. Implications for Vulkan Backend
+
+The Metal-side discoveries have direct crossover to the Vulkan/NVIDIA backend:
+
+### 10.1 `dispatch_many()` is already Vulkan-ready
+The `GpuBackend::dispatch_many` trait method has a default implementation
+that calls `dispatch_ex` per spec — so Vulkan works correctly today with zero
+changes. Overriding it to batch into a single `VkCommandBuffer` would yield
+even larger gains than Metal because `vkAllocateCommandBuffers` +
+`vkFreeCommandBuffers` per dispatch is more expensive than Metal's
+`MTLCommandBuffer` lifecycle. The other session's switch from
+`vkQueueWaitIdle` to per-submission fences reduces serialisation, but
+batching eliminates the alloc/free pair entirely.
+
+### 10.2 Dead sizes buffer
+The Metal backend no longer allocates a sizes buffer per dispatch
+(`naga_msl_fixup` strips the `_buffer_sizes` kernel parameter). The
+Vulkan backend likely pre-allocates descriptor sets that include the
+sizes buffer binding — check whether it can be dropped if SPIR-V
+doesn't reference it, saving descriptor updates.
+
+### 10.3 Micro-benchmark portability
+`examples/dispatch_profile.rs` is backend-agnostic (only depends on the
+`GpuBackend` trait). It isolates per-component costs (command buffer,
+encoder, binding, dispatch, fence) and would pinpoint where the GB10's
+memory bandwidth bottleneck sits vs API overhead.
+
+### 10.4 Naga post-processing pattern
+The `naga_msl_fixup` approach — post-process naga output before backend
+compilation — may apply to SPIR-V if specific GPU/driver combos reject
+certain naga-generated patterns. The SPIR-V backend is generally more
+stable than MSL, but the pattern is worth keeping in the toolbox.
