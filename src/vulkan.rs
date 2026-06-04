@@ -29,7 +29,7 @@ use ash::Entry;
 
 use std::ffi::CString;
 
-use crate::{ComputePipeline, GpuBuffer, GpuBackend, GpuError, MemoryStrategy, Result};
+use crate::{ComputePipeline, DispatchSpec, GpuBuffer, GpuBackend, GpuError, MemoryStrategy, Result};
 
 // ═══════════════════════════════════════════════════════════════════
 // VulkanBackend
@@ -1120,6 +1120,170 @@ impl GpuBackend for VulkanBackend {
         }
 
         // ── Cleanup ───────────────────────────────────────────────
+
+        unsafe {
+            self.device
+                .free_command_buffers(
+                    self.command_pool,
+                    std::slice::from_ref(&cmd),
+                );
+        }
+
+        Ok(())
+    }
+
+    fn dispatch_many(&self, dispatches: &[DispatchSpec<'_>]) -> Result<()> {
+        if dispatches.is_empty() {
+            return Ok(());
+        }
+
+        // ── Allocate ONE command buffer for all dispatches ──────
+
+        let alloc_info = vk::CommandBufferAllocateInfo::default()
+            .command_pool(self.command_pool)
+            .level(vk::CommandBufferLevel::PRIMARY)
+            .command_buffer_count(1);
+
+        let cmd = unsafe {
+            self.device
+                .allocate_command_buffers(&alloc_info)
+                .map_err(|e| GpuError::DispatchFailed {
+                    message: format!("vkAllocateCommandBuffers: {e}"),
+                })?
+        }[0];
+
+        // ── Begin ───────────────────────────────────────────────
+
+        let begin_info = vk::CommandBufferBeginInfo::default()
+            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+
+        unsafe {
+            self.device
+                .begin_command_buffer(cmd, &begin_info)
+                .map_err(|e| GpuError::DispatchFailed {
+                    message: format!("vkBeginCommandBuffer: {e}"),
+                })?;
+        }
+
+        // ── Process each dispatch ───────────────────────────────
+
+        for spec in dispatches {
+            let nbuffers = spec.buffers.len();
+            if nbuffers > Self::MAX_BUFFER_BINDINGS as usize {
+                return Err(GpuError::InvalidBinding {
+                    message: format!(
+                        "{nbuffers} buffers exceeds max {}",
+                        Self::MAX_BUFFER_BINDINGS
+                    ),
+                });
+            }
+
+            // Bind pipeline
+            unsafe {
+                let vk_pipeline =
+                    (*(spec.pipeline.raw as *const VulkanPipelineInner)).pipeline;
+                self.device.cmd_bind_pipeline(
+                    cmd,
+                    vk::PipelineBindPoint::COMPUTE,
+                    vk_pipeline,
+                );
+            }
+
+            // Update descriptor set + bind
+            let mut buffer_infos: Vec<vk::DescriptorBufferInfo> =
+                Vec::with_capacity(nbuffers);
+            let mut writes: Vec<vk::WriteDescriptorSet> =
+                Vec::with_capacity(nbuffers);
+
+            for buf in spec.buffers.iter() {
+                let inner = unsafe {
+                    &*(buf.raw as *const VulkanBufferInner)
+                };
+                buffer_infos.push(
+                    vk::DescriptorBufferInfo::default()
+                        .buffer(inner.buffer)
+                        .offset(0)
+                        .range(vk::WHOLE_SIZE),
+                );
+            }
+
+            for (i, buf_info) in buffer_infos.iter().enumerate() {
+                writes.push(
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(self.descriptor_set)
+                        .dst_binding(i as u32)
+                        .dst_array_element(0)
+                        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                        .buffer_info(std::slice::from_ref(buf_info)),
+                );
+            }
+
+            unsafe {
+                self.device.update_descriptor_sets(&writes, &[]);
+                self.device.cmd_bind_descriptor_sets(
+                    cmd,
+                    vk::PipelineBindPoint::COMPUTE,
+                    self.pipeline_layout,
+                    0,
+                    std::slice::from_ref(&self.descriptor_set),
+                    &[],
+                );
+
+                self.device.cmd_dispatch(
+                    cmd,
+                    spec.workgroups.0,
+                    spec.workgroups.1,
+                    spec.workgroups.2,
+                );
+            }
+        }
+
+        // ── Memory barrier (all dispatches → host) ──────────────
+
+        let barrier = vk::MemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+            .dst_access_mask(vk::AccessFlags::HOST_READ);
+
+        unsafe {
+            self.device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::HOST,
+                vk::DependencyFlags::empty(),
+                std::slice::from_ref(&barrier),
+                &[],
+                &[],
+            );
+        }
+
+        // ── End, submit, wait ───────────────────────────────────
+
+        unsafe {
+            self.device
+                .end_command_buffer(cmd)
+                .map_err(|e| GpuError::DispatchFailed {
+                    message: format!("vkEndCommandBuffer: {e}"),
+                })?;
+        }
+
+        let submit_info = vk::SubmitInfo::default()
+            .command_buffers(std::slice::from_ref(&cmd));
+
+        unsafe {
+            self.device
+                .queue_submit(self.queue, &[submit_info], vk::Fence::null())
+                .map_err(|e| GpuError::DispatchFailed {
+                    message: format!("vkQueueSubmit: {e}"),
+                })?;
+
+            self.device
+                .queue_wait_idle(self.queue)
+                .map_err(|e| GpuError::DispatchFailed {
+                    message: format!("vkQueueWaitIdle: {e}"),
+                })?;
+        }
+
+        // ── Cleanup ─────────────────────────────────────────────
 
         unsafe {
             self.device
