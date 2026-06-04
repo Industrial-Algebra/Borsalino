@@ -8,11 +8,13 @@ All notable changes to Borsalino are documented in this file.
 - **Vulkan backend** — full `GpuBackend` trait implementation via `ash` raw FFI. WGSL→SPIR-V translation via `naga`, synchronous dispatch, pre-allocated descriptor sets and command pool. Tested on AMD Radeon, NVIDIA RTX 5080, and NVIDIA GB10.
 - **WGSL shader language** — kernels authored in WGSL with `@group(0) @binding(N)` buffer declarations. Naga translates to MSL (Metal) and SPIR-V (Vulkan).
 - **Device-local memory strategy** — automatic detection of discrete vs. unified memory GPUs. VRAM allocation with staging transfers for discrete GPUs (RTX 5080: 15× throughput improvement). Explicit `MemoryStrategy` enum for power users.
+- **Batched dispatch (`dispatch_many`)** — multi-kernel command buffers amortise alloc/submit/wait overhead. RTX 5080: per-dispatch latency drops from 37 µs to 0.5 µs (75×). Peak throughput: 577 GFLOPS SAXPY on RTX 5080, 408 GFLOPS on GB10.
 - **`verify` feature** — karpal-verify 0.5.0 GPU obligation bundles for `add_one`, `scale`, and `saxpy` kernels. Export to SMT-LIB2, Lean 4, and Kani backends.
-- **Benchmarks** — cross-platform GPU benchmark example (`examples/bench.rs`) measuring pipeline compilation, dispatch latency, throughput scaling, and buffer I/O. Tested on AMD integrated, NVIDIA RTX 5080, NVIDIA GB10, and Apple M3 Pro.
+- **Benchmarks** — cross-platform GPU benchmark example (`examples/bench.rs`) measuring pipeline compilation, dispatch latency, throughput scaling, batched SAXPY, and buffer I/O. Tested on AMD integrated, NVIDIA RTX 5080, NVIDIA GB10, and Apple M3 Pro.
+- **Dispatch profiler** — per-component cost profiling example (`examples/dispatch_profile.rs`) isolating command buffer alloc, bind, dispatch, and sync costs.
 - **Examples** — `hello_compute` (simplest add_one kernel), `saxpy` (fused multiply-add on 1024 elements).
 - **Dual licensing** — AGPL-3.0 + commercial license (Schubert model).
-- **CI workflow** — GitHub Actions: format check, clippy, multi-feature test matrix, and documentation build.
+- **CI workflow** — GitHub Actions: format check, clippy, multi-feature test matrix, documentation build, and crates.io publish on tag.
 
 ### Changed
 - **Shader language: MSL → WGSL** — `GpuBackend::compile()` now accepts WGSL source instead of MSL. Metal backend translates WGSL→MSL via naga; Vulkan backend translates WGSL→SPIR-V via naga.
