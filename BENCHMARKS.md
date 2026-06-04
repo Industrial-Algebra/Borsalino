@@ -62,12 +62,28 @@ WGSL → native shader compilation, lower is better.
 
 *"instant" = < 0.1 µs — unified memory platforms read via pointer dereference (zero copy).*
 
-## Observations
+## Batched Dispatch (`dispatch_many`)
 
-- **Unified memory wins on buffer I/O** — Apple Silicon, AMD APU, and GB10 have zero-copy reads. RTX 5080 requires a PCIe staging transfer for each read.
-- **Discrete GPUs win on compute throughput** — VRAM-local buffers avoid PCIe during dispatch. RTX 5080 delivers 3× the SAXPY throughput of GB10.
-- **Dispatch overhead is consistently low** — 29-136 µs across all platforms. The synchronous command-buffer model adds negligible latency.
-- **Pipeline compilation is dominated by naga** — shader translation time overwhelms the Vulkan/Metal driver compilation cost.
+256 dispatches per command buffer, SAXPY kernel. Higher GFLOPS is better.
+
+| Size | GB10 (single) | GB10 (×256 batch) | RTX 5080 (single) | RTX 5080 (×256 batch) |
+|---|---|---|---|---|
+| 1K el | 0.07 | 6.1 GFLOPS (87×) | 0.12 | 6.9 GFLOPS (58×) |
+| 16K el | 1.1 | 60.5 GFLOPS (55×) | 1.8 | 112 GFLOPS (62×) |
+| 256K el | 10.9 | 141.7 GFLOPS (13×) | 27.7 | **408 GFLOPS** (15×) |
+| 1M el | 27.2 | 208 GFLOPS (7.6×) | 101.7 | **577 GFLOPS** (5.7×) |
+| 16M el | 49.2 | 61.6 GFLOPS (1.3×) | 92.2 | 75.3 GFLOPS (0.8×) |
+
+Per-dispatch overhead at 256 batched:
+
+| Platform | Single | Batched ×256 | Reduction |
+|---|---|---|---|
+| GB10 | 46 µs | **1.0 µs** | 46× |
+| RTX 5080 | 37 µs | **0.5 µs** | 75× |
+
+At small element counts, batching eliminates command-buffer alloc/free
+dominance. At 16M elements, kernel compute dominates and batching provides
+marginal benefit.
 
 ## Test Hardware
 
