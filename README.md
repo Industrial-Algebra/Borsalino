@@ -87,6 +87,50 @@ translates to each backend's native format via [naga](https://github.com/gfx-rs/
 Buffer bindings use `@group(0) @binding(N)` in WGSL, mapped to dispatch
 buffer position: `buffers[0]` → `@binding(0)`, `buffers[1]` → `@binding(1)`.
 
+## Memory Strategy
+
+Borsalino auto-detects your hardware and picks the optimal memory layout:
+
+| GPU type | Detection | Memory | Behaviour |
+|---|---|---|---|
+| Apple Silicon M-series | Unified | Host-visible, coherent | Zero-copy between CPU and GPU |
+| AMD integrated (APU) | Unified | Host-visible, coherent | Zero-copy |
+| NVIDIA Grace Blackwell (GB10) | Unified | Host-visible, coherent | Zero-copy |
+| NVIDIA RTX / AMD RDNA / Intel Arc | Discrete (auto) | Device-local VRAM + staging | Automatic PCIe transfers |
+
+For explicit control:
+
+```rust
+use borsalino::MemoryStrategy;
+
+let gpu = borsalino::init()?;                                      // auto-detect
+let gpu = borsalino::init_device_local()?;                         // force VRAM
+let gpu = VulkanBackend::init_with_strategy(MemoryStrategy::Unified)?; // force unified
+```
+
+## Batched Dispatch
+
+Chain multiple dispatches into a single command buffer with
+[`dispatch_many`](GpuBackend::dispatch_many):
+
+```rust
+use borsalino::{DispatchSpec, GpuBackend};
+
+gpu.dispatch_many(&[
+    DispatchSpec { pipeline: &p1, buffers: &[&buf_a, &buf_b],
+                   workgroups: (4, 1, 1), threads_per_group: (256, 1, 1) },
+    DispatchSpec { pipeline: &p2, buffers: &[&buf_b, &buf_c],
+                   workgroups: (4, 1, 1), threads_per_group: (256, 1, 1) },
+])?;
+```
+
+Batching amortises command-buffer allocation overhead. On RTX 5080,
+256 dispatches per buffer drops per-dispatch latency from 37 us to
+**0.5 us** (75x faster). On GB10: 46 us to **1.0 us** (46x faster).
+Peak throughput: **577 GFLOPS** (RTX 5080, 1M elements batched).
+
+See [BENCHMARKS.md](./BENCHMARKS.md) for full cross-platform performance data.
+
 ## Verification
 
 GPU safety properties are encoded as karpal-verify 0.5 obligation bundles
@@ -108,6 +152,7 @@ Bundles export to SMT-LIB2, Lean 4, and Kani verification backends.
 | `hello_compute` | add_one kernel on 4 elements | `cargo run --example hello_compute --features vulkan` |
 | `saxpy` | SAXPY (a·x + y) on 1024 elements | `cargo run --example saxpy --features vulkan` |
 | `bench` | Cross-platform GPU benchmarks | `cargo run --example bench --features vulkan --release` |
+| `dispatch_profile` | Per-component dispatch cost profiling | `cargo run --example dispatch_profile --features vulkan --release` |
 
 ## Testing
 
