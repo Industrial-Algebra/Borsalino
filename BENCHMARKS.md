@@ -81,6 +81,26 @@ Per-dispatch overhead at 256 batched:
 | GB10 | 46 µs | **1.0 µs** | 46× |
 | RTX 5080 | 37 µs | **0.5 µs** | 75× |
 
+## Tiled Matrix Multiply (2D workgroup, shared memory)
+
+1024×1024 matrix, 16×16 tile size, 64×64 workgroups.
+
+| Platform | GFLOPS | vs Element-wise |
+|---|---|---|
+| AMD Radeon (iGPU) | 278 | 17× faster than SAXPY |
+
+### Comparison: 1D Element-wise vs 2D Tiled
+
+| Kernel | Workgroup dims | Shared memory | Peak GFLOPS (AMD iGPU) |
+|---|---|---|---|
+| SAXPY (vadd) | 1D (N,1,1) | None | 17 |
+| **Tiled matmul** | **2D (N,N,1)** | **16×16 tiles** | **278** |
+
+The 2D tiled kernel achieves 16× higher throughput because it keeps data
+in shared memory (on-chip), avoiding repeated global memory reads. This
+is the pattern for compute-bound kernels — use `dispatch_ex` with 2D/3D
+workgroup grids and WGSL `var<workgroup>` for tile memory.
+
 At small element counts, batching eliminates command-buffer alloc/free
 dominance. At 16M elements, kernel compute dominates and batching provides
 marginal benefit.

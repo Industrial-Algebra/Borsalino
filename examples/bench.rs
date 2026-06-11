@@ -386,6 +386,85 @@ fn main() -> Result<(), borsalino::GpuError> {
         results.push(bench);
     }
 
+    // ── Tiled Matmul (2D workgroup, shared memory) ────────────
+
+    println!("--- Tiled Matmul (2D, shared memory) ---");
+
+    let kernel_matmul = r#"
+@group(0) @binding(0) var<storage, read> a: array<f32>;
+@group(0) @binding(1) var<storage, read> b: array<f32>;
+@group(0) @binding(2) var<storage, read_write> c: array<f32>;
+
+const T: u32 = 16u;
+const N: u32 = MATRIX_Nu;
+const K: u32 = MATRIX_Ku;
+
+var<workgroup> tile_a: array<f32, 256>;
+var<workgroup> tile_b: array<f32, 256>;
+
+@compute @workgroup_size(16, 16, 1)
+fn matmul(
+    @builtin(workgroup_id) wg_id: vec3<u32>,
+    @builtin(local_invocation_id) local_id: vec3<u32>,
+) {
+    let row = wg_id.y * T + local_id.y;
+    let col = wg_id.x * T + local_id.x;
+    let idx = local_id.y * T + local_id.x;
+    var sum = 0.0;
+    for (var kt = 0u; kt < K; kt += T) {
+        tile_a[idx] = a[row * K + kt + local_id.x];
+        tile_b[idx] = b[(kt + local_id.y) * N + col];
+        workgroupBarrier();
+        for (var i = 0u; i < T; i++) {
+            sum += tile_a[local_id.y * T + i] * tile_b[i * T + local_id.x];
+        }
+        workgroupBarrier();
+    }
+    c[row * N + col] = sum;
+}
+"#;
+
+    for &n in &[512u32, 1024u32] {
+        let total = (n * n) as usize;
+        let a: Vec<f32> = (0..total).map(|i| (i % 997) as f32 * 0.001).collect();
+        let b: Vec<f32> = (0..total).map(|i| ((i * 3 + 1) % 997) as f32 * 0.001).collect();
+
+        let ksrc = kernel_matmul
+            .replace("MATRIX_Nu", &n.to_string())
+            .replace("MATRIX_Ku", &n.to_string());
+        let pipeline = gpu.compile("matmul", &ksrc)?;
+        let buf_a = gpu.create_buffer(&a)?;
+        let buf_b = gpu.create_buffer(&b)?;
+        let buf_c = gpu.create_buffer_uninit::<f32>(total)?;
+        let wgs = n / 16;
+        let iters = if n <= 512 { 10 } else { 5 };
+
+        let bench = run_bench(
+            &format!("matmul {n}×{n} ({wgs}×{wgs} wgs)"),
+            "ms",
+            iters,
+            || {
+                gpu.dispatch_ex(
+                    &pipeline,
+                    &[&buf_a, &buf_b, &buf_c],
+                    (wgs, wgs, 1),
+                    (16, 16, 1),
+                )
+                .unwrap();
+            },
+        );
+
+        let flops = 2.0 * (n as f64).powi(3);
+        let gflops = flops / bench.value / 1e9;
+        println!(
+            "  {n}×{n}  {:>8.3} ms  ({:>8.2} GFLOPS)  ±{:.1}%",
+            bench.value * 1e3,
+            gflops,
+            (bench.stddev / bench.value) * 100.0
+        );
+        results.push(bench);
+    }
+
     // ── Summary table ─────────────────────────────────────────
 
     print_results(&results);
