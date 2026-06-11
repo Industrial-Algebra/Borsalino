@@ -416,7 +416,7 @@ fn matmul(
 }
 "#;
 
-    for &n in &[512u32, 1024u32] {
+    for &n in &[512u32, 1024u32, 4096u32] {
         let total = (n * n) as usize;
         let a: Vec<f32> = (0..total).map(|i| (i % 997) as f32 * 0.001).collect();
         let b: Vec<f32> = (0..total)
@@ -431,7 +431,7 @@ fn matmul(
         let buf_b = gpu.create_buffer(&b)?;
         let buf_c = gpu.create_buffer_uninit::<f32>(total)?;
         let wgs = n / 16;
-        let iters = if n <= 512 { 10 } else { 5 };
+        let iters = if n <= 512 { 10 } else if n <= 1024 { 5 } else { 3 };
 
         let bench = run_bench(
             &format!("matmul {n}×{n} ({wgs}×{wgs} wgs)"),
