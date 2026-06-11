@@ -22,14 +22,19 @@
 - [ ] Miri integration for buffer lifecycle safety
 - [ ] Kani harnesses for buffer roundtrip and alignment
 
-## v0.3.0+ (Speculative)
+- [x] Candle integration pattern (custom element-wise WGSL kernels)
 
-- [ ] `dispatch_verified()` with `Proven<>` gates (Phase 3 verification)
+## v0.3.0 (Planned)
+
+- [ ] SPIR-V shader caching (`compile_cached`)
+- [ ] Real IA kernel benchmark (geometric product of 32-element multivectors)
+- [ ] `dispatch_verified()` with `Proven<>` gates (Karpal Phase 3)
+- [ ] Miri + Kani verification harnesses for buffer lifecycle
+
+## Future (Speculative)
+
+- [ ] Multi-GPU dispatch
+- [ ] Zero-copy Candle tensor interop
 - [ ] amari-flynn statistical verification (kernel determinism)
 - [ ] Metal performance counters (occupancy, bandwidth metrics)
-- [ ] Multi-GPU dispatch
 - [ ] WASM target (WebGPU compute)
-- [ ] SPIR-V shader caching
-- [ ] Zero-copy tensor interop with Candle
-
-*This roadmap is speculative beyond v0.2.0. Items may be reprioritised or descoped.*
