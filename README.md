@@ -1,5 +1,10 @@
 # Borsalino
 
+[![crates.io](https://img.shields.io/crates/v/borsalino)](https://crates.io/crates/borsalino)
+[![docs.rs](https://img.shields.io/docsrs/borsalino)](https://docs.rs/borsalino)
+[![CI](https://github.com/Industrial-Algebra/Borsalino/actions/workflows/ci.yml/badge.svg)](https://github.com/Industrial-Algebra/Borsalino/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/license-AGPL--3.0--or--Commercial-blue)](./LICENSE)
+
 Thin GPU compute abstraction for the Industrial Algebra ecosystem.
 
 > One trait, two backends, zero ceremony.
@@ -129,6 +134,28 @@ Batching amortises command-buffer allocation overhead. On RTX 5080,
 **0.5 us** (75x faster). On GB10: 46 us to **1.0 us** (46x faster).
 Peak throughput: **577 GFLOPS** (RTX 5080, 1M elements batched).
 
+## Persistent Buffers
+
+For iterative workloads (ML training, physics simulation), buffers can
+live on the GPU across dispatches without CPU readback:
+
+```rust
+let weights = gpu.create_device_buffer(&model_weights)?;
+let output = gpu.create_device_buffer_uninit::<f32>(N)?;
+
+// Dispatch many times — no CPU round-trip
+for _ in 0..1000 {
+    gpu.dispatch(&pipeline, &[&weights, &output], (wgs, 1, 1))?;
+}
+
+// Read once at the end
+let result = gpu.read_buffer(&output)?;
+```
+
+On unified memory, `create_device_buffer` is identical to `create_buffer`
+(zero copy). On discrete GPUs, it allocates VRAM and uses one-shot staging
+only on final readback.
+
 See [BENCHMARKS.md](./BENCHMARKS.md) for full cross-platform performance data.
 
 ## Verification
@@ -153,6 +180,59 @@ Bundles export to SMT-LIB2, Lean 4, and Kani verification backends.
 | `saxpy` | SAXPY (a·x + y) on 1024 elements | `cargo run --example saxpy --features vulkan` |
 | `bench` | Cross-platform GPU benchmarks | `cargo run --example bench --features vulkan --release` |
 | `dispatch_profile` | Per-component dispatch cost profiling | `cargo run --example dispatch_profile --features vulkan --release` |
+| `tiled_matmul` | 2D tiled matrix multiply with shared memory | `cargo run --example tiled_matmul --features vulkan --release` |
+| `candle_tropical_mask` | Candle + Borsalino tropical masking benchmark | `cargo run --example candle_tropical_mask --features vulkan --release` |
+
+## Async Dispatch
+
+Non-blocking GPU execution via [`dispatch_async`](GpuBackend::dispatch_async):
+
+```rust
+let p1 = gpu.dispatch_async(&pipe_a, &[&buf_x], (64, 1, 1))?;
+let p2 = gpu.dispatch_async(&pipe_b, &[&buf_y], (64, 1, 1))?;
+// Both running concurrently on GPU. Do CPU work here...
+p1.wait();
+p2.wait();
+let result = gpu.read_buffer(&buf_out)?;
+```
+
+[`Pulse`] handles are `Send + Sync`. Drop performs implicit join
+(blocks until the GPU dispatch completes).
+
+## Profiling
+
+Measure GPU-side execution time with [`timestamp`](GpuBackend::timestamp):
+
+```rust
+let t0 = gpu.timestamp()?;
+gpu.dispatch(&pipeline, &buffers, (wgs, 1, 1))?;
+let gpu_ns = gpu.timestamp()? - t0;
+```
+
+## Candle Integration
+
+Borsalino complements Huggingface Candle for custom element-wise GPU kernels.
+See `examples/candle_tropical_mask.rs` for the full Candle → Borsalino → Candle
+data flow implementing Quantizon's tropical masking operation.
+
+## 2D / 3D Dispatch
+
+Borsalino supports multi-dimensional workgroup grids for tile-based
+algorithms (matrix multiply, convolution, attention):
+
+```rust
+// 2D workgroup grid: 64×64 workgroups, each 16×16 threads
+gpu.dispatch_ex(
+    &pipeline, &buffers,
+    (64, 64, 1),      // workgroups in (x, y, z)
+    (16, 16, 1),       // threads per workgroup
+)?;
+```
+
+Combine with WGSL shared memory (`var<workgroup>`) and barriers
+(`workgroupBarrier()`) for tiled algorithms. See
+`examples/tiled_matmul.rs` for a complete 2D tiled matrix multiply
+(278 GFLOPS on AMD iGPU, 1024×1024, ~1 TFLOPS on NVIDIA RTX).
 
 ## Testing
 

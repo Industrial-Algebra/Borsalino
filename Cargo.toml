@@ -34,3 +34,4 @@ objc = "0.2"
 ash = { version = "0.38", optional = true }
 
 [dev-dependencies]
+candle-core = "0.10"

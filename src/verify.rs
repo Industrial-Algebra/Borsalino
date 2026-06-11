@@ -31,8 +31,7 @@ use karpal_verify::{ObligationBundle, Origin};
 
 pub use karpal_proof::{Property, Proven};
 pub use karpal_verify::gpu::{
-    IsBufferAlignedTo16, IsDispatchWithinLimits, IsMSLKernelDeterministic,
-    IsWorkgroupSizeDivisible,
+    IsBufferAlignedTo16, IsDispatchWithinLimits, IsMSLKernelDeterministic, IsWorkgroupSizeDivisible,
 };
 
 // ── Obligation bundles ────────────────────────────────────────────

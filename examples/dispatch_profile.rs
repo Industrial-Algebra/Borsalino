@@ -9,8 +9,8 @@
 //! cargo run --example dispatch_profile --features metal --release
 //! ```
 
-use std::time::Instant;
 use borsalino::GpuBackend;
+use std::time::Instant;
 
 const KERNEL_NOOP: &str = r#"
     @group(0) @binding(0) var<storage, read_write> out: array<f32>;
@@ -22,14 +22,19 @@ const KERNEL_NOOP: &str = r#"
 
 fn time_it<F: FnMut()>(label: &str, iters: u32, mut f: F) {
     // Warm-up
-    for _ in 0..3 { f(); }
+    for _ in 0..3 {
+        f();
+    }
 
     let start = Instant::now();
-    for _ in 0..iters { f(); }
+    for _ in 0..iters {
+        f();
+    }
     let elapsed = start.elapsed();
     let per = elapsed.as_secs_f64() / iters as f64;
 
-    println!("  {:<45} {:>8.1} µs/op  ({iters} iters, {:.1} ms total)",
+    println!(
+        "  {:<45} {:>8.1} µs/op  ({iters} iters, {:.1} ms total)",
         label,
         per * 1e6,
         elapsed.as_secs_f64() * 1e3
@@ -60,7 +65,8 @@ fn main() -> Result<(), borsalino::GpuError> {
     // ── Phase 3: Full dispatch (the baseline) ─────────────────
     println!("\n--- Full Dispatch (baseline) ---");
     time_it("full dispatch (1×1 thread)", 200, || {
-        gpu.dispatch_ex(&pipeline, &[&out], (1, 1, 1), (1, 1, 1)).unwrap();
+        gpu.dispatch_ex(&pipeline, &[&out], (1, 1, 1), (1, 1, 1))
+            .unwrap();
     });
     time_it("full dispatch (1×256 threads)", 200, || {
         gpu.dispatch(&pipeline, &[&out], (1, 1, 1)).unwrap();
@@ -122,13 +128,10 @@ fn main() -> Result<(), borsalino::GpuError> {
     println!("\n--- Thread Scaling (1 workgroup, varying threads) ---");
     for threads in [1u32, 32, 64, 128, 256, 512, 1024] {
         let big_out = gpu.create_buffer_uninit::<f32>(threads as usize)?;
-        time_it(
-            &format!("1 wg × {threads:>4} threads"),
-            100,
-            || {
-                gpu.dispatch_ex(&pipeline, &[&big_out], (1, 1, 1), (threads, 1, 1)).unwrap();
-            },
-        );
+        time_it(&format!("1 wg × {threads:>4} threads"), 100, || {
+            gpu.dispatch_ex(&pipeline, &[&big_out], (1, 1, 1), (threads, 1, 1))
+                .unwrap();
+        });
     }
 
     // ── Phase 6: Workgroup scaling (fixed total threads) ──────
@@ -140,30 +143,42 @@ fn main() -> Result<(), borsalino::GpuError> {
             &format!("{wg_count:>5} wg × {wg_size:>4} threads"),
             20,
             || {
-                gpu.dispatch_ex(&pipeline, &[&big_out], (wg_count, 1, 1), (wg_size, 1, 1)).unwrap();
+                gpu.dispatch_ex(&pipeline, &[&big_out], (wg_count, 1, 1), (wg_size, 1, 1))
+                    .unwrap();
             },
         );
     }
 
     // ── Phase 7: Buffer count scaling ─────────────────────────
     println!("\n--- Buffer Count Scaling (1 wg × 256 threads) ---");
-    let buffers_2 = [gpu.create_buffer_uninit::<f32>(256)?, gpu.create_buffer_uninit::<f32>(256)?];
+    let buffers_2 = [
+        gpu.create_buffer_uninit::<f32>(256)?,
+        gpu.create_buffer_uninit::<f32>(256)?,
+    ];
     let buffers_4 = [
         gpu.create_buffer_uninit::<f32>(256)?,
         gpu.create_buffer_uninit::<f32>(256)?,
         gpu.create_buffer_uninit::<f32>(256)?,
         gpu.create_buffer_uninit::<f32>(256)?,
     ];
-    let _buffers_8 = (0..8).map(|_| gpu.create_buffer_uninit::<f32>(256).unwrap()).collect::<Vec<_>>();
+    let _buffers_8 = (0..8)
+        .map(|_| gpu.create_buffer_uninit::<f32>(256).unwrap())
+        .collect::<Vec<_>>();
 
     time_it("1 buffer", 200, || {
         gpu.dispatch(&pipeline, &[&out], (1, 1, 1)).unwrap();
     });
     time_it("2 buffers", 200, || {
-        gpu.dispatch(&pipeline, &[&buffers_2[0], &buffers_2[1]], (1, 1, 1)).unwrap();
+        gpu.dispatch(&pipeline, &[&buffers_2[0], &buffers_2[1]], (1, 1, 1))
+            .unwrap();
     });
     time_it("4 buffers", 200, || {
-        gpu.dispatch(&pipeline, &[&buffers_4[0], &buffers_4[1], &buffers_4[2], &buffers_4[3]], (1, 1, 1)).unwrap();
+        gpu.dispatch(
+            &pipeline,
+            &[&buffers_4[0], &buffers_4[1], &buffers_4[2], &buffers_4[3]],
+            (1, 1, 1),
+        )
+        .unwrap();
     });
 
     // ── Phase 8: Readback timing ──────────────────────────────
@@ -171,13 +186,9 @@ fn main() -> Result<(), borsalino::GpuError> {
     for size in [256usize, 1024, 4096, 16384, 65536, 262144, 1_048_576] {
         let buf = gpu.create_buffer_uninit::<f32>(size)?;
         gpu.dispatch(&pipeline, &[&buf], (1, 1, 1)).unwrap(); // write something
-        time_it(
-            &format!("read_buffer {size:>8} f32"),
-            100,
-            || {
-                let _: Vec<f32> = gpu.read_buffer(&buf).unwrap();
-            },
-        );
+        time_it(&format!("read_buffer {size:>8} f32"), 100, || {
+            let _: Vec<f32> = gpu.read_buffer(&buf).unwrap();
+        });
     }
 
     println!("\nDone.");

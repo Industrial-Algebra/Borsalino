@@ -20,7 +20,7 @@ use naga::valid::{Capabilities, ValidationFlags, Validator};
 use objc::runtime::Object;
 use objc::{class, msg_send, sel, sel_impl};
 
-use crate::{ComputePipeline, GpuBuffer, GpuBackend, GpuError, Result, DispatchSpec};
+use crate::{ComputePipeline, DispatchSpec, GpuBackend, GpuBuffer, GpuError, Pulse, Result};
 
 // ═══════════════════════════════════════════════════════════════════
 // Metal C symbol
@@ -192,10 +192,16 @@ fn fix_device_line(line: &str, mutable: bool) -> Option<String> {
 
     let idx_after_type = after_device.find('&')? + 1;
     let rest = after_device[idx_after_type..].trim_start();
-    let name_end = rest.find(|c: char| !c.is_alphanumeric() && c != '_').unwrap_or(rest.len());
+    let name_end = rest
+        .find(|c: char| !c.is_alphanumeric() && c != '_')
+        .unwrap_or(rest.len());
     let name = &rest[..name_end];
     let suffix = &rest[name_end..];
-    let prefix = if mutable { "device float* " } else { "device const float* " };
+    let prefix = if mutable {
+        "device float* "
+    } else {
+        "device const float* "
+    };
     let before = &line[..type_start];
     Some(format!("{before}{prefix}{name}{suffix}"))
 }
@@ -219,13 +225,11 @@ impl GpuBackend for MetalBackend {
         let device_ptr = unsafe { MTLCreateSystemDefaultDevice() };
         if device_ptr.is_null() {
             return Err(GpuError::InitFailed(
-                "MTLCreateSystemDefaultDevice returned null — no Metal-capable GPU"
-                    .into(),
+                "MTLCreateSystemDefaultDevice returned null — no Metal-capable GPU".into(),
             ));
         }
 
-        let queue_ptr: *mut c_void =
-            unsafe { msg_send![obj(device_ptr), newCommandQueue] };
+        let queue_ptr: *mut c_void = unsafe { msg_send![obj(device_ptr), newCommandQueue] };
         if queue_ptr.is_null() {
             unsafe {
                 let _: () = msg_send![obj(device_ptr), release];
@@ -245,22 +249,17 @@ impl GpuBackend for MetalBackend {
         })
     }
 
-    fn compile(
-        &self,
-        entry_point: &str,
-        wgsl_source: &str,
-    ) -> Result<ComputePipeline> {
+    fn compile(&self, entry_point: &str, wgsl_source: &str) -> Result<ComputePipeline> {
         // Step 0: Translate WGSL → MSL via naga
-        let module =
-            wgsl::parse_str(wgsl_source).map_err(|e| GpuError::CompileFailed {
-                entry: entry_point.into(),
-                message: e.emit_to_string(wgsl_source),
-            })?;
+        let module = wgsl::parse_str(wgsl_source).map_err(|e| GpuError::CompileFailed {
+            entry: entry_point.into(),
+            message: e.emit_to_string(wgsl_source),
+        })?;
 
-        let mut validator =
-            Validator::new(ValidationFlags::all(), Capabilities::all());
-        let info =
-            validator.validate(&module).map_err(|e| GpuError::CompileFailed {
+        let mut validator = Validator::new(ValidationFlags::all(), Capabilities::all());
+        let info = validator
+            .validate(&module)
+            .map_err(|e| GpuError::CompileFailed {
                 entry: entry_point.into(),
                 message: e.emit_to_string(wgsl_source),
             })?;
@@ -356,9 +355,7 @@ impl GpuBackend for MetalBackend {
                 let _: () = msg_send![library as *const objc::runtime::Object, release];
                 return Err(GpuError::PipelineFailed {
                     entry: entry_point.into(),
-                    message: format!(
-                        "function '{entry_point}' not found in compiled library"
-                    ),
+                    message: format!("function '{entry_point}' not found in compiled library"),
                 });
             }
 
@@ -376,8 +373,7 @@ impl GpuBackend for MetalBackend {
 
             if pipeline.is_null() {
                 let msg = if !perr.is_null() {
-                    let desc: *mut c_void =
-                        msg_send![obj(perr), localizedDescription];
+                    let desc: *mut c_void = msg_send![obj(perr), localizedDescription];
                     let s = nsstring_read(desc);
                     let _: () = msg_send![obj(perr), release];
                     s
@@ -404,10 +400,7 @@ impl GpuBackend for MetalBackend {
         }
     }
 
-    fn create_buffer<T: bytemuck::Pod>(
-        &self,
-        data: &[T],
-    ) -> Result<GpuBuffer> {
+    fn create_buffer<T: bytemuck::Pod>(&self, data: &[T]) -> Result<GpuBuffer> {
         let element_size = std::mem::size_of::<T>();
         let byte_len = data.len() * element_size;
         let dev = self.device.ptr.as_ptr();
@@ -439,10 +432,7 @@ impl GpuBackend for MetalBackend {
         })
     }
 
-    fn create_buffer_uninit<T: bytemuck::Pod>(
-        &self,
-        len: usize,
-    ) -> Result<GpuBuffer> {
+    fn create_buffer_uninit<T: bytemuck::Pod>(&self, len: usize) -> Result<GpuBuffer> {
         let element_size = std::mem::size_of::<T>();
         let byte_len = len * element_size;
         let dev = self.device.ptr.as_ptr();
@@ -487,16 +477,14 @@ impl GpuBackend for MetalBackend {
         _threads_per_group: (u32, u32, u32),
     ) -> Result<()> {
         unsafe {
-            let cmd: *mut c_void =
-                msg_send![obj(self.queue.ptr.as_ptr()), commandBuffer];
+            let cmd: *mut c_void = msg_send![obj(self.queue.ptr.as_ptr()), commandBuffer];
             if cmd.is_null() {
                 return Err(GpuError::DispatchFailed {
                     message: "failed to create MTLCommandBuffer".into(),
                 });
             }
 
-            let encoder: *mut c_void =
-                msg_send![obj(cmd), computeCommandEncoder];
+            let encoder: *mut c_void = msg_send![obj(cmd), computeCommandEncoder];
             if encoder.is_null() {
                 let _: () = msg_send![obj(cmd), release];
                 return Err(GpuError::DispatchFailed {
@@ -505,8 +493,7 @@ impl GpuBackend for MetalBackend {
             }
 
             // Set pipeline
-            let _: () =
-                msg_send![obj(encoder), setComputePipelineState: pipeline.raw];
+            let _: () = msg_send![obj(encoder), setComputePipelineState: pipeline.raw];
 
             // Bind user buffers
             for (i, buf) in buffers.iter().enumerate() {
@@ -535,18 +522,69 @@ impl GpuBackend for MetalBackend {
         Ok(())
     }
 
-    fn read_buffer<T: bytemuck::Pod>(
+    fn dispatch_async(
         &self,
-        buffer: &GpuBuffer,
-    ) -> Result<Vec<T>> {
+        pipeline: &ComputePipeline,
+        buffers: &[&GpuBuffer],
+        workgroups: (u32, u32, u32),
+    ) -> Result<Pulse> {
+        unsafe {
+            let cmd: *mut c_void = msg_send![obj(self.queue.ptr.as_ptr()), commandBuffer];
+            if cmd.is_null() {
+                return Err(GpuError::DispatchFailed {
+                    message: "failed to create MTLCommandBuffer".into(),
+                });
+            }
+
+            let encoder: *mut c_void = msg_send![obj(cmd), computeCommandEncoder];
+            if encoder.is_null() {
+                let _: () = msg_send![obj(cmd), release];
+                return Err(GpuError::DispatchFailed {
+                    message: "failed to create MTLComputeCommandEncoder".into(),
+                });
+            }
+
+            let _: () = msg_send![obj(encoder), setComputePipelineState: pipeline.raw];
+
+            for (i, buf) in buffers.iter().enumerate() {
+                let _: () = msg_send![
+                    obj(encoder),
+                    setBuffer: buf.raw
+                    offset: 0u64
+                    atIndex: i as u64
+                ];
+            }
+
+            let _: () = msg_send![
+                obj(encoder),
+                dispatchThreadgroups: (workgroups.0 as u64, workgroups.1 as u64, workgroups.2 as u64)
+                threadsPerThreadgroup: (256u64, 1u64, 1u64)
+            ];
+
+            let _: () = msg_send![obj(encoder), endEncoding];
+            let _: () = msg_send![obj(cmd), commit];
+
+            // Store command buffer in Pulse; wait+release on demand
+            Ok(Pulse {
+                raw: cmd,
+                wait_fn: |raw| {
+                    let _: () = unsafe { msg_send![obj(raw), waitUntilCompleted] };
+                },
+                drop_fn: |raw| {
+                    let _: () = unsafe { msg_send![obj(raw), release] };
+                },
+            })
+        }
+    }
+
+    fn read_buffer<T: bytemuck::Pod>(&self, buffer: &GpuBuffer) -> Result<Vec<T>> {
         let contents = (buffer.contents_fn)(buffer.raw) as *const T;
         if contents.is_null() {
             return Err(GpuError::BufferReadFailed {
                 message: "buffer contents pointer is null".into(),
             });
         }
-        let slice =
-            unsafe { std::slice::from_raw_parts(contents, buffer.len) };
+        let slice = unsafe { std::slice::from_raw_parts(contents, buffer.len) };
         Ok(slice.to_vec())
     }
 
@@ -564,16 +602,14 @@ impl GpuBackend for MetalBackend {
         }
 
         unsafe {
-            let cmd: *mut c_void =
-                msg_send![obj(self.queue.ptr.as_ptr()), commandBuffer];
+            let cmd: *mut c_void = msg_send![obj(self.queue.ptr.as_ptr()), commandBuffer];
             if cmd.is_null() {
                 return Err(GpuError::DispatchFailed {
                     message: "failed to create MTLCommandBuffer".into(),
                 });
             }
 
-            let encoder: *mut c_void =
-                msg_send![obj(cmd), computeCommandEncoder];
+            let encoder: *mut c_void = msg_send![obj(cmd), computeCommandEncoder];
             if encoder.is_null() {
                 let _: () = msg_send![obj(cmd), release];
                 return Err(GpuError::DispatchFailed {
@@ -665,8 +701,7 @@ mod tests {
         "#;
 
         let pipeline = backend.compile("add_one", wgsl).unwrap();
-        let input =
-            backend.create_buffer(&[1.0f32, 2.0, 3.0, 4.0]).unwrap();
+        let input = backend.create_buffer(&[1.0f32, 2.0, 3.0, 4.0]).unwrap();
         let output = backend.create_buffer_uninit::<f32>(4).unwrap();
         backend
             .dispatch(&pipeline, &[&input, &output], (1, 1, 1))
