@@ -2,6 +2,25 @@
 
 All notable changes to Borsalino are documented in this file.
 
+## [0.2.0] — 2026-06-11
+
+### Added
+- **Async dispatch** — `dispatch_async()` returns `Pulse` handle for non-blocking GPU execution. VkFence (Vulkan), MTLCommandBuffer (Metal). Implicit join on drop.
+- **Persistent buffers** — `create_device_buffer()` / `create_device_buffer_uninit()` for GPU-resident data. VRAM on discrete GPUs, zero-copy on unified memory.
+- **GPU timestamps** — `gpu.timestamp()` for profiling. Vulkan: vkCmdWriteTimestamp query pool. Metal: CPU epoch fallback.
+- **2D/3D tiled dispatch** — matmul example with WGSL shared memory and workgroup barriers. RTX 5080: 1,120 GFLOPS; GB10: 1,097 GFLOPS.
+- **Candle integration** — `candle_tropical_mask` example showing Candle → Borsalino → Candle data flow.
+- **Benchmark matrix** — SAXPY, batched SAXPY, tiled matmul, timestamp resolution across M3 Pro, GB10, RTX 5080, AMD iGPU.
+- **ROADMAP.md** — current and future development plans.
+
+### Changed
+- **CI** — clippy enforces `--all-features -- -D warnings` (zero warnings required).
+- **README** — badges (crates.io, docs.rs, CI, license), async dispatch section, profiling section.
+- **BENCHMARKS.md** — updated with v0.2.0 numbers including tiled matmul.
+
+### Removed
+- HANDOFF.md and docs/metal-debug-handoff.md (internal agent scaffolding).
+
 ## [0.1.0] — 2026-06-03
 
 ### Added
