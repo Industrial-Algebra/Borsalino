@@ -1,6 +1,6 @@
 [package]
 name = "borsalino"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 rust-version = "1.85"
 description = "Thin GPU compute abstraction — Metal and Vulkan backends for Industrial Algebra"
@@ -34,4 +34,3 @@ objc = "0.2"
 ash = { version = "0.38", optional = true }
 
 [dev-dependencies]
-candle-core = "0.10"

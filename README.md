@@ -181,7 +181,6 @@ Bundles export to SMT-LIB2, Lean 4, and Kani verification backends.
 | `bench` | Cross-platform GPU benchmarks | `cargo run --example bench --features vulkan --release` |
 | `dispatch_profile` | Per-component dispatch cost profiling | `cargo run --example dispatch_profile --features vulkan --release` |
 | `tiled_matmul` | 2D tiled matrix multiply with shared memory | `cargo run --example tiled_matmul --features vulkan --release` |
-| `candle_tropical_mask` | Candle + Borsalino tropical masking benchmark | `cargo run --example candle_tropical_mask --features vulkan --release` |
 
 ## Async Dispatch
 
@@ -209,11 +208,7 @@ gpu.dispatch(&pipeline, &buffers, (wgs, 1, 1))?;
 let gpu_ns = gpu.timestamp()? - t0;
 ```
 
-## Candle Integration
 
-Borsalino complements Huggingface Candle for custom element-wise GPU kernels.
-See `examples/candle_tropical_mask.rs` for the full Candle → Borsalino → Candle
-data flow implementing Quantizon's tropical masking operation.
 
 ## 2D / 3D Dispatch
 
