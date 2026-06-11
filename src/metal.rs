@@ -550,6 +550,14 @@ impl GpuBackend for MetalBackend {
         Ok(slice.to_vec())
     }
 
+    fn timestamp(&self) -> Result<u64> {
+        // CPU monotonic timestamp in nanoseconds.
+        // On unified memory (Apple Silicon), GPU execution time closely
+        // tracks CPU wall time. For Metal GPU-accurate timestamps,
+        // use MTLCommandBuffer.gpuEndTime (requires command buffer liftetime).
+        Ok(std::time::UNIX_EPOCH.elapsed().unwrap().as_nanos() as u64)
+    }
+
     fn dispatch_many(&self, dispatches: &[crate::DispatchSpec<'_>]) -> Result<()> {
         if dispatches.is_empty() {
             return Ok(());

@@ -166,6 +166,36 @@ fn main() -> Result<(), borsalino::GpuError> {
     let pipeline_noop = gpu.compile("noop", KERNEL_NOOP)?;
     let out_buf = gpu.create_buffer_uninit::<f32>(256)?;
 
+    // GPU timestamp dispersion
+    println!("--- GPU Timestamp Accuracy ---");
+    let t0 = gpu.timestamp()?;
+    let t1 = gpu.timestamp()?;
+    let ns_per_tick = t1 as f64 - t0 as f64;
+    println!("  timestamp resolution: ~{:.1} ns", ns_per_tick.max(1.0));
+
+    // Measure GPU-side dispatch time vs CPU wall time
+    let bench = run_bench("GPU timestamp dispatch (1 wg × 256)", "µs", 200, || {
+        let t0 = gpu.timestamp().unwrap();
+        gpu.dispatch(&pipeline_noop, &[&out_buf], (1, 1, 1)).unwrap();
+        let t1 = gpu.timestamp().unwrap();
+        let elapsed = t1.saturating_sub(t0);
+        // Return elapsed in seconds for the bench framework
+        elapsed
+    });
+    let gpu_ns = bench.value;
+    println!(
+        "  GPU timestamp:  {:>8.1} ns ±{:.1}%",
+        gpu_ns,
+        (bench.stddev / bench.value.max(0.001)) * 100.0
+    );
+    results.push(BenchResult {
+        name: "GPU timestamp (1 wg dispatch)".into(),
+        value: gpu_ns / 1e3,
+        unit: "µs".into(),
+        iters: bench.iters,
+        stddev: bench.stddev / 1e3,
+    });
+
     // Single dispatch overhead (1 workgroup × 1 thread)
     let bench = run_bench("dispatch (1 workgroup × 1 thread)", "µs", 200, || {
         gpu.dispatch_ex(&pipeline_noop, &[&out_buf], (1, 1, 1), (1, 1, 1))

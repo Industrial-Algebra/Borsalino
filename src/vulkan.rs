@@ -80,6 +80,10 @@ pub struct VulkanBackend {
     /// Command pool for staging transfers (device ↔ host).
     #[allow(dead_code)]
     transfer_command_pool: vk::CommandPool,
+    /// Query pool for GPU timestamps (None if unsupported).
+    timestamp_pool: Option<vk::QueryPool>,
+    /// GPU timestamp period in nanoseconds (from device limits).
+    timestamp_period: f32,
 }
 
 impl VulkanBackend {
@@ -90,6 +94,9 @@ impl VulkanBackend {
 impl Drop for VulkanBackend {
     fn drop(&mut self) {
         unsafe {
+            if let Some(pool) = self.timestamp_pool {
+                self.device.destroy_query_pool(pool, None);
+            }
             self.device.destroy_command_pool(self.transfer_command_pool, None);
             self.device.destroy_command_pool(self.command_pool, None);
             self.device.destroy_descriptor_pool(self.descriptor_pool, None);
@@ -655,6 +662,28 @@ impl GpuBackend for VulkanBackend {
                 })?
         };
 
+        // ── Timestamp query pool ─────────────────────────────────
+
+        let timestamp_pool = if device_props.limits.timestamp_compute_and_graphics
+            == vk::TRUE
+        {
+            let pool_info = vk::QueryPoolCreateInfo::default()
+                .query_type(vk::QueryType::TIMESTAMP)
+                .query_count(1);
+            let pool = unsafe {
+                device
+                    .create_query_pool(&pool_info, None)
+                    .map_err(|e| {
+                        GpuError::InitFailed(format!("create timestamp pool: {e}"))
+                    })?
+            };
+            Some(pool)
+        } else {
+            None
+        };
+        let timestamp_period =
+            device_props.limits.timestamp_period;
+
         Ok(Self {
             _entry: entry,
             instance,
@@ -671,6 +700,8 @@ impl GpuBackend for VulkanBackend {
             descriptor_set,
             command_pool,
             transfer_command_pool,
+            timestamp_pool,
+            timestamp_period,
         })
     }
 
@@ -1334,6 +1365,81 @@ impl GpuBackend for VulkanBackend {
             unsafe { std::slice::from_raw_parts(contents, buffer.len) };
         Ok(slice.to_vec())
     }
+
+    fn timestamp(&self) -> Result<u64> {
+        let Some(pool) = self.timestamp_pool else {
+            // Fall back to CPU timestamp if GPU timestamps unsupported
+            return Ok(
+                std::time::UNIX_EPOCH
+                    .elapsed()
+                    .unwrap()
+                    .as_nanos() as u64,
+            );
+        };
+
+        unsafe {
+            // Allocate a one-shot command buffer
+            let alloc_info = vk::CommandBufferAllocateInfo::default()
+                .command_pool(self.command_pool)
+                .level(vk::CommandBufferLevel::PRIMARY)
+                .command_buffer_count(1);
+
+            let cmd = self
+                .device
+                .allocate_command_buffers(&alloc_info)
+                .map_err(|e| GpuError::Internal(format!("timestamp alloc: {e}")))?[0];
+
+            let begin_info = vk::CommandBufferBeginInfo::default()
+                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+            self.device
+                .begin_command_buffer(cmd, &begin_info)
+                .map_err(|e| GpuError::Internal(format!("timestamp begin: {e}")))?;
+
+            // Reset query pool before use
+            self.device
+                .reset_query_pool(pool, 0, 1);
+
+            // Write GPU timestamp
+            self.device.cmd_write_timestamp(
+                cmd,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                pool,
+                0,
+            );
+
+            self.device
+                .end_command_buffer(cmd)
+                .map_err(|e| GpuError::Internal(format!("timestamp end: {e}")))?;
+
+            let submit_info =
+                vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&cmd));
+            self.device
+                .queue_submit(self.queue, &[submit_info], vk::Fence::null())
+                .map_err(|e| GpuError::Internal(format!("timestamp submit: {e}")))?;
+            self.device
+                .queue_wait_idle(self.queue)
+                .map_err(|e| GpuError::Internal(format!("timestamp wait: {e}")))?;
+
+            // Read back timestamp
+            let mut ts_data = [0u64];
+            self.device
+                .get_query_pool_results(
+                    pool,
+                    0,
+                    &mut ts_data,
+                    vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT,
+                )
+                .map_err(|e| GpuError::Internal(format!("timestamp read: {e}")))?;
+
+            self.device.free_command_buffers(
+                self.command_pool,
+                std::slice::from_ref(&cmd),
+            );
+
+            // Convert ticks to nanoseconds
+            Ok((ts_data[0] as f64 * self.timestamp_period as f64) as u64)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1461,5 +1567,21 @@ mod tests {
         let result: Vec<f32> = backend.read_buffer(&buf).unwrap();
         assert_eq!(result.len(), 16);
         // Uninitialised — all zeroes is typical for fresh device memory
+    }
+
+    #[test]
+    fn timestamp_works() {
+        let backend = match VulkanBackend::init() {
+            Ok(b) => b,
+            Err(_) => {
+                eprintln!("skipping: no Vulkan device");
+                return;
+            }
+        };
+
+        let t0 = backend.timestamp().unwrap();
+        let t1 = backend.timestamp().unwrap();
+        assert!(t1 >= t0, "timestamps should be monotonic");
+        assert!(t1 > 0, "timestamp should be non-zero");
     }
 }

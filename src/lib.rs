@@ -256,6 +256,18 @@ pub trait GpuBackend: Sized {
     /// Read the contents of a GPU buffer back to the CPU.
     fn read_buffer<T: bytemuck::Pod>(&self, buffer: &GpuBuffer) -> Result<Vec<T>>;
 
+    /// Return a GPU-side timestamp in nanoseconds for profiling.
+    ///
+    /// Call before and after a dispatch to measure GPU execution time
+    /// independent of CPU-side dispatch overhead:
+    ///
+    /// ```ignore
+    /// let t0 = gpu.timestamp()?;
+    /// gpu.dispatch(&pipeline, &buffers, (wgs, 1, 1))?;
+    /// let elapsed_ns = gpu.timestamp()? - t0;
+    /// ```
+    fn timestamp(&self) -> Result<u64>;
+
     /// Dispatch multiple kernels in a single command buffer.
     ///
     /// Amortises command-buffer creation and GPU-sync overhead across
@@ -334,6 +346,9 @@ impl GpuBackend for NoBackendStub {
         Err(GpuError::NoBackend)
     }
     fn read_buffer<T: bytemuck::Pod>(&self, _buffer: &GpuBuffer) -> Result<Vec<T>> {
+        Err(GpuError::NoBackend)
+    }
+    fn timestamp(&self) -> Result<u64> {
         Err(GpuError::NoBackend)
     }
 }
