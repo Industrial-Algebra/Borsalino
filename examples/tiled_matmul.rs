@@ -85,13 +85,19 @@ fn main() -> Result<(), borsalino::GpuError> {
 
     println!("Borsalino 2D Tiled Matrix Multiply");
     println!("  matrix: {n}×{n}  tile: {}×{}", TILE_SIZE, TILE_SIZE);
-    println!("  workgroups: {0}×{0}  threads/wg: {1}×{1} ({2})",
-        n as u32 / TILE_SIZE, TILE_SIZE, TILE_SIZE * TILE_SIZE);
+    println!(
+        "  workgroups: {0}×{0}  threads/wg: {1}×{1} ({2})",
+        n as u32 / TILE_SIZE,
+        TILE_SIZE,
+        TILE_SIZE * TILE_SIZE
+    );
     println!();
 
     // Generate matrices
     let a: Vec<f32> = (0..total).map(|i| (i % 997) as f32 * 0.001).collect();
-    let b: Vec<f32> = (0..total).map(|i| ((i * 3 + 1) % 997) as f32 * 0.001).collect();
+    let b: Vec<f32> = (0..total)
+        .map(|i| ((i * 3 + 1) % 997) as f32 * 0.001)
+        .collect();
 
     // CPU reference
     println!("--- CPU Reference ---");
@@ -118,7 +124,7 @@ fn main() -> Result<(), borsalino::GpuError> {
     gpu.dispatch_ex(
         &pipeline,
         &[&buf_a, &buf_b, &buf_c],
-        (wgs, wgs, 1),          // 2D workgroup grid
+        (wgs, wgs, 1),             // 2D workgroup grid
         (TILE_SIZE, TILE_SIZE, 1), // 2D thread layout
     )?;
     let dispatch_time = dispatch_start.elapsed();
@@ -138,7 +144,9 @@ fn main() -> Result<(), borsalino::GpuError> {
         let err = (result[i] - expected[i]).abs();
         if err > 1e-3 {
             mismatches += 1;
-            if err > max_err { max_err = err; }
+            if err > max_err {
+                max_err = err;
+            }
         }
     }
 

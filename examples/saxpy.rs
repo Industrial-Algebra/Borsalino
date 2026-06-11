@@ -33,7 +33,8 @@ fn main() -> Result<(), borsalino::GpuError> {
     const N: usize = 1024;
     let x: Vec<f32> = (0..N).map(|i| i as f32 * 0.125).collect();
     let y: Vec<f32> = (0..N).map(|i| 1.0 - i as f32 * 0.0625).collect();
-    let expected: Vec<f32> = x.iter()
+    let expected: Vec<f32> = x
+        .iter()
         .zip(y.iter())
         .map(|(xi, yi)| 2.5 * xi + yi)
         .collect();

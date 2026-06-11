@@ -72,7 +72,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
         .collect();
 
-    println!("  generated in {:>8.1} ms", gen_start.elapsed().as_secs_f64() * 1e3);
+    println!(
+        "  generated in {:>8.1} ms",
+        gen_start.elapsed().as_secs_f64() * 1e3
+    );
 
     // ── CPU reference ───────────────────────────────────────────
 
@@ -130,7 +133,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut max_err = 0.0f32;
     for i in 0..vocab_size as usize {
         let err = (result[i] - cpu_results[(batches - 1) as usize][i]).abs();
-        if err > max_err { max_err = err; }
+        if err > max_err {
+            max_err = err;
+        }
     }
     println!("  max error: {:.6}", max_err);
 

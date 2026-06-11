@@ -112,7 +112,11 @@ fn print_results(results: &[BenchResult]) {
             format_time(r),
             r.unit,
             r.iters,
-            if r.value > 0.0 { (r.stddev / r.value) * 100.0 } else { 0.0 }
+            if r.value > 0.0 {
+                (r.stddev / r.value) * 100.0
+            } else {
+                0.0
+            }
         );
     }
     println!();
@@ -176,7 +180,8 @@ fn main() -> Result<(), borsalino::GpuError> {
     // Measure GPU-side dispatch time vs CPU wall time
     let bench = run_bench("GPU timestamp dispatch (1 wg × 256)", "µs", 200, || {
         let t0 = gpu.timestamp().unwrap();
-        gpu.dispatch(&pipeline_noop, &[&out_buf], (1, 1, 1)).unwrap();
+        gpu.dispatch(&pipeline_noop, &[&out_buf], (1, 1, 1))
+            .unwrap();
         let t1 = gpu.timestamp().unwrap();
         let elapsed = t1.saturating_sub(t0);
         // Return elapsed in seconds for the bench framework
@@ -210,7 +215,8 @@ fn main() -> Result<(), borsalino::GpuError> {
 
     // Single workgroup × 256 threads
     let bench = run_bench("dispatch (1 workgroup × 256 threads)", "µs", 200, || {
-        gpu.dispatch(&pipeline_noop, &[&out_buf], (1, 1, 1)).unwrap();
+        gpu.dispatch(&pipeline_noop, &[&out_buf], (1, 1, 1))
+            .unwrap();
     });
     println!(
         "  dispatch 1×256:  {:>8.1} µs ±{:.1}%",
@@ -236,15 +242,10 @@ fn main() -> Result<(), borsalino::GpuError> {
         let iters = if n <= 262_144 { 50 } else { 10 };
         let (unit, scale) = scale_unit(n);
 
-        let bench = run_bench(
-            &format!("vadd {n:>9} el ({wgs} wgs)"),
-            unit,
-            iters,
-            || {
-                gpu.dispatch(&pipeline_vadd, &[&buf_a, &buf_b, &buf_out], (wgs, 1, 1))
-                    .unwrap();
-            },
-        );
+        let bench = run_bench(&format!("vadd {n:>9} el ({wgs} wgs)"), unit, iters, || {
+            gpu.dispatch(&pipeline_vadd, &[&buf_a, &buf_b, &buf_out], (wgs, 1, 1))
+                .unwrap();
+        });
 
         let elem_sec = n as f64 / bench.value;
         let gflops = (n as f64 * 2.0) / bench.value / 1e9;
@@ -311,19 +312,10 @@ fn main() -> Result<(), borsalino::GpuError> {
         let iters = if n <= 262_144 { 50 } else { 10 };
         let (unit, scale) = scale_unit(n);
 
-        let bench = run_bench(
-            &format!("saxpy {n:>9} el ({wgs} wgs)"),
-            unit,
-            iters,
-            || {
-                gpu.dispatch(
-                    &pipeline_saxpy,
-                    &[&buf_x, &buf_y, &buf_out],
-                    (wgs, 1, 1),
-                )
+        let bench = run_bench(&format!("saxpy {n:>9} el ({wgs} wgs)"), unit, iters, || {
+            gpu.dispatch(&pipeline_saxpy, &[&buf_x, &buf_y, &buf_out], (wgs, 1, 1))
                 .unwrap();
-            },
-        );
+        });
 
         let elem_sec = n as f64 / bench.value;
         let gflops = (n as f64 * 3.0) / bench.value / 1e9;
@@ -427,7 +419,9 @@ fn matmul(
     for &n in &[512u32, 1024u32] {
         let total = (n * n) as usize;
         let a: Vec<f32> = (0..total).map(|i| (i % 997) as f32 * 0.001).collect();
-        let b: Vec<f32> = (0..total).map(|i| ((i * 3 + 1) % 997) as f32 * 0.001).collect();
+        let b: Vec<f32> = (0..total)
+            .map(|i| ((i * 3 + 1) % 997) as f32 * 0.001)
+            .collect();
 
         let ksrc = kernel_matmul
             .replace("MATRIX_Nu", &n.to_string())

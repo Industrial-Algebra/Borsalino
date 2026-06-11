@@ -282,10 +282,7 @@ pub trait GpuBackend: Sized {
     ///
     /// Default implementation delegates to
     /// [`create_buffer_uninit`](GpuBackend::create_buffer_uninit).
-    fn create_device_buffer_uninit<T: bytemuck::Pod>(
-        &self,
-        len: usize,
-    ) -> Result<GpuBuffer> {
+    fn create_device_buffer_uninit<T: bytemuck::Pod>(&self, len: usize) -> Result<GpuBuffer> {
         self.create_buffer_uninit::<T>(len)
     }
 
