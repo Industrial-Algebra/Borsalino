@@ -175,6 +175,45 @@ impl Drop for GpuBuffer {
     }
 }
 
+/// Handle to an in-flight asynchronous dispatch.
+///
+/// Created by [`GpuBackend::dispatch_async`]. Call [`Pulse::wait`]
+/// to block until the GPU completes the dispatch. Multiple pulses
+/// can be in flight simultaneously.
+///
+/// # Drop behaviour
+///
+/// When dropped, blocks until the dispatch completes (implicit join).
+pub struct Pulse {
+    pub(crate) raw: *mut c_void,
+    pub(crate) wait_fn: fn(*mut c_void),
+    pub(crate) drop_fn: fn(*mut c_void),
+}
+
+impl std::fmt::Debug for Pulse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Pulse").field("raw", &self.raw).finish()
+    }
+}
+
+unsafe impl Send for Pulse {}
+unsafe impl Sync for Pulse {}
+
+impl Drop for Pulse {
+    fn drop(&mut self) {
+        // Implicit join: wait for the dispatch to complete before cleanup
+        (self.wait_fn)(self.raw);
+        (self.drop_fn)(self.raw);
+    }
+}
+
+impl Pulse {
+    /// Block until the dispatch completes.
+    pub fn wait(&self) {
+        (self.wait_fn)(self.raw);
+    }
+}
+
 // ── Trait ─────────────────────────────────────────────────────────
 
 /// Backend-agnostic GPU compute interface.
@@ -312,6 +351,29 @@ pub trait GpuBackend: Sized {
             )?;
         }
         Ok(())
+    }
+
+    /// Dispatch a compute pipeline asynchronously.
+    ///
+    /// Returns a [`Pulse`] handle that can be waited on later.
+    /// Unlike [`dispatch`](GpuBackend::dispatch), this does not block
+    /// the caller. Multiple async dispatches can be in flight simultaneously.
+    ///
+    /// The default implementation calls [`dispatch`](GpuBackend::dispatch)
+    /// and wraps the result in a no-op pulse. Backends may override with
+    /// true async behaviour.
+    fn dispatch_async(
+        &self,
+        pipeline: &ComputePipeline,
+        buffers: &[&GpuBuffer],
+        workgroups: (u32, u32, u32),
+    ) -> Result<Pulse> {
+        self.dispatch(pipeline, buffers, workgroups)?;
+        Ok(Pulse {
+            raw: std::ptr::null_mut(),
+            wait_fn: |_| {},
+            drop_fn: |_| {},
+        })
     }
 }
 
