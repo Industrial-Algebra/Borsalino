@@ -1,5 +1,10 @@
 # Borsalino
 
+[![crates.io](https://img.shields.io/crates/v/borsalino)](https://crates.io/crates/borsalino)
+[![docs.rs](https://img.shields.io/docsrs/borsalino)](https://docs.rs/borsalino)
+[![CI](https://github.com/Industrial-Algebra/Borsalino/actions/workflows/ci.yml/badge.svg)](https://github.com/Industrial-Algebra/Borsalino/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/license-AGPL--3.0--or--Commercial-blue)](./LICENSE)
+
 Thin GPU compute abstraction for the Industrial Algebra ecosystem.
 
 > One trait, two backends, zero ceremony.
