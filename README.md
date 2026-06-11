@@ -129,6 +129,28 @@ Batching amortises command-buffer allocation overhead. On RTX 5080,
 **0.5 us** (75x faster). On GB10: 46 us to **1.0 us** (46x faster).
 Peak throughput: **577 GFLOPS** (RTX 5080, 1M elements batched).
 
+## Persistent Buffers
+
+For iterative workloads (ML training, physics simulation), buffers can
+live on the GPU across dispatches without CPU readback:
+
+```rust
+let weights = gpu.create_device_buffer(&model_weights)?;
+let output = gpu.create_device_buffer_uninit::<f32>(N)?;
+
+// Dispatch many times — no CPU round-trip
+for _ in 0..1000 {
+    gpu.dispatch(&pipeline, &[&weights, &output], (wgs, 1, 1))?;
+}
+
+// Read once at the end
+let result = gpu.read_buffer(&output)?;
+```
+
+On unified memory, `create_device_buffer` is identical to `create_buffer`
+(zero copy). On discrete GPUs, it allocates VRAM and uses one-shot staging
+only on final readback.
+
 See [BENCHMARKS.md](./BENCHMARKS.md) for full cross-platform performance data.
 
 ## Verification
