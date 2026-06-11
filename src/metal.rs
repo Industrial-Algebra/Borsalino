@@ -20,7 +20,7 @@ use naga::valid::{Capabilities, ValidationFlags, Validator};
 use objc::runtime::Object;
 use objc::{class, msg_send, sel, sel_impl};
 
-use crate::{ComputePipeline, GpuBuffer, GpuBackend, GpuError, Result, DispatchSpec};
+use crate::{ComputePipeline, DispatchSpec, GpuBuffer, GpuBackend, GpuError, Pulse, Result};
 
 // ═══════════════════════════════════════════════════════════════════
 // Metal C symbol
@@ -533,6 +533,64 @@ impl GpuBackend for MetalBackend {
         }
 
         Ok(())
+    }
+
+    fn dispatch_async(
+        &self,
+        pipeline: &ComputePipeline,
+        buffers: &[&GpuBuffer],
+        workgroups: (u32, u32, u32),
+    ) -> Result<Pulse> {
+        unsafe {
+            let cmd: *mut c_void =
+                msg_send![obj(self.queue.ptr.as_ptr()), commandBuffer];
+            if cmd.is_null() {
+                return Err(GpuError::DispatchFailed {
+                    message: "failed to create MTLCommandBuffer".into(),
+                });
+            }
+
+            let encoder: *mut c_void =
+                msg_send![obj(cmd), computeCommandEncoder];
+            if encoder.is_null() {
+                let _: () = msg_send![obj(cmd), release];
+                return Err(GpuError::DispatchFailed {
+                    message: "failed to create MTLComputeCommandEncoder".into(),
+                });
+            }
+
+            let _: () =
+                msg_send![obj(encoder), setComputePipelineState: pipeline.raw];
+
+            for (i, buf) in buffers.iter().enumerate() {
+                let _: () = msg_send![
+                    obj(encoder),
+                    setBuffer: buf.raw
+                    offset: 0u64
+                    atIndex: i as u64
+                ];
+            }
+
+            let _: () = msg_send![
+                obj(encoder),
+                dispatchThreadgroups: (workgroups.0 as u64, workgroups.1 as u64, workgroups.2 as u64)
+                threadsPerThreadgroup: (256u64, 1u64, 1u64)
+            ];
+
+            let _: () = msg_send![obj(encoder), endEncoding];
+            let _: () = msg_send![obj(cmd), commit];
+
+            // Store command buffer in Pulse; wait+release on demand
+            Ok(Pulse {
+                raw: cmd,
+                wait_fn: |raw| {
+                    let _: () = unsafe { msg_send![obj(raw), waitUntilCompleted] };
+                },
+                drop_fn: |raw| {
+                    let _: () = unsafe { msg_send![obj(raw), release] };
+                },
+            })
+        }
     }
 
     fn read_buffer<T: bytemuck::Pod>(

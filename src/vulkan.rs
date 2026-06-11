@@ -29,7 +29,7 @@ use ash::Entry;
 
 use std::ffi::CString;
 
-use crate::{ComputePipeline, DispatchSpec, GpuBuffer, GpuBackend, GpuError, MemoryStrategy, Result};
+use crate::{ComputePipeline, DispatchSpec, GpuBuffer, GpuBackend, GpuError, MemoryStrategy, Pulse, Result};
 
 // ═══════════════════════════════════════════════════════════════════
 // VulkanBackend
@@ -167,6 +167,41 @@ fn drop_vulkan_pipeline(raw: *mut std::ffi::c_void) {
         unsafe {
             let inner = Box::from_raw(raw as *mut VulkanPipelineInner);
             inner.device.destroy_pipeline(inner.pipeline, None);
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Pulse inner type
+// ═══════════════════════════════════════════════════════════════════
+
+/// Internal state for an async dispatch, stored behind the opaque
+/// `Pulse.raw` pointer.
+struct VulkanPulseInner {
+    fence: vk::Fence,
+    device: ash::Device,
+}
+
+fn wait_vulkan_pulse(raw: *mut std::ffi::c_void) {
+    if !raw.is_null() {
+        let inner = unsafe { &*(raw as *const VulkanPulseInner) };
+        unsafe {
+            let _ = inner
+                .device
+                .wait_for_fences(
+                    std::slice::from_ref(&inner.fence),
+                    true,
+                    u64::MAX,
+                );
+        }
+    }
+}
+
+fn drop_vulkan_pulse(raw: *mut std::ffi::c_void) {
+    if !raw.is_null() {
+        let inner = unsafe { Box::from_raw(raw as *mut VulkanPulseInner) };
+        unsafe {
+            inner.device.destroy_fence(inner.fence, None);
         }
     }
 }
@@ -1525,6 +1560,155 @@ impl GpuBackend for VulkanBackend {
         Ok(())
     }
 
+    fn dispatch_async(
+        &self,
+        pipeline: &ComputePipeline,
+        buffers: &[&GpuBuffer],
+        workgroups: (u32, u32, u32),
+    ) -> Result<Pulse> {
+        let nbuffers = buffers.len();
+        if nbuffers > Self::MAX_BUFFER_BINDINGS as usize {
+            return Err(GpuError::InvalidBinding {
+                message: format!(
+                    "{nbuffers} buffers exceeds max {}",
+                    Self::MAX_BUFFER_BINDINGS
+                ),
+            });
+        }
+
+        let alloc_info = vk::CommandBufferAllocateInfo::default()
+            .command_pool(self.command_pool)
+            .level(vk::CommandBufferLevel::PRIMARY)
+            .command_buffer_count(1);
+
+        let cmd = unsafe {
+            self.device
+                .allocate_command_buffers(&alloc_info)
+                .map_err(|e| GpuError::DispatchFailed {
+                    message: format!("vkAllocateCommandBuffers: {e}"),
+                })?
+        }[0];
+
+        let begin_info = vk::CommandBufferBeginInfo::default()
+            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+
+        unsafe {
+            self.device
+                .begin_command_buffer(cmd, &begin_info)
+                .map_err(|e| GpuError::DispatchFailed {
+                    message: format!("vkBeginCommandBuffer: {e}"),
+                })?;
+        }
+
+        // Bind pipeline
+        unsafe {
+            let vk_pipeline =
+                (*(pipeline.raw as *const VulkanPipelineInner)).pipeline;
+            self.device.cmd_bind_pipeline(
+                cmd,
+                vk::PipelineBindPoint::COMPUTE,
+                vk_pipeline,
+            );
+        }
+
+        // Descriptor set + bind
+        let mut buffer_infos = Vec::with_capacity(nbuffers);
+        let mut writes = Vec::with_capacity(nbuffers);
+        for buf in buffers.iter() {
+            let inner =
+                unsafe { &*(buf.raw as *const VulkanBufferInner) };
+            buffer_infos.push(
+                vk::DescriptorBufferInfo::default()
+                    .buffer(inner.buffer)
+                    .offset(0)
+                    .range(vk::WHOLE_SIZE),
+            );
+        }
+        for (i, bi) in buffer_infos.iter().enumerate() {
+            writes.push(
+                vk::WriteDescriptorSet::default()
+                    .dst_set(self.descriptor_set)
+                    .dst_binding(i as u32)
+                    .dst_array_element(0)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .buffer_info(std::slice::from_ref(bi)),
+            );
+        }
+
+        unsafe {
+            self.device.update_descriptor_sets(&writes, &[]);
+            self.device.cmd_bind_descriptor_sets(
+                cmd,
+                vk::PipelineBindPoint::COMPUTE,
+                self.pipeline_layout,
+                0,
+                std::slice::from_ref(&self.descriptor_set),
+                &[],
+            );
+            self.device.cmd_dispatch(cmd, workgroups.0, workgroups.1, workgroups.2);
+
+            // Barrier: shader write → host read (applied when waited)
+            let barrier = vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(vk::AccessFlags::HOST_READ);
+            self.device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::HOST,
+                vk::DependencyFlags::empty(),
+                std::slice::from_ref(&barrier),
+                &[],
+                &[],
+            );
+
+            self.device
+                .end_command_buffer(cmd)
+                .map_err(|e| GpuError::DispatchFailed {
+                    message: format!("vkEndCommandBuffer: {e}"),
+                })?;
+        }
+
+        // Create fence for async completion signal
+        let fence_info = vk::FenceCreateInfo::default();
+        let fence = unsafe {
+            self.device
+                .create_fence(&fence_info, None)
+                .map_err(|e| GpuError::DispatchFailed {
+                    message: format!("vkCreateFence: {e}"),
+                })?
+        };
+
+        let submit_info =
+            vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&cmd));
+
+        unsafe {
+            self.device
+                .queue_submit(self.queue, &[submit_info], fence)
+                .map_err(|e| GpuError::DispatchFailed {
+                    message: format!("vkQueueSubmit: {e}"),
+                })?;
+        }
+
+        // Free command buffer (work is submitted, fence tracks completion)
+        unsafe {
+            self.device.free_command_buffers(
+                self.command_pool,
+                std::slice::from_ref(&cmd),
+            );
+        }
+
+        let inner = Box::new(VulkanPulseInner {
+            fence,
+            device: self.device.clone(),
+        });
+
+        Ok(Pulse {
+            raw: Box::into_raw(inner) as *mut std::ffi::c_void,
+            wait_fn: wait_vulkan_pulse,
+            drop_fn: drop_vulkan_pulse,
+        })
+    }
+
     fn read_buffer<T: bytemuck::Pod>(&self, buffer: &GpuBuffer) -> Result<Vec<T>> {
         let inner = unsafe { &*(buffer.raw as *const VulkanBufferInner) };
 
@@ -1834,6 +2018,39 @@ mod tests {
     }
 
     #[test]
+    fn async_dispatch() {
+        let backend = match VulkanBackend::init() {
+            Ok(b) => b,
+            Err(_) => {
+                eprintln!("skipping: no Vulkan device");
+                return;
+            }
+        };
+
+        let wgsl = r#"
+            @group(0) @binding(0) var<storage, read> input: array<f32>;
+            @group(0) @binding(1) var<storage, read_write> output: array<f32>;
+            @compute @workgroup_size(256)
+            fn add_one(@builtin(global_invocation_id) gid: vec3<u32>) {
+                output[gid.x] = input[gid.x] + 1.0;
+            }
+        "#;
+        let pipeline = backend.compile("add_one", wgsl).unwrap();
+        let input =
+            backend.create_buffer(&[1.0f32, 2.0, 3.0, 4.0]).unwrap();
+        let output = backend.create_device_buffer_uninit::<f32>(4).unwrap();
+
+        let pulse = backend
+            .dispatch_async(&pipeline, &[&input, &output], (1, 1, 1))
+            .unwrap();
+
+        pulse.wait();
+
+        let result: Vec<f32> = backend.read_buffer(&output).unwrap();
+        assert_eq!(result, vec![2.0, 3.0, 4.0, 5.0]);
+    }
+
+    #[test]
     fn persistent_buffer_multi_dispatch() {
         let backend = match VulkanBackend::init() {
             Ok(b) => b,
@@ -1843,7 +2060,6 @@ mod tests {
             }
         };
 
-        // Create device-local buffer (lives on GPU, no CPU readback between dispatches)
         let weights = backend
             .create_device_buffer(&[2.0f32, 3.0, 4.0, 5.0])
             .unwrap();
@@ -1859,17 +2075,14 @@ mod tests {
         "#;
         let pipeline = backend.compile("scale", wgsl).unwrap();
 
-        // Dispatch multiple times without re-reading — buffer stays on GPU
         for _ in 0..5 {
             backend
                 .dispatch(&pipeline, &[&weights, &output], (1, 1, 1))
                 .unwrap();
         }
 
-        // Read once at the end
         let result: Vec<f32> = backend.read_buffer(&output).unwrap();
         assert_eq!(result.len(), 4);
-        // Each dispatch scaled weights by 10, so values = original * 10
         for (i, &r) in result.iter().enumerate() {
             let expected = (2.0 + i as f32) * 10.0;
             assert!((r - expected).abs() < 1e-5, "mismatch at {i}: {r} vs {expected}");
