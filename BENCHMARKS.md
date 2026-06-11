@@ -81,18 +81,20 @@ Per-dispatch overhead at 256 batched:
 
 ## Tiled Matrix Multiply (2D workgroup, shared memory)
 
-1024×1024 matrix, 16×16 tile size, 64×64 workgroups.
+16×16 tile size, WGSL shared memory + barriers.
 
-| Platform | GFLOPS |
-|---|---|
-| **NVIDIA RTX 5080** | **1,120** |
-| **NVIDIA GB10** | **1,097** |
-| **AMD Radeon (iGPU)** | **278** |
-| Apple M3 Pro | 184 |
+| Platform | 512×512 | 1024×1024 | 4096×4096 | 8192×8192 |
+|---|---|---|---|---|
+| **NVIDIA GB10** | 398 | 1,171 | 1,225 | **1,403 GFLOPS** |
+| **NVIDIA RTX 5080** | 182 | 978 | 523 | — |
+| **AMD Radeon (iGPU)** | — | 278 | — | — |
+| Apple M3 Pro | 160 | 184 | 186 | — |
 
-The tiled kernel demonstrates Borsalino's compute-bound ceiling — approaching
-1+ TFLOPS on discrete hardware. Compare with element-wise SAXPY at 17-67 GFLOPS
-— the 2D shared-memory pattern delivers 6-40× higher throughput.
+The kernel scales with problem size on GB10 — throughput increases from
+398 GFLOPS (512) to 1,403 GFLOPS (8192) as launch overhead is amortised.
+RTX 5080 peaks at 1024 then drops at 4096, likely PCIe-limited at larger
+matrix sizes where memory traffic exceeds the bus. Unified memory
+platforms (M3, AMD) are bandwidth-limited from the start.
 
 ## GPU Timestamp Resolution
 
