@@ -181,6 +181,39 @@ Bundles export to SMT-LIB2, Lean 4, and Kani verification backends.
 | `bench` | Cross-platform GPU benchmarks | `cargo run --example bench --features vulkan --release` |
 | `dispatch_profile` | Per-component dispatch cost profiling | `cargo run --example dispatch_profile --features vulkan --release` |
 | `tiled_matmul` | 2D tiled matrix multiply with shared memory | `cargo run --example tiled_matmul --features vulkan --release` |
+| `candle_tropical_mask` | Candle + Borsalino tropical masking benchmark | `cargo run --example candle_tropical_mask --features vulkan --release` |
+
+## Async Dispatch
+
+Non-blocking GPU execution via [`dispatch_async`](GpuBackend::dispatch_async):
+
+```rust
+let p1 = gpu.dispatch_async(&pipe_a, &[&buf_x], (64, 1, 1))?;
+let p2 = gpu.dispatch_async(&pipe_b, &[&buf_y], (64, 1, 1))?;
+// Both running concurrently on GPU. Do CPU work here...
+p1.wait();
+p2.wait();
+let result = gpu.read_buffer(&buf_out)?;
+```
+
+[`Pulse`] handles are `Send + Sync`. Drop performs implicit join
+(blocks until the GPU dispatch completes).
+
+## Profiling
+
+Measure GPU-side execution time with [`timestamp`](GpuBackend::timestamp):
+
+```rust
+let t0 = gpu.timestamp()?;
+gpu.dispatch(&pipeline, &buffers, (wgs, 1, 1))?;
+let gpu_ns = gpu.timestamp()? - t0;
+```
+
+## Candle Integration
+
+Borsalino complements Huggingface Candle for custom element-wise GPU kernels.
+See `examples/candle_tropical_mask.rs` for the full Candle → Borsalino → Candle
+data flow implementing Quantizon's tropical masking operation.
 
 ## 2D / 3D Dispatch
 
