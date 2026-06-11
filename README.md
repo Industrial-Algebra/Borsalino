@@ -153,6 +153,26 @@ Bundles export to SMT-LIB2, Lean 4, and Kani verification backends.
 | `saxpy` | SAXPY (a·x + y) on 1024 elements | `cargo run --example saxpy --features vulkan` |
 | `bench` | Cross-platform GPU benchmarks | `cargo run --example bench --features vulkan --release` |
 | `dispatch_profile` | Per-component dispatch cost profiling | `cargo run --example dispatch_profile --features vulkan --release` |
+| `tiled_matmul` | 2D tiled matrix multiply with shared memory | `cargo run --example tiled_matmul --features vulkan --release` |
+
+## 2D / 3D Dispatch
+
+Borsalino supports multi-dimensional workgroup grids for tile-based
+algorithms (matrix multiply, convolution, attention):
+
+```rust
+// 2D workgroup grid: 64×64 workgroups, each 16×16 threads
+gpu.dispatch_ex(
+    &pipeline, &buffers,
+    (64, 64, 1),      // workgroups in (x, y, z)
+    (16, 16, 1),       // threads per workgroup
+)?;
+```
+
+Combine with WGSL shared memory (`var<workgroup>`) and barriers
+(`workgroupBarrier()`) for tiled algorithms. See
+`examples/tiled_matmul.rs` for a complete 2D tiled matrix multiply
+(278 GFLOPS on AMD iGPU, 1024×1024, ~1 TFLOPS on NVIDIA RTX).
 
 ## Testing
 
