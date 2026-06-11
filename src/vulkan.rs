@@ -979,6 +979,204 @@ impl GpuBackend for VulkanBackend {
         })
     }
 
+    fn create_device_buffer<T: bytemuck::Pod>(
+        &self,
+        data: &[T],
+    ) -> Result<GpuBuffer> {
+        let element_size = std::mem::size_of::<T>();
+        let byte_len = std::mem::size_of_val(data) as vk::DeviceSize;
+
+        let aligned_size = if byte_len == 0 {
+            self.min_storage_buffer_offset_alignment
+        } else {
+            align_up(byte_len, self.min_storage_buffer_offset_alignment)
+        };
+
+        let usage = vk::BufferUsageFlags::STORAGE_BUFFER
+            | vk::BufferUsageFlags::TRANSFER_SRC
+            | vk::BufferUsageFlags::TRANSFER_DST;
+
+        // Device-local buffer: VRAM on discrete, host-visible on unified
+        let (dev_buf, dev_mem) = if self.uses_device_local {
+            unsafe {
+                allocate_device_local_buffer(
+                    &self.device,
+                    &self.memory_properties,
+                    aligned_size,
+                    usage,
+                )?
+            }
+        } else {
+            let (buf, mem, mapped) = unsafe {
+                allocate_buffer(
+                    &self.device,
+                    &self.memory_properties,
+                    aligned_size,
+                    usage,
+                )?
+            };
+            // Upload data directly (unified memory)
+            if byte_len > 0 {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        data.as_ptr() as *const std::ffi::c_void,
+                        mapped,
+                        byte_len as usize,
+                    );
+                }
+            }
+            let inner = Box::new(VulkanBufferInner {
+                buffer: buf,
+                memory: mem,
+                _size: aligned_size,
+                mapped,
+                staging_buffer: None,
+                staging_memory: None,
+                device: self.device.clone(),
+            });
+
+            return Ok(GpuBuffer {
+                raw: Box::into_raw(inner) as *mut std::ffi::c_void,
+                len: data.len(),
+                element_size,
+                drop_fn: drop_vulkan_buffer,
+                contents_fn: contents_vulkan_buffer,
+            });
+        };
+
+        // On discrete GPU: upload via temp staging buffer, then free it
+        let (stg_buf, stg_mem, stg_mapped) = unsafe {
+            allocate_buffer(
+                &self.device,
+                &self.memory_properties,
+                aligned_size,
+                vk::BufferUsageFlags::TRANSFER_SRC,
+            )?
+        };
+
+        if byte_len > 0 {
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    data.as_ptr() as *const std::ffi::c_void,
+                    stg_mapped,
+                    byte_len as usize,
+                );
+            }
+            unsafe {
+                one_shot_transfer(
+                    &self.device,
+                    self.transfer_command_pool,
+                    self.queue,
+                    |cmd| {
+                        let copy = vk::BufferCopy::default().size(aligned_size);
+                        self.device.cmd_copy_buffer(
+                            cmd,
+                            stg_buf,
+                            dev_buf,
+                            std::slice::from_ref(&copy),
+                        );
+                    },
+                )?;
+            }
+        }
+
+        // Free temporary staging buffer
+        unsafe {
+            self.device.destroy_buffer(stg_buf, None);
+            self.device.free_memory(stg_mem, None);
+        }
+
+        let inner = Box::new(VulkanBufferInner {
+            buffer: dev_buf,
+            memory: dev_mem,
+            _size: aligned_size,
+            mapped: std::ptr::null_mut(),
+            staging_buffer: None,
+            staging_memory: None,
+            device: self.device.clone(),
+        });
+
+        Ok(GpuBuffer {
+            raw: Box::into_raw(inner) as *mut std::ffi::c_void,
+            len: data.len(),
+            element_size,
+            drop_fn: drop_vulkan_buffer,
+            contents_fn: contents_vulkan_buffer,
+        })
+    }
+
+    fn create_device_buffer_uninit<T: bytemuck::Pod>(
+        &self,
+        len: usize,
+    ) -> Result<GpuBuffer> {
+        let element_size = std::mem::size_of::<T>();
+        let byte_len = (len * element_size) as vk::DeviceSize;
+
+        let aligned_size = if byte_len == 0 {
+            self.min_storage_buffer_offset_alignment
+        } else {
+            align_up(byte_len, self.min_storage_buffer_offset_alignment)
+        };
+
+        let usage = vk::BufferUsageFlags::STORAGE_BUFFER
+            | vk::BufferUsageFlags::TRANSFER_SRC
+            | vk::BufferUsageFlags::TRANSFER_DST;
+
+        let (buf, mem) = if self.uses_device_local {
+            unsafe {
+                allocate_device_local_buffer(
+                    &self.device,
+                    &self.memory_properties,
+                    aligned_size,
+                    usage,
+                )?
+            }
+        } else {
+            let (buf, mem, mapped) = unsafe {
+                allocate_buffer(
+                    &self.device,
+                    &self.memory_properties,
+                    aligned_size,
+                    usage,
+                )?
+            };
+            let inner = Box::new(VulkanBufferInner {
+                buffer: buf,
+                memory: mem,
+                _size: aligned_size,
+                mapped,
+                staging_buffer: None,
+                staging_memory: None,
+                device: self.device.clone(),
+            });
+            return Ok(GpuBuffer {
+                raw: Box::into_raw(inner) as *mut std::ffi::c_void,
+                len,
+                element_size,
+                drop_fn: drop_vulkan_buffer,
+                contents_fn: contents_vulkan_buffer,
+            });
+        };
+
+        let inner = Box::new(VulkanBufferInner {
+            buffer: buf,
+            memory: mem,
+            _size: aligned_size,
+            mapped: std::ptr::null_mut(),
+            staging_buffer: None,
+            staging_memory: None,
+            device: self.device.clone(),
+        });
+
+        Ok(GpuBuffer {
+            raw: Box::into_raw(inner) as *mut std::ffi::c_void,
+            len,
+            element_size,
+            drop_fn: drop_vulkan_buffer,
+            contents_fn: contents_vulkan_buffer,
+        })
+    }
+
     fn dispatch(
         &self,
         pipeline: &ComputePipeline,
@@ -1331,18 +1529,47 @@ impl GpuBackend for VulkanBackend {
         let inner = unsafe { &*(buffer.raw as *const VulkanBufferInner) };
 
         if self.uses_device_local {
-            // Copy device-local → staging buffer
-            if let (Some(stg_buf), Some(_stg_mem)) =
-                (inner.staging_buffer, inner.staging_memory)
-            {
+            // Device-local with persistent staging (from create_buffer)
+            if inner.staging_buffer.is_some() {
+                if let (Some(stg_buf), Some(_stg_mem)) =
+                    (inner.staging_buffer, inner.staging_memory)
+                {
+                    unsafe {
+                        one_shot_transfer(
+                            &self.device,
+                            self.transfer_command_pool,
+                            self.queue,
+                            |cmd| {
+                                let copy =
+                                    vk::BufferCopy::default().size(inner._size);
+                                self.device.cmd_copy_buffer(
+                                    cmd,
+                                    inner.buffer,
+                                    stg_buf,
+                                    std::slice::from_ref(&copy),
+                                );
+                            },
+                        )?;
+                    }
+                }
+            } else if inner.mapped.is_null() {
+                // Device-local without staging (from create_device_buffer).
+                // Allocate temp staging, copy, read, free.
+                let (stg_buf, stg_mem, stg_mapped) = unsafe {
+                    allocate_buffer(
+                        &self.device,
+                        &self.memory_properties,
+                        inner._size,
+                        vk::BufferUsageFlags::TRANSFER_DST,
+                    )?
+                };
                 unsafe {
                     one_shot_transfer(
                         &self.device,
                         self.transfer_command_pool,
                         self.queue,
                         |cmd| {
-                            let copy =
-                                vk::BufferCopy::default().size(inner._size);
+                            let copy = vk::BufferCopy::default().size(inner._size);
                             self.device.cmd_copy_buffer(
                                 cmd,
                                 inner.buffer,
@@ -1352,6 +1579,27 @@ impl GpuBackend for VulkanBackend {
                         },
                     )?;
                 }
+
+                let contents = stg_mapped as *const T;
+                if contents.is_null() {
+                    unsafe {
+                        self.device.destroy_buffer(stg_buf, None);
+                        self.device.free_memory(stg_mem, None);
+                    }
+                    return Err(GpuError::BufferReadFailed {
+                        message: "staging buffer map failed".into(),
+                    });
+                }
+                let slice = unsafe {
+                    std::slice::from_raw_parts(contents, buffer.len)
+                };
+                let result = slice.to_vec();
+
+                unsafe {
+                    self.device.destroy_buffer(stg_buf, None);
+                    self.device.free_memory(stg_mem, None);
+                }
+                return Ok(result);
             }
         }
 
@@ -1583,5 +1831,48 @@ mod tests {
         let t1 = backend.timestamp().unwrap();
         assert!(t1 >= t0, "timestamps should be monotonic");
         assert!(t1 > 0, "timestamp should be non-zero");
+    }
+
+    #[test]
+    fn persistent_buffer_multi_dispatch() {
+        let backend = match VulkanBackend::init() {
+            Ok(b) => b,
+            Err(_) => {
+                eprintln!("skipping: no Vulkan device");
+                return;
+            }
+        };
+
+        // Create device-local buffer (lives on GPU, no CPU readback between dispatches)
+        let weights = backend
+            .create_device_buffer(&[2.0f32, 3.0, 4.0, 5.0])
+            .unwrap();
+        let output = backend.create_device_buffer_uninit::<f32>(4).unwrap();
+
+        let wgsl = r#"
+            @group(0) @binding(0) var<storage, read> w: array<f32>;
+            @group(0) @binding(1) var<storage, read_write> out: array<f32>;
+            @compute @workgroup_size(4)
+            fn scale(@builtin(global_invocation_id) gid: vec3<u32>) {
+                out[gid.x] = w[gid.x] * 10.0;
+            }
+        "#;
+        let pipeline = backend.compile("scale", wgsl).unwrap();
+
+        // Dispatch multiple times without re-reading — buffer stays on GPU
+        for _ in 0..5 {
+            backend
+                .dispatch(&pipeline, &[&weights, &output], (1, 1, 1))
+                .unwrap();
+        }
+
+        // Read once at the end
+        let result: Vec<f32> = backend.read_buffer(&output).unwrap();
+        assert_eq!(result.len(), 4);
+        // Each dispatch scaled weights by 10, so values = original * 10
+        for (i, &r) in result.iter().enumerate() {
+            let expected = (2.0 + i as f32) * 10.0;
+            assert!((r - expected).abs() < 1e-5, "mismatch at {i}: {r} vs {expected}");
+        }
     }
 }

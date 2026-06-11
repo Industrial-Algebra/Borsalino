@@ -224,6 +224,32 @@ pub trait GpuBackend: Sized {
     /// Allocate an uninitialised GPU buffer of `len` elements.
     fn create_buffer_uninit<T: bytemuck::Pod>(&self, len: usize) -> Result<GpuBuffer>;
 
+    /// Allocate a device-local GPU buffer and upload initial data.
+    ///
+    /// Unlike [`create_buffer`](GpuBackend::create_buffer), this buffer is
+    /// allocated in device-local memory (VRAM on discrete GPUs) and persists
+    /// across dispatches without CPU readback overhead. Use for model weights,
+    /// activations, and other GPU-resident data.
+    ///
+    /// On unified memory systems (Apple Silicon, AMD APU, GB10), this is
+    /// identical to [`create_buffer`](GpuBackend::create_buffer).
+    ///
+    /// Default implementation delegates to [`create_buffer`](GpuBackend::create_buffer).
+    fn create_device_buffer<T: bytemuck::Pod>(&self, data: &[T]) -> Result<GpuBuffer> {
+        self.create_buffer(data)
+    }
+
+    /// Allocate an uninitialised device-local GPU buffer.
+    ///
+    /// Default implementation delegates to
+    /// [`create_buffer_uninit`](GpuBackend::create_buffer_uninit).
+    fn create_device_buffer_uninit<T: bytemuck::Pod>(
+        &self,
+        len: usize,
+    ) -> Result<GpuBuffer> {
+        self.create_buffer_uninit::<T>(len)
+    }
+
     /// Dispatch a compute pipeline across `workgroups` thread groups.
     ///
     /// Each workgroup contains 256 threads (1D layout) unless overridden
