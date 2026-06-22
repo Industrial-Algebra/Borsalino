@@ -63,3 +63,39 @@ jobs:
         run: cargo doc --all-features --no-deps
         env:
           RUSTDOCFLAGS: -D warnings
+
+  kani:
+    name: Kani Verification
+    runs-on: ubuntu-latest
+    if: contains(github.event.pull_request.labels.*.name, 'run-kani')
+    steps:
+      - uses: actions/checkout@v4
+      - uses: model-checking/kani-github-action@v31
+      - name: Run Kani harnesses
+        run: |
+          cargo kani --harness buffer_alignment_boundary
+          cargo kani --harness workgroup_divisibility
+          cargo kani --harness buffer_size_no_overflow
+
+  miri:
+    name: Miri (safety check)
+    runs-on: ubuntu-latest
+    if: contains(github.event.pull_request.labels.*.name, 'run-miri')
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      - uses: Swatinem/rust-cache@v2
+      - name: Run Miri on buffer lifecycle tests
+        run: cargo miri test --features vulkan buffer_lifecycle
+    runs-on: ubuntu-latest
+    if: contains(github.event.pull_request.labels.*.name, 'run-kani')
+    steps:
+      - uses: actions/checkout@v4
+      - uses: model-checking/kani-github-action@v31
+      - name: Run Kani harnesses
+        run: |
+          cargo kani --harness buffer_alignment_boundary
+          cargo kani --harness workgroup_divisibility
+          cargo kani --harness buffer_size_no_overflow
