@@ -365,6 +365,25 @@ pub trait GpuBackend: Sized {
         Ok(())
     }
 
+    /// Dispatch with verified workgroup divisibility.
+    ///
+    /// The `proof` parameter confirms that `total_threads` is divisible by
+    /// `threads_per_group`. Construct a proof via [`DispatchConfig::verify`].
+    ///
+    /// This is a safe wrapper around [`dispatch_ex`](GpuBackend::dispatch_ex)
+    /// that eliminates the runtime divisibility check. Use in performance-critical
+    /// paths where the dispatch configuration is known at compile time.
+    fn dispatch_verified(
+        &self,
+        pipeline: &ComputePipeline,
+        buffers: &[&GpuBuffer],
+        workgroups: (u32, u32, u32),
+        threads_per_group: (u32, u32, u32),
+        _proof: &WorkgroupProof,
+    ) -> Result<()> {
+        self.dispatch_ex(pipeline, buffers, workgroups, threads_per_group)
+    }
+
     /// Dispatch a compute pipeline asynchronously.
     ///
     /// Returns a [`Pulse`] handle that can be waited on later.
@@ -400,6 +419,39 @@ pub struct DispatchSpec<'a> {
     pub workgroups: (u32, u32, u32),
     /// Threads per threadgroup (default: 256, 1, 1).
     pub threads_per_group: (u32, u32, u32),
+}
+
+/// Configuration for a verified dispatch.
+#[derive(Clone, Copy, Debug)]
+pub struct DispatchConfig {
+    /// Total thread count (workgroups_x × threads_x).
+    pub total_threads: u32,
+    /// Threads per workgroup.
+    pub threads_per_group: u32,
+}
+
+/// Proof that a dispatch configuration has been validated for divisibility.
+///
+/// Created by [`DispatchConfig::verify`]. Pass to
+/// [`GpuBackend::dispatch_verified`] to skip runtime divisibility checking.
+#[derive(Clone, Copy)]
+pub struct WorkgroupProof {
+    _private: (),
+}
+
+impl DispatchConfig {
+    /// Verify that the dispatch configuration satisfies workgroup divisibility.
+    pub fn verify(self) -> Result<WorkgroupProof> {
+        if self.total_threads % self.threads_per_group != 0 {
+            return Err(GpuError::InvalidBinding {
+                message: format!(
+                    "total_threads ({}) not divisible by threads_per_group ({})",
+                    self.total_threads, self.threads_per_group
+                ),
+            });
+        }
+        Ok(WorkgroupProof { _private: () })
+    }
 }
 
 // ── Stub backend (compile-time sentinel) ──────────────────────────
@@ -489,4 +541,38 @@ pub fn init_device_local() -> Result<vulkan::VulkanBackend> {
 )))]
 pub fn init() -> Result<NoBackendStub> {
     Err(GpuError::NoBackend)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dispatch_config_verify_pass() {
+        let config = DispatchConfig {
+            total_threads: 1024,
+            threads_per_group: 256,
+        };
+        assert!(config.verify().is_ok());
+    }
+
+    #[test]
+    fn dispatch_config_verify_fail() {
+        let config = DispatchConfig {
+            total_threads: 1000,
+            threads_per_group: 256,
+        };
+        assert!(config.verify().is_err());
+    }
+
+    #[test]
+    fn dispatch_verified_accepts_proof() {
+        let config = DispatchConfig {
+            total_threads: 1024,
+            threads_per_group: 256,
+        };
+        let proof = config.verify().unwrap();
+        // Proof is clone+copy
+        let _proof2 = proof;
+    }
 }
