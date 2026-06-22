@@ -268,11 +268,7 @@ pub trait GpuBackend: Sized {
     ///
     /// The default implementation delegates to [`compile`](GpuBackend::compile)
     /// without caching. Backends may override.
-    fn compile_cached(
-        &self,
-        entry_point: &str,
-        wgsl_source: &str,
-    ) -> Result<ComputePipeline> {
+    fn compile_cached(&self, entry_point: &str, wgsl_source: &str) -> Result<ComputePipeline> {
         self.compile(entry_point, wgsl_source)
     }
 

@@ -596,11 +596,7 @@ impl GpuBackend for MetalBackend {
         Ok(std::time::UNIX_EPOCH.elapsed().unwrap().as_nanos() as u64)
     }
 
-    fn compile_cached(
-        &self,
-        entry_point: &str,
-        wgsl_source: &str,
-    ) -> Result<ComputePipeline> {
+    fn compile_cached(&self, entry_point: &str, wgsl_source: &str) -> Result<ComputePipeline> {
         let cache_dir = std::env::var("XDG_CACHE_HOME")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|_| {
@@ -631,11 +627,7 @@ impl GpuBackend for MetalBackend {
     }
 
     /// Compile pre-generated MSL directly (skips naga).
-    fn compile_msl(
-        &self,
-        entry_point: &str,
-        msl_source: &str,
-    ) -> Result<ComputePipeline> {
+    fn compile_msl(&self, entry_point: &str, msl_source: &str) -> Result<ComputePipeline> {
         let sels = selectors();
         let dev = self.device.ptr.as_ptr();
 
@@ -672,9 +664,7 @@ impl GpuBackend for MetalBackend {
                 let _: () = msg_send![library as *const Object, release];
                 return Err(GpuError::PipelineFailed {
                     entry: entry_point.into(),
-                    message: format!(
-                        "function '{entry_point}' not found in compiled library"
-                    ),
+                    message: format!("function '{entry_point}' not found in compiled library"),
                 });
             }
 

@@ -98,8 +98,7 @@ impl VulkanBackend {
         entry_point: &str,
         spv_words: &[u32],
     ) -> Result<ComputePipeline> {
-        let shader_info =
-            vk::ShaderModuleCreateInfo::default().code(spv_words);
+        let shader_info = vk::ShaderModuleCreateInfo::default().code(spv_words);
 
         let shader_module = unsafe {
             self.device
@@ -110,11 +109,10 @@ impl VulkanBackend {
                 })?
         };
 
-        let entry_name =
-            CString::new(entry_point).map_err(|_| GpuError::CompileFailed {
-                entry: entry_point.into(),
-                message: "entry point name contains null byte".into(),
-            })?;
+        let entry_name = CString::new(entry_point).map_err(|_| GpuError::CompileFailed {
+            entry: entry_point.into(),
+            message: "entry point name contains null byte".into(),
+        })?;
 
         let stage_info = vk::PipelineShaderStageCreateInfo::default()
             .module(shader_module)
@@ -874,17 +872,12 @@ impl GpuBackend for VulkanBackend {
         })
     }
 
-    fn compile_cached(
-        &self,
-        entry_point: &str,
-        wgsl_source: &str,
-    ) -> Result<ComputePipeline> {
+    fn compile_cached(&self, entry_point: &str, wgsl_source: &str) -> Result<ComputePipeline> {
         // Determine cache path
         let cache_dir = cache_dir().join("borsalino");
         let _ = std::fs::create_dir_all(&cache_dir);
         let cache_key = fnv1a(wgsl_source.as_bytes());
-        let cache_path =
-            cache_dir.join(format!("{entry_point}_{cache_key:016x}.spv"));
+        let cache_path = cache_dir.join(format!("{entry_point}_{cache_key:016x}.spv"));
 
         // Try loading from cache
         if let Ok(spv_bytes) = std::fs::read(&cache_path) {
@@ -900,36 +893,29 @@ impl GpuBackend for VulkanBackend {
         }
 
         // Cache miss: compile from source, then save SPIR-V
-        let module =
-            wgsl::parse_str(wgsl_source).map_err(|e| GpuError::CompileFailed {
-                entry: entry_point.into(),
-                message: e.emit_to_string(wgsl_source),
-            })?;
-
-        let mut validator =
-            Validator::new(ValidationFlags::all(), Capabilities::all());
-        let info =
-            validator.validate(&module).map_err(|e| GpuError::CompileFailed {
-                entry: entry_point.into(),
-                message: e.emit_to_string(wgsl_source),
-            })?;
-
-        let spv_words = spv::write_vec(
-            &module,
-            &info,
-            &spv::Options::default(),
-            None,
-        )
-        .map_err(|e| GpuError::CompileFailed {
+        let module = wgsl::parse_str(wgsl_source).map_err(|e| GpuError::CompileFailed {
             entry: entry_point.into(),
-            message: format!("SPIR-V emission failed: {e}"),
+            message: e.emit_to_string(wgsl_source),
         })?;
 
+        let mut validator = Validator::new(ValidationFlags::all(), Capabilities::all());
+        let info = validator
+            .validate(&module)
+            .map_err(|e| GpuError::CompileFailed {
+                entry: entry_point.into(),
+                message: e.emit_to_string(wgsl_source),
+            })?;
+
+        let spv_words =
+            spv::write_vec(&module, &info, &spv::Options::default(), None).map_err(|e| {
+                GpuError::CompileFailed {
+                    entry: entry_point.into(),
+                    message: format!("SPIR-V emission failed: {e}"),
+                }
+            })?;
+
         // Save to cache (best-effort)
-        let spv_bytes: Vec<u8> = spv_words
-            .iter()
-            .flat_map(|w| w.to_le_bytes())
-            .collect();
+        let spv_bytes: Vec<u8> = spv_words.iter().flat_map(|w| w.to_le_bytes()).collect();
         let _ = std::fs::write(&cache_path, &spv_bytes);
 
         self.create_pipeline_from_spv(entry_point, &spv_words)

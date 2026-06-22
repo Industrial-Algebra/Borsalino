@@ -161,17 +161,16 @@ fn main() -> Result<(), borsalino::GpuError> {
     println!("\n--- GPU Performance ---");
     let gpu_start = Instant::now();
     for _ in 0..batch_count {
-        gpu.dispatch(
-            &pipeline,
-            &[&buf_sign, &buf_a, &buf_b, &buf_out],
-            (1, 1, 1),
-        )?;
+        gpu.dispatch(&pipeline, &[&buf_sign, &buf_a, &buf_b, &buf_out], (1, 1, 1))?;
     }
     let gpu_time = gpu_start.elapsed();
 
     let result: Vec<f32> = gpu.read_buffer(&buf_out)?;
     let gpu_per = gpu_time.as_micros() as f64 / batch_count as f64;
-    println!("  total ({batch_count} dispatches): {:>8.1} ms", gpu_time.as_secs_f64() * 1e3);
+    println!(
+        "  total ({batch_count} dispatches): {:>8.1} ms",
+        gpu_time.as_secs_f64() * 1e3
+    );
     println!("  per-dispatch: {:>8.1} µs", gpu_per);
 
     // ── Verify ──────────────────────────────────────────────────
@@ -179,7 +178,9 @@ fn main() -> Result<(), borsalino::GpuError> {
     let mut max_err = 0.0f32;
     for i in 0..BLADES as usize {
         let err = (result[i] - expected[i]).abs();
-        if err > max_err { max_err = err; }
+        if err > max_err {
+            max_err = err;
+        }
     }
 
     print!("\n--- Verification ---\n  ");
@@ -203,7 +204,9 @@ fn main() -> Result<(), borsalino::GpuError> {
     let batch_size: u32 = 4096;
     let flat_size = (batch_size * BLADES) as usize;
     let a_batch: Vec<f32> = (0..flat_size).map(|i| (i % 32) as f32 * 0.1).collect();
-    let b_batch: Vec<f32> = (0..flat_size).map(|i| ((i * 3 + 7) % 32) as f32 * 0.1).collect();
+    let b_batch: Vec<f32> = (0..flat_size)
+        .map(|i| ((i * 3 + 7) % 32) as f32 * 0.1)
+        .collect();
 
     let pipeline_batched = gpu.compile("gp_batched", KERNEL_GEOMETRIC_PRODUCT_BATCHED)?;
     let buf_a_batch = gpu.create_buffer(&a_batch)?;
@@ -224,7 +227,11 @@ fn main() -> Result<(), borsalino::GpuError> {
     let cpu_batch_time = cpu_batch_start.elapsed();
 
     let gpu_batch_start = Instant::now();
-    gpu.dispatch(&pipeline_batched, &[&buf_sign, &buf_a_batch, &buf_b_batch, &buf_out_batch], (wgs, 1, 1))?;
+    gpu.dispatch(
+        &pipeline_batched,
+        &[&buf_sign, &buf_a_batch, &buf_b_batch, &buf_out_batch],
+        (wgs, 1, 1),
+    )?;
     let gpu_batch_time = gpu_batch_start.elapsed();
 
     let result_batch: Vec<f32> = gpu.read_buffer(&buf_out_batch)?;
@@ -241,7 +248,9 @@ fn main() -> Result<(), borsalino::GpuError> {
                 batch_ok = false;
             }
         }
-        if !batch_ok { break; }
+        if !batch_ok {
+            break;
+        }
     }
 
     println!(
@@ -255,9 +264,17 @@ fn main() -> Result<(), borsalino::GpuError> {
         gpu_batch_time.as_micros() as f64 / batch_size as f64
     );
     let batch_speedup = cpu_batch_time.as_secs_f64() / gpu_batch_time.as_secs_f64();
-    let batch_gflops = (batch_size as f64 * (32.0 * 32.0 * 32.0) * 2.0) / gpu_batch_time.as_secs_f64() / 1e9;
+    let batch_gflops =
+        (batch_size as f64 * (32.0 * 32.0 * 32.0) * 2.0) / gpu_batch_time.as_secs_f64() / 1e9;
     println!("  speedup: {batch_speedup:.1}×  ({batch_gflops:.1} GFLOPS)");
-    println!("  verification: {}", if batch_ok { "✅ all correct" } else { "❌ errors" });
+    println!(
+        "  verification: {}",
+        if batch_ok {
+            "✅ all correct"
+        } else {
+            "❌ errors"
+        }
+    );
 
     Ok(())
 }
