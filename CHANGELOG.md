@@ -20,7 +20,24 @@ All notable changes to Borsalino are documented in this file.
 ### Removed
 - HANDOFF.md and docs/metal-debug-handoff.md (internal agent scaffolding).
 
-## [0.1.0] — 2026-06-03
+## [0.3.0] — 2026-06-12
+
+### Added
+- **Shader caching** — `compile_cached()` skips naga translation on repeat calls. SPIR-V/MSL cached to `~/.cache/borsalino/`.
+- **IA kernel benchmark** — geometric product of 32-blade multivectors (5D GA). Batched 4096× dispatch: 23× speedup over CPU.
+- **`dispatch_verified()`** — `DispatchConfig` + `WorkgroupProof` safety gate for workgroup divisibility.
+- **Miri + Kani verification** — buffer lifecycle safety under Miri; alignment, divisibility, and overflow proofs under Kani. CI label-gated.
+
+### Changed
+- ROADMAP.md: v0.3.0 items marked complete, future items reorganised.
+- README: shader caching, verified dispatch, Miri/Kani sections added.
+
+## [0.2.1] — 2026-06-11
+
+### Removed
+- `candle_tropical_mask` example (pending pre-print publication).
+
+## [0.2.0] — 2026-06-11
 
 ### Added
 - **Vulkan backend** — full `GpuBackend` trait implementation via `ash` raw FFI. WGSL→SPIR-V translation via `naga`, synchronous dispatch, pre-allocated descriptor sets and command pool. Tested on AMD Radeon, NVIDIA RTX 5080, and NVIDIA GB10.

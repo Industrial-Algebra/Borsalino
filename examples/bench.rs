@@ -431,7 +431,15 @@ fn matmul(
         let buf_b = gpu.create_buffer(&b)?;
         let buf_c = gpu.create_buffer_uninit::<f32>(total)?;
         let wgs = n / 16;
-        let iters = if n <= 512 { 10 } else if n <= 1024 { 5 } else if n <= 4096 { 3 } else { 1 };
+        let iters = if n <= 512 {
+            10
+        } else if n <= 1024 {
+            5
+        } else if n <= 4096 {
+            3
+        } else {
+            1
+        };
 
         let bench = run_bench(
             &format!("matmul {n}×{n} ({wgs}×{wgs} wgs)"),
