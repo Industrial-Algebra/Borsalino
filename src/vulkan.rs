@@ -2120,4 +2120,45 @@ mod tests {
             );
         }
     }
+
+    /// Miri-compatible: exercises buffer create → read → drop lifecycle.
+    /// Run: `cargo +nightly miri test --features vulkan buffer_lifecycle`
+    #[test]
+    fn buffer_lifecycle_safety() {
+        let backend = match VulkanBackend::init() {
+            Ok(b) => b,
+            Err(_) => return,
+        };
+
+        let buf = backend.create_buffer(&[1.0f32, 2.0, 3.0]).unwrap();
+        let _ = backend.read_buffer::<f32>(&buf).unwrap();
+        drop(buf);
+
+        let wgsl = r#"
+            @group(0) @binding(0) var<storage, read_write> out: array<f32>;
+            @compute @workgroup_size(4)
+            fn fill(@builtin(global_invocation_id) gid: vec3<u32>) {
+                out[gid.x] = f32(gid.x);
+            }
+        "#;
+        let p = backend.compile("fill", wgsl).unwrap();
+        let buf2 = backend.create_buffer_uninit::<f32>(4).unwrap();
+        backend.dispatch(&p, &[&buf2], (1, 1, 1)).unwrap();
+        let result = backend.read_buffer::<f32>(&buf2).unwrap();
+        assert_eq!(result.len(), 4);
+        drop(buf2);
+        drop(p);
+
+        let dev_buf = backend.create_device_buffer(&[4.0f32, 5.0, 6.0]).unwrap();
+        let _ = backend.read_buffer::<f32>(&dev_buf).unwrap();
+        drop(dev_buf);
+
+        let noop_wgsl = r#"
+            @group(0) @binding(0) var<storage, read_write> out: array<f32>;
+            @compute @workgroup_size(1)
+            fn noop(@builtin(global_invocation_id) gid: vec3<u32>) {}
+        "#;
+        let p2 = backend.compile("noop", noop_wgsl).unwrap();
+        drop(p2);
+    }
 }
