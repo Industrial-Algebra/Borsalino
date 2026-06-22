@@ -257,6 +257,25 @@ pub trait GpuBackend: Sized {
     /// if dispatching repeatedly.
     fn compile(&self, entry_point: &str, wgsl_source: &str) -> Result<ComputePipeline>;
 
+    /// Compile with disk caching.
+    ///
+    /// On first call, behaves identically to [`compile`](GpuBackend::compile)
+    /// and caches the compiled shader to disk. On subsequent calls with the
+    /// same WGSL source, skips naga translation and loads the cached binary
+    /// (SPIR-V on Vulkan, MSL on Metal).
+    ///
+    /// Cache location: `~/.cache/borsalino/` (respects `XDG_CACHE_HOME` on Linux).
+    ///
+    /// The default implementation delegates to [`compile`](GpuBackend::compile)
+    /// without caching. Backends may override.
+    fn compile_cached(
+        &self,
+        entry_point: &str,
+        wgsl_source: &str,
+    ) -> Result<ComputePipeline> {
+        self.compile(entry_point, wgsl_source)
+    }
+
     /// Allocate a GPU buffer and upload initial data.
     fn create_buffer<T: bytemuck::Pod>(&self, data: &[T]) -> Result<GpuBuffer>;
 

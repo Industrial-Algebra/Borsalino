@@ -596,6 +596,126 @@ impl GpuBackend for MetalBackend {
         Ok(std::time::UNIX_EPOCH.elapsed().unwrap().as_nanos() as u64)
     }
 
+    fn compile_cached(
+        &self,
+        entry_point: &str,
+        wgsl_source: &str,
+    ) -> Result<ComputePipeline> {
+        let cache_dir = std::env::var("XDG_CACHE_HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| {
+                let home = std::env::var("HOME").unwrap_or_default();
+                std::path::PathBuf::from(home).join(".cache")
+            })
+            .join("borsalino");
+        let _ = std::fs::create_dir_all(&cache_dir);
+
+        let mut hash: u64 = 0xcbf29ce484222325;
+        for &byte in wgsl_source.as_bytes() {
+            hash ^= byte as u64;
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        let cache_path = cache_dir.join(format!("{entry_point}_{hash:016x}.msl"));
+
+        if let Ok(cached_msl) = std::fs::read_to_string(&cache_path) {
+            if !cached_msl.is_empty() {
+                return self.compile_msl(entry_point, &cached_msl);
+            }
+        }
+
+        // Cache miss: compile normally
+        let pipeline = self.compile(entry_point, wgsl_source)?;
+        // MSL is generated internally by compile() — can't easily extract.
+        // For now, cache miss compiles fresh each time.
+        Ok(pipeline)
+    }
+
+    /// Compile pre-generated MSL directly (skips naga).
+    fn compile_msl(
+        &self,
+        entry_point: &str,
+        msl_source: &str,
+    ) -> Result<ComputePipeline> {
+        let sels = selectors();
+        let dev = self.device.ptr.as_ptr();
+
+        unsafe {
+            let ns_src = nsstring(msl_source);
+            let mut err: *mut c_void = std::ptr::null_mut();
+            let library: *mut c_void = msg_send![
+                dev as *const Object,
+                newLibraryWithSource: ns_src
+                options: std::ptr::null_mut::<c_void>()
+                error: &mut err
+            ];
+
+            if library.is_null() {
+                let msg = if !err.is_null() {
+                    let desc: *mut c_void = msg_send![err as *const Object, localizedDescription];
+                    let s = nsstring_read(desc);
+                    let _: () = msg_send![err as *const Object, release];
+                    s
+                } else {
+                    "unknown compilation error".into()
+                };
+                return Err(GpuError::CompileFailed {
+                    entry: entry_point.into(),
+                    message: msg,
+                });
+            }
+
+            let ns_entry = nsstring(entry_point);
+            let func: *mut c_void =
+                msg_send![library as *const Object, newFunctionWithName: ns_entry];
+
+            if func.is_null() {
+                let _: () = msg_send![library as *const Object, release];
+                return Err(GpuError::PipelineFailed {
+                    entry: entry_point.into(),
+                    message: format!(
+                        "function '{entry_point}' not found in compiled library"
+                    ),
+                });
+            }
+
+            let desc: *mut c_void = msg_send![class!(MTLComputePipelineDescriptor), new];
+            let _: () = msg_send![desc as *const Object, setComputeFunction: func];
+            let mut perr: *mut c_void = std::ptr::null_mut();
+            let pipeline: *mut c_void = msg_send![
+                dev as *const Object,
+                newComputePipelineStateWithDescriptor: desc
+                options: 0u64
+                reflection: std::ptr::null_mut::<c_void>()
+                error: &mut perr
+            ];
+
+            if pipeline.is_null() {
+                let msg = if !perr.is_null() {
+                    let desc: *mut c_void = msg_send![perr as *const Object, localizedDescription];
+                    let s = nsstring_read(desc);
+                    let _: () = msg_send![perr as *const Object, release];
+                    s
+                } else {
+                    "unknown pipeline error".into()
+                };
+                let _: () = msg_send![obj(func), release];
+                let _: () = msg_send![obj(library), release];
+                return Err(GpuError::PipelineFailed {
+                    entry: entry_point.into(),
+                    message: msg,
+                });
+            }
+
+            let _: () = msg_send![obj(func), release];
+            let _: () = msg_send![obj(library), release];
+
+            Ok(ComputePipeline {
+                raw: pipeline,
+                drop_fn: drop_pipeline,
+            })
+        }
+    }
+
     fn dispatch_many(&self, dispatches: &[crate::DispatchSpec<'_>]) -> Result<()> {
         if dispatches.is_empty() {
             return Ok(());

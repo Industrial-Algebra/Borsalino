@@ -91,6 +91,67 @@ pub struct VulkanBackend {
 impl VulkanBackend {
     /// Maximum number of storage buffer bindings per pipeline layout.
     const MAX_BUFFER_BINDINGS: u32 = 8;
+
+    /// Create a compute pipeline from pre-compiled SPIR-V.
+    fn create_pipeline_from_spv(
+        &self,
+        entry_point: &str,
+        spv_words: &[u32],
+    ) -> Result<ComputePipeline> {
+        let shader_info =
+            vk::ShaderModuleCreateInfo::default().code(spv_words);
+
+        let shader_module = unsafe {
+            self.device
+                .create_shader_module(&shader_info, None)
+                .map_err(|e| GpuError::CompileFailed {
+                    entry: entry_point.into(),
+                    message: format!("vkCreateShaderModule: {e}"),
+                })?
+        };
+
+        let entry_name =
+            CString::new(entry_point).map_err(|_| GpuError::CompileFailed {
+                entry: entry_point.into(),
+                message: "entry point name contains null byte".into(),
+            })?;
+
+        let stage_info = vk::PipelineShaderStageCreateInfo::default()
+            .module(shader_module)
+            .name(&entry_name)
+            .stage(vk::ShaderStageFlags::COMPUTE);
+
+        let pipeline_info = vk::ComputePipelineCreateInfo::default()
+            .stage(stage_info)
+            .layout(self.pipeline_layout);
+
+        let pipelines = unsafe {
+            self.device
+                .create_compute_pipelines(
+                    vk::PipelineCache::null(),
+                    std::slice::from_ref(&pipeline_info),
+                    None,
+                )
+                .map_err(|(_pipelines, err)| GpuError::PipelineFailed {
+                    entry: entry_point.into(),
+                    message: format!("vkCreateComputePipelines: {err}"),
+                })?
+        };
+
+        unsafe {
+            self.device.destroy_shader_module(shader_module, None);
+        }
+
+        let inner = Box::new(VulkanPipelineInner {
+            pipeline: pipelines[0],
+            device: self.device.clone(),
+        });
+
+        Ok(ComputePipeline {
+            raw: Box::into_raw(inner) as *mut std::ffi::c_void,
+            drop_fn: drop_vulkan_pipeline,
+        })
+    }
 }
 
 impl Drop for VulkanBackend {
@@ -307,6 +368,31 @@ unsafe fn create_device(
     let queue = unsafe { device.get_device_queue(queue_family_index, 0) };
 
     Ok((device, queue))
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Utility helpers
+// ═══════════════════════════════════════════════════════════════════
+
+/// FNV-1a hash (deterministic across runs, used for cache keys).
+fn fnv1a(data: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for &byte in data {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+/// Get the cache directory (respects XDG).
+fn cache_dir() -> std::path::PathBuf {
+    if let Ok(dir) = std::env::var("XDG_CACHE_HOME") {
+        std::path::PathBuf::from(dir)
+    } else if let Ok(home) = std::env::var("HOME") {
+        std::path::PathBuf::from(home).join(".cache")
+    } else {
+        std::path::PathBuf::from(".cache")
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -786,6 +872,67 @@ impl GpuBackend for VulkanBackend {
             raw: Box::into_raw(inner) as *mut std::ffi::c_void,
             drop_fn: drop_vulkan_pipeline,
         })
+    }
+
+    fn compile_cached(
+        &self,
+        entry_point: &str,
+        wgsl_source: &str,
+    ) -> Result<ComputePipeline> {
+        // Determine cache path
+        let cache_dir = cache_dir().join("borsalino");
+        let _ = std::fs::create_dir_all(&cache_dir);
+        let cache_key = fnv1a(wgsl_source.as_bytes());
+        let cache_path =
+            cache_dir.join(format!("{entry_point}_{cache_key:016x}.spv"));
+
+        // Try loading from cache
+        if let Ok(spv_bytes) = std::fs::read(&cache_path) {
+            if !spv_bytes.is_empty() && spv_bytes.len() % 4 == 0 {
+                let spv_words: Vec<u32> = spv_bytes
+                    .chunks_exact(4)
+                    .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect();
+                if let Ok(pipeline) = self.create_pipeline_from_spv(entry_point, &spv_words) {
+                    return Ok(pipeline);
+                }
+            }
+        }
+
+        // Cache miss: compile from source, then save SPIR-V
+        let module =
+            wgsl::parse_str(wgsl_source).map_err(|e| GpuError::CompileFailed {
+                entry: entry_point.into(),
+                message: e.emit_to_string(wgsl_source),
+            })?;
+
+        let mut validator =
+            Validator::new(ValidationFlags::all(), Capabilities::all());
+        let info =
+            validator.validate(&module).map_err(|e| GpuError::CompileFailed {
+                entry: entry_point.into(),
+                message: e.emit_to_string(wgsl_source),
+            })?;
+
+        let spv_words = spv::write_vec(
+            &module,
+            &info,
+            &spv::Options::default(),
+            None,
+        )
+        .map_err(|e| GpuError::CompileFailed {
+            entry: entry_point.into(),
+            message: format!("SPIR-V emission failed: {e}"),
+        })?;
+
+        // Save to cache (best-effort)
+        let spv_bytes: Vec<u8> = spv_words
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect();
+        let _ = std::fs::write(&cache_path, &spv_bytes);
+
+        self.create_pipeline_from_spv(entry_point, &spv_words)
     }
 
     fn create_buffer<T: bytemuck::Pod>(&self, data: &[T]) -> Result<GpuBuffer> {
@@ -1877,6 +2024,41 @@ mod tests {
         let t1 = backend.timestamp().unwrap();
         assert!(t1 >= t0, "timestamps should be monotonic");
         assert!(t1 > 0, "timestamp should be non-zero");
+    }
+
+    #[test]
+    fn shader_caching() {
+        let backend = match VulkanBackend::init() {
+            Ok(b) => b,
+            Err(_) => {
+                eprintln!("skipping: no Vulkan device");
+                return;
+            }
+        };
+
+        let wgsl = r#"
+            @group(0) @binding(0) var<storage, read_write> out: array<f32>;
+            @compute @workgroup_size(1)
+            fn cache_test(@builtin(global_invocation_id) gid: vec3<u32>) {
+                out[gid.x] = 42.0;
+            }
+        "#;
+
+        // First call: compile from source
+        let p1 = backend.compile_cached("cache_test", wgsl).unwrap();
+
+        // Second call: should load from cache
+        let p2 = backend.compile_cached("cache_test", wgsl).unwrap();
+
+        // Both pipelines should work
+        let out = backend.create_buffer_uninit::<f32>(1).unwrap();
+        backend.dispatch(&p1, &[&out], (1, 1, 1)).unwrap();
+        let result: Vec<f32> = backend.read_buffer(&out).unwrap();
+        assert!((result[0] - 42.0).abs() < 0.001);
+
+        backend.dispatch(&p2, &[&out], (1, 1, 1)).unwrap();
+        let result2: Vec<f32> = backend.read_buffer(&out).unwrap();
+        assert!((result2[0] - 42.0).abs() < 0.001);
     }
 
     #[test]
