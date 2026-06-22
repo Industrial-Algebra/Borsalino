@@ -181,6 +181,42 @@ Bundles export to SMT-LIB2, Lean 4, and Kani verification backends.
 | `bench` | Cross-platform GPU benchmarks | `cargo run --example bench --features vulkan --release` |
 | `dispatch_profile` | Per-component dispatch cost profiling | `cargo run --example dispatch_profile --features vulkan --release` |
 | `tiled_matmul` | 2D tiled matrix multiply with shared memory | `cargo run --example tiled_matmul --features vulkan --release` |
+| `ia_geometric_product` | IA kernel: 32-blade geometric product (5D GA) | `cargo run --example ia_geometric_product --features vulkan --release` |
+
+## Shader Caching
+
+[`compile_cached`](GpuBackend::compile_cached) skips naga translation on repeat
+calls by caching compiled SPIR-V (Vulkan) or MSL (Metal) to disk
+(`~/.cache/borsalino/`):
+
+```rust
+let pipeline = gpu.compile_cached("add_one", wgsl)?;
+// Second call loads from disk — zero naga overhead
+let pipeline2 = gpu.compile_cached("add_one", wgsl)?;
+```
+
+## Verified Dispatch
+
+[`dispatch_verified`](GpuBackend::dispatch_verified) gates dispatches behind a
+runtime workgroup divisibility proof:
+
+```rust
+let config = DispatchConfig { total_threads: 1024, threads_per_group: 256 };
+let proof = config.verify()?;
+gpu.dispatch_verified(&pipeline, &buffers, (4, 1, 1), (256, 1, 1), &proof)?;
+```
+
+## Verification (Miri + Kani)
+
+Buffer lifecycle safety is verified under Miri (undefined behaviour detection)
+and Kani (bounded model checking):
+
+```sh
+cargo +nightly miri test --features vulkan buffer_lifecycle
+cargo kani --harness buffer_alignment_boundary
+```
+
+CI runs both on label-gated PRs (`run-miri`, `run-kani`).
 
 ## Async Dispatch
 

@@ -12,24 +12,20 @@
 - [x] CI: format, clippy, test matrix, docs, crates.io publish
 - [x] Cross-platform benchmarks (AMD, GB10, RTX 5080, M3 Pro)
 
-## v0.2.0 (In Progress)
+## v0.2.0 (Released 2026-06-11)
 
-- [x] Persisted GPU buffer retention (`create_device_buffer`)
-- [x] 2D/3D dispatch patterns with shared memory (tiled matmul: 278 GFLOPS)
-- [x] Async dispatch (`dispatch_async` → `Pulse`)
-- [x] Candle integration benchmark (tropical masking)
-- [ ] Real IA kernel test (geometric product of 32-element multivectors)
-- [ ] Miri integration for buffer lifecycle safety
-- [ ] Kani harnesses for buffer roundtrip and alignment
-
+- [x] Async dispatch (`dispatch_async` -> `Pulse`)
+- [x] Persistent GPU buffer retention (`create_device_buffer`)
+- [x] GPU timestamps (`gpu.timestamp()`)
+- [x] 2D/3D dispatch patterns with shared memory (tiled matmul: 1.4 TFLOPS)
 - [x] Candle integration pattern (custom element-wise WGSL kernels)
 
-## v0.3.0 (Planned)
+## v0.3.0 (Released 2026-06-12)
 
-- [ ] SPIR-V shader caching (`compile_cached`)
-- [ ] Real IA kernel benchmark (geometric product of 32-element multivectors)
-- [ ] `dispatch_verified()` with `Proven<>` gates (Karpal Phase 3)
-- [ ] Miri + Kani verification harnesses for buffer lifecycle
+- [x] SPIR-V shader caching (`compile_cached`)
+- [x] Real IA kernel benchmark (geometric product of 32-element multivectors)
+- [x] `dispatch_verified()` with WorkgroupProof safety gate
+- [x] Miri + Kani verification harnesses for buffer lifecycle
 
 ## Future (Speculative)
 
@@ -38,3 +34,4 @@
 - [ ] amari-flynn statistical verification (kernel determinism)
 - [ ] Metal performance counters (occupancy, bandwidth metrics)
 - [ ] WASM target (WebGPU compute)
+- [ ] Tropical masking example (re-integration after pre-print)
