@@ -1,5 +1,5 @@
 // Copyright (C) 2026 Industrial Algebra
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 
 //! Borsalino Industrial Algebra benchmark — geometric product of 32-element
 //! multivectors (5D GA, 32 basis blades).

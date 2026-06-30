@@ -3,12 +3,12 @@
 > **v0.2.0 update (2026-06-03):** Since this critique was written (v0.1.0 pre-release),
 > benchmarks have been published (4 platforms), documentation has been
 > expanded (README, BENCHMARKS, CHANGELOG, ROADMAP), a dual commercial license
-> model is in place, and CI covers format/clippy/test/docs/publish. The AGPL
+> model is in place, and CI covers format/clippy/test/docs/publish. 
 > license is intentional by design, not a gap. See CHANGELOG.md for full history.
 
 ## TL;DR — Quick takeaways
 - **Purpose** - A minimal, synchronous GPU compute abstraction that lets you write WGSL kernels and run them on either Metal (macOS) or Vulkan (Linux/Windows).  It aims for *zero-ceremony* - just a few function calls.
-- **License** - **AGPL-3.0-only** (no commercial-license exception).  Shipping a binary that includes Borsalino forces the whole product to be AGPL-licensed.
+- **License** - **Apache-2.0 (was AGPL-3.0-only, relicensed v0.4.0)** (no commercial-license exception).  Shipping a binary that includes Borsalino forces the whole product to be AGPL-licensed.
 - **Maturity** - 0.1.0, very early.  The crate compiles, has a modest API surface, and includes a `verify` feature that pulls in `karpal-verify`/`karpal-proof` for GPU-safety checks, but many parts are still experimental.
 - **Target audience** - Researchers or hobbyists needing a *thin* cross-platform GPU compute layer and who are comfortable with the AGPL copyleft.
 
@@ -30,7 +30,7 @@
 ## Weaknesses / Red Flags (What limits its adoption)
 | Issue | Impact |
 |-------|--------|
-| **AGPL-3.0-only license** | The copyleft nature blocks commercial use unless you release your entire product under the same license.  Most companies prefer permissive licenses (MIT/Apache). |
+| **Apache-2.0 (was AGPL-3.0-only, relicensed v0.4.0) license** | Resolved in v0.4.0: relicensed to Apache-2.0. |
 | **Very early stage (0.1.0)** | API is still stabilising; breaking changes are likely.  The crate has limited documentation and few examples. |
 | **Synchronous-only** | No async or non-blocking dispatch.  For high-throughput workloads this can become a bottleneck. |
 | **Thin feature set** | Only compute pipelines; no support for graphics, ray-tracing, or compute-shader pipelines with multiple dispatches. |
