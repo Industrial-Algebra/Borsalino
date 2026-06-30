@@ -1,5 +1,5 @@
 // Copyright (C) 2026 Industrial Algebra
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 
 //! Borsalino Industrial Algebra benchmark — geometric product of 32-element
 //! multivectors (5D GA, 32 basis blades).
@@ -19,55 +19,9 @@
 use std::time::Instant;
 
 use borsalino::GpuBackend;
+use borsalino::kernels::{GEOMETRIC_PRODUCT, GEOMETRIC_PRODUCT_BATCHED};
 
 const BLADES: u32 = 32;
-
-/// Geometric product kernel for 32-blade multivectors.
-/// Each thread computes one output blade as: out[k] = Σ sign(i,j,k) · a[i] · b[j]
-const KERNEL_GEOMETRIC_PRODUCT: &str = r#"
-@group(0) @binding(0) var<storage, read> sign_table: array<f32>;
-@group(0) @binding(1) var<storage, read> a: array<f32>;
-@group(0) @binding(2) var<storage, read> b: array<f32>;
-@group(0) @binding(3) var<storage, read_write> out: array<f32>;
-
-@compute @workgroup_size(32)
-fn gp(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let k = gid.x;
-    var sum = 0.0;
-    for (var i = 0u; i < 32u; i++) {
-        for (var j = 0u; j < 32u; j++) {
-            let sign = sign_table[i * 32u * 32u + j * 32u + k];
-            sum += sign * a[i] * b[j];
-        }
-    }
-    out[k] = sum;
-}
-"#;
-
-/// Kernel for batched geometric products: N multivectors in one dispatch.
-const KERNEL_GEOMETRIC_PRODUCT_BATCHED: &str = r#"
-@group(0) @binding(0) var<storage, read> sign_table: array<f32>;
-@group(0) @binding(1) var<storage, read> a_batch: array<f32>;
-@group(0) @binding(2) var<storage, read> b_batch: array<f32>;
-@group(0) @binding(3) var<storage, read_write> out_batch: array<f32>;
-
-@compute @workgroup_size(256)
-fn gp_batched(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let idx = gid.x;
-    let mv = idx / 32u;      // which multivector in the batch
-    let blade = idx % 32u;   // which output blade
-    let base = mv * 32u;
-
-    var sum = 0.0;
-    for (var i = 0u; i < 32u; i++) {
-        for (var j = 0u; j < 32u; j++) {
-            let sign = sign_table[i * 32u * 32u + j * 32u + blade];
-            sum += sign * a_batch[base + i] * b_batch[base + j];
-        }
-    }
-    out_batch[base + blade] = sum;
-}
-"#;
 
 /// Generate the 5D GA multiplication table: sign_table[i][j][k] = { -1, 0, +1 }
 /// indicating the contribution of a[i]*b[j] to output blade k.
@@ -144,7 +98,7 @@ fn main() -> Result<(), borsalino::GpuError> {
     // ── GPU compile + upload ────────────────────────────────────
 
     let compile_start = Instant::now();
-    let pipeline = gpu.compile("gp", KERNEL_GEOMETRIC_PRODUCT)?;
+    let pipeline = gpu.compile("gp", GEOMETRIC_PRODUCT)?;
     println!("\n--- GPU Setup ---");
     println!(
         "  compile: {:>8.1} ms",
@@ -208,7 +162,7 @@ fn main() -> Result<(), borsalino::GpuError> {
         .map(|i| ((i * 3 + 7) % 32) as f32 * 0.1)
         .collect();
 
-    let pipeline_batched = gpu.compile("gp_batched", KERNEL_GEOMETRIC_PRODUCT_BATCHED)?;
+    let pipeline_batched = gpu.compile("gp_batched", GEOMETRIC_PRODUCT_BATCHED)?;
     let buf_a_batch = gpu.create_buffer(&a_batch)?;
     let buf_b_batch = gpu.create_buffer(&b_batch)?;
     let buf_out_batch = gpu.create_buffer_uninit::<f32>(flat_size)?;

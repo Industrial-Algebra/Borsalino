@@ -27,6 +27,11 @@
 - [x] `dispatch_verified()` with WorkgroupProof safety gate
 - [x] Miri + Kani verification harnesses for buffer lifecycle
 
+## v0.4.0 (2026-06-29)
+
+- [x] Relicense from AGPL-3.0 to Apache-2.0
+- [x] CONTRIBUTING.md with CLA reference
+
 ## Future (Speculative)
 
 - [ ] Multi-GPU dispatch

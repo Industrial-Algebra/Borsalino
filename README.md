@@ -3,7 +3,7 @@
 [![crates.io](https://img.shields.io/crates/v/borsalino)](https://crates.io/crates/borsalino)
 [![docs.rs](https://img.shields.io/docsrs/borsalino)](https://docs.rs/borsalino)
 [![CI](https://github.com/Industrial-Algebra/Borsalino/actions/workflows/ci.yml/badge.svg)](https://github.com/Industrial-Algebra/Borsalino/actions/workflows/ci.yml)
-[![License](https://img.shields.io/badge/license-AGPL--3.0--or--Commercial-blue)](./LICENSE)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue)](./LICENSE)
 
 Thin GPU compute abstraction for the Industrial Algebra ecosystem.
 
@@ -283,8 +283,6 @@ cargo test --features metal
 
 ## License
 
-AGPL-3.0-only OR Commercial. Copyright (C) 2026 Industrial Algebra.
+Apache-2.0. Copyright (C) 2026 Industrial Algebra.
 
-Dual-licensed: use under AGPL v3 for open-source projects, or obtain a
-commercial license for proprietary use. See [LICENSE](./LICENSE) and
-[LICENSE-COMMERCIAL](./LICENSE-COMMERCIAL).
+Contributors must sign the [CLA](https://github.com/Industrial-Algebra/.github/blob/main/CLA.md).

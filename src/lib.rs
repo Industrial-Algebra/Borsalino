@@ -1,5 +1,5 @@
 // Copyright (C) 2026 Industrial Algebra
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 
 //! # Borsalino — Thin GPU Compute Abstraction
 //!
@@ -75,6 +75,70 @@ mod error;
 mod metal;
 #[cfg(feature = "verify")]
 pub mod verify;
+
+/// Reusable WGSL kernels for the Industrial Algebra ecosystem.
+///
+/// These constants provide ready-to-compile WGSL source for common
+/// IA operations. Use with [`GpuBackend::compile`]:
+///
+/// ```ignore
+/// let pipeline = gpu.compile("gp", borsalino::kernels::GEOMETRIC_PRODUCT)?;
+/// ```
+pub mod kernels {
+    /// Geometric product of 32-blade multivectors (5D Geometric Algebra).
+    ///
+    /// Requires a 32×32×32 sign table at binding 0, input multivectors
+    /// at bindings 1 and 2, output at binding 3.
+    /// Workgroup size: 32 (one thread per output blade).
+    pub const GEOMETRIC_PRODUCT: &str = r#"
+@group(0) @binding(0) var<storage, read> sign_table: array<f32>;
+@group(0) @binding(1) var<storage, read> a: array<f32>;
+@group(0) @binding(2) var<storage, read> b: array<f32>;
+@group(0) @binding(3) var<storage, read_write> out: array<f32>;
+
+@compute @workgroup_size(32)
+fn gp(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let k = gid.x;
+    var sum = 0.0;
+    for (var i = 0u; i < 32u; i++) {
+        for (var j = 0u; j < 32u; j++) {
+            let sign = sign_table[i * 32u * 32u + j * 32u + k];
+            sum += sign * a[i] * b[j];
+        }
+    }
+    out[k] = sum;
+}
+"#;
+
+    /// Batched geometric product: N multivectors in one dispatch.
+    ///
+    /// Requires a 32×32×32 sign table at binding 0, flat input arrays
+    /// at bindings 1 and 2 (N×32 floats each), output at binding 3.
+    /// Workgroup size: 256.
+    pub const GEOMETRIC_PRODUCT_BATCHED: &str = r#"
+@group(0) @binding(0) var<storage, read> sign_table: array<f32>;
+@group(0) @binding(1) var<storage, read> a_batch: array<f32>;
+@group(0) @binding(2) var<storage, read> b_batch: array<f32>;
+@group(0) @binding(3) var<storage, read_write> out_batch: array<f32>;
+
+@compute @workgroup_size(256)
+fn gp_batched(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    let mv = idx / 32u;
+    let blade = idx % 32u;
+    let base = mv * 32u;
+
+    var sum = 0.0;
+    for (var i = 0u; i < 32u; i++) {
+        for (var j = 0u; j < 32u; j++) {
+            let sign = sign_table[i * 32u * 32u + j * 32u + blade];
+            sum += sign * a_batch[base + i] * b_batch[base + j];
+        }
+    }
+    out_batch[base + blade] = sum;
+}
+"#;
+}
 #[cfg(all(feature = "vulkan", not(target_os = "macos")))]
 mod vulkan;
 
