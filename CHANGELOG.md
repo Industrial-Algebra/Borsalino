@@ -20,6 +20,18 @@ All notable changes to Borsalino are documented in this file.
 ### Removed
 - HANDOFF.md and docs/metal-debug-handoff.md (internal agent scaffolding).
 
+## [0.4.0] — 2026-06-29
+
+### Changed
+- **Relicensed from AGPL-3.0 to Apache-2.0** — removes network-use clause
+  adoption barrier. All source headers, Cargo.toml, README, and CI updated.
+- LICENSE-COMMERCIAL deleted (Apache-2.0 permits commercial use directly).
+- Added CONTRIBUTING.md with CLA reference.
+
+### Migration
+Published versions 0.1.0–0.3.0 remain AGPL-3.0 on crates.io (immutable).
+Version 0.4.0+ carries Apache-2.0.
+
 ## [0.3.0] — 2026-06-12
 
 ### Added
