@@ -22,8 +22,8 @@ naga = { version = "27", features = ["wgsl-in", "spv-out", "msl-out"] }
 
 # Verification (GPU safety properties, obligation bundles)
 # For local development, add: path = "../karpal/karpal-verify"
-karpal-verify = { version = "0.6", optional = true }
-karpal-proof = { version = "0.6", optional = true }
+karpal-verify = { version = "0.6.1", optional = true }
+karpal-proof = { version = "0.6.1", optional = true }
 rand = { version = "0.8", optional = true }
 
 # Metal backend (macOS) — objc crate for safe ARM64 msg_send dispatch
