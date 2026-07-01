@@ -1,0 +1,568 @@
+// Copyright (C) 2026 Industrial Algebra
+// SPDX-License-Identifier: Apache-2.0
+
+//! DeepReinforce exact-match numerical correctness protocol for linear GPU kernels.
+//!
+//! This module implements the protocol described in
+//! [Towards a Reliable Kernel Correctness Check in Matrix
+//! Multiplication](https://deep-reinforce.com/correctness_check.html).
+//!
+//! # How It Works
+//!
+//! Standard tolerance-based checks (`torch.allclose` with `atol`/`rtol`) are
+//! unreliable for GPU kernels because floating-point associativity does not
+//! hold: `(a+b)+c ≠ a+(b+c)` in FP16/BF16. Different GPU thread orderings
+//! produce different accumulation sequences, so two correct kernels can produce
+//! different outputs. No universal tolerance works across matrix sizes or
+//! precision formats.
+//!
+//! The exact-match protocol sidesteps this by restricting kernel inputs to
+//! **binary `{0, 1}`** values with a zero-biased distribution. This guarantees:
+//!
+//! 1. All partial sums are non-negative and monotonically non-decreasing
+//! 2. Within the FP16 exact-integer range `[0, 2048]`, floating-point
+//!    associativity holds exactly
+//!
+//! The kernel output is then compared against an FP32 CPU reference with
+//! **bit-exact equality** at every position where the reference value is at or
+//! below the threshold (2048 for FP16). Positions above the threshold are
+//! ignored because they have lost exactness.
+//!
+//! # Applicability
+//!
+//! This protocol applies to **all linear kernels** (matmul, saxpy, scale,
+//! add_one) and bilinear kernels where both operands are binary (geometric
+//! product). It does **not** apply to non-linear operations (`log`, `exp`,
+//! `tanh`) — those produce irrational outputs that cannot be checked with
+//! exact match.
+//!
+//! # Example
+//!
+//! ```ignore
+//! use borsalino::numerical_check::{self, ExactMatchConfig, AddOneReference};
+//!
+//! let gpu = borsalino::init()?;
+//! let pipeline = gpu.compile("add_one", borsalino::kernels::ADD_ONE)?;
+//! let result = numerical_check::verify_numerical(
+//!     &gpu,
+//!     &pipeline,
+//!     &AddOneReference { len: 1024 },
+//!     &ExactMatchConfig::default(),
+//! )?;
+//! assert!(result.passed);
+//! # Ok::<(), borsalino::GpuError>(())
+//! ```
+
+use crate::{ComputePipeline, GpuBackend, GpuBuffer, Result};
+
+// ── Configuration ──────────────────────────────────────────────────
+
+/// Configuration for the exact-match numerical correctness protocol.
+///
+/// # Defaults
+///
+/// | Field | Default | Rationale |
+/// |---|---|---|
+/// | `threshold` | 2048.0 | Largest integer exactly representable in FP16 |
+/// | `trials` | 16 | Sufficient trials to catch systematic bugs |
+/// | `p_zero` | 0.7 | 70% zeros keeps accumulated sums below threshold |
+#[derive(Debug, Clone)]
+pub struct ExactMatchConfig {
+    /// The exact-match ceiling. Positions where the FP32 CPU reference output
+    /// exceeds this value are ignored (they have lost floating-point exactness).
+    ///
+    /// Default: 2048.0 (FP16 exact-integer ceiling).
+    pub threshold: f32,
+
+    /// Number of random binary-input trials to run.
+    ///
+    /// Default: 16. A kernel that passes all trials is very unlikely to be
+    /// incorrect, though passing does not constitute a mathematical proof.
+    pub trials: u32,
+
+    /// Probability of sampling 0 vs 1 for each input element.
+    ///
+    /// Default: 0.7 (70% zeros). A higher zero probability keeps accumulated
+    /// sums below the threshold for larger matrices. For small kernels, 0.5
+    /// (uniform binary) is fine.
+    pub p_zero: f32,
+}
+
+impl Default for ExactMatchConfig {
+    fn default() -> Self {
+        Self {
+            threshold: 2048.0,
+            trials: 16,
+            p_zero: 0.7,
+        }
+    }
+}
+
+// ── Result ─────────────────────────────────────────────────────────
+
+/// Result of a numerical correctness check.
+#[derive(Debug, Clone)]
+pub struct NumericalCheckResult {
+    /// Number of trials run.
+    pub trials: u32,
+
+    /// Total output positions compared across all trials (positions where
+    /// reference ≤ threshold).
+    pub positions_checked: usize,
+
+    /// Positions that matched the reference exactly.
+    pub positions_exact: usize,
+
+    /// Maximum absolute difference observed at positions below the threshold.
+    /// Should be 0.0 for a correct kernel.
+    pub max_diff_below_threshold: f32,
+
+    /// Whether the kernel passed the check.
+    ///
+    /// True only if every position at or below the threshold matched the
+    /// reference exactly across all trials.
+    pub passed: bool,
+}
+
+// ── Reference implementations ──────────────────────────────────────
+
+/// A kernel's CPU reference implementation for the exact-match protocol.
+///
+/// Implement this for each kernel type. The reference must compute the same
+/// mathematical function as the GPU kernel, in FP32 on CPU.
+///
+/// The inputs are binary `{0, 1}` values generated by the protocol. The
+/// reference computes the expected output from those same inputs.
+pub trait NumericalReference {
+    /// Generate binary inputs for trial `trial_idx`, ready for GPU upload.
+    ///
+    /// Returns a vector of byte buffers (one per input buffer the kernel
+    /// expects) and a vector of element counts (one per buffer).
+    ///
+    /// Use `rng` for reproducibility — the same seed should produce the same
+    /// inputs across runs.
+    fn generate_inputs(
+        &self,
+        trial_idx: u32,
+        cfg: &ExactMatchConfig,
+        rng: &mut dyn rand::RngCore,
+    ) -> (Vec<Vec<u8>>, Vec<usize>);
+
+    /// Compute the FP32 CPU reference output from the same binary inputs.
+    ///
+    /// Returns a flat vector of f32 values — the expected kernel output.
+    fn compute_reference(&self, inputs: &[Vec<u8>], input_sizes: &[usize]) -> Vec<f32>;
+}
+
+/// Reference for the `add_one` kernel: `out[i] = in[i] + 1`.
+#[derive(Debug, Clone)]
+pub struct AddOneReference {
+    /// Number of elements in the input/output buffer.
+    pub len: usize,
+}
+
+/// Reference for the `scale` kernel: `out[i] = alpha * in[i]`.
+#[derive(Debug, Clone)]
+pub struct ScaleReference {
+    /// Number of elements.
+    pub len: usize,
+    /// Scale factor. Use 1.0 for exact-match (keeps products exact).
+    pub alpha: f32,
+}
+
+/// Reference for the `saxpy` kernel: `out[i] = alpha * x[i] + y[i]`.
+#[derive(Debug, Clone)]
+pub struct SaxpyReference {
+    /// Number of elements.
+    pub len: usize,
+    /// Scale factor applied to x. Use 1.0 for exact-match.
+    pub alpha: f32,
+}
+
+/// Reference for tiled matrix multiplication: `C = A @ B`.
+#[derive(Debug, Clone)]
+pub struct MatmulReference {
+    /// Rows of A / C.
+    pub m: usize,
+    /// Inner dimension (columns of A, rows of B).
+    pub k: usize,
+    /// Columns of B / C.
+    pub n: usize,
+}
+
+// ── Trait implementations ──────────────────────────────────────────
+
+impl NumericalReference for AddOneReference {
+    fn generate_inputs(
+        &self,
+        _trial_idx: u32,
+        cfg: &ExactMatchConfig,
+        rng: &mut dyn rand::RngCore,
+    ) -> (Vec<Vec<u8>>, Vec<usize>) {
+        let input = sample_binary_bytes(self.len, cfg.p_zero, rng);
+        let sizes = vec![self.len];
+        (vec![input], sizes)
+    }
+
+    fn compute_reference(&self, inputs: &[Vec<u8>], input_sizes: &[usize]) -> Vec<f32> {
+        debug_assert_eq!(inputs.len(), 1);
+        debug_assert_eq!(input_sizes[0], self.len);
+        inputs[0].iter().map(|&b| b as f32 + 1.0).collect()
+    }
+}
+
+impl NumericalReference for ScaleReference {
+    fn generate_inputs(
+        &self,
+        _trial_idx: u32,
+        cfg: &ExactMatchConfig,
+        rng: &mut dyn rand::RngCore,
+    ) -> (Vec<Vec<u8>>, Vec<usize>) {
+        let input = sample_binary_bytes(self.len, cfg.p_zero, rng);
+        let sizes = vec![self.len];
+        (vec![input], sizes)
+    }
+
+    fn compute_reference(&self, inputs: &[Vec<u8>], input_sizes: &[usize]) -> Vec<f32> {
+        debug_assert_eq!(inputs.len(), 1);
+        debug_assert_eq!(input_sizes[0], self.len);
+        inputs[0].iter().map(|&b| b as f32 * self.alpha).collect()
+    }
+}
+
+impl NumericalReference for SaxpyReference {
+    fn generate_inputs(
+        &self,
+        _trial_idx: u32,
+        cfg: &ExactMatchConfig,
+        rng: &mut dyn rand::RngCore,
+    ) -> (Vec<Vec<u8>>, Vec<usize>) {
+        let x = sample_binary_bytes(self.len, cfg.p_zero, rng);
+        let y = sample_binary_bytes(self.len, cfg.p_zero, rng);
+        let sizes = vec![self.len, self.len];
+        (vec![x, y], sizes)
+    }
+
+    fn compute_reference(&self, inputs: &[Vec<u8>], input_sizes: &[usize]) -> Vec<f32> {
+        debug_assert_eq!(inputs.len(), 2);
+        debug_assert_eq!(input_sizes[0], self.len);
+        debug_assert_eq!(input_sizes[1], self.len);
+        inputs[0]
+            .iter()
+            .zip(inputs[1].iter())
+            .map(|(&x, &y)| self.alpha * x as f32 + y as f32)
+            .collect()
+    }
+}
+
+impl NumericalReference for MatmulReference {
+    fn generate_inputs(
+        &self,
+        _trial_idx: u32,
+        cfg: &ExactMatchConfig,
+        rng: &mut dyn rand::RngCore,
+    ) -> (Vec<Vec<u8>>, Vec<usize>) {
+        // Row-major: A is m×k, B is k×n.
+        let a = sample_binary_bytes(self.m * self.k, cfg.p_zero, rng);
+        let b = sample_binary_bytes(self.k * self.n, cfg.p_zero, rng);
+        let sizes = vec![self.m * self.k, self.k * self.n];
+        (vec![a, b], sizes)
+    }
+
+    fn compute_reference(&self, inputs: &[Vec<u8>], input_sizes: &[usize]) -> Vec<f32> {
+        debug_assert_eq!(inputs.len(), 2);
+        debug_assert_eq!(input_sizes[0], self.m * self.k);
+        debug_assert_eq!(input_sizes[1], self.k * self.n);
+        let a = &inputs[0];
+        let b = &inputs[1];
+        // Row-major matmul: C[i][j] = sum_k A[i][k] * B[k][j].
+        let mut c = vec![0.0f32; self.m * self.n];
+        for i in 0..self.m {
+            for j in 0..self.n {
+                let mut sum = 0.0f32;
+                for k in 0..self.k {
+                    sum += a[i * self.k + k] as f32 * b[k * self.n + j] as f32;
+                }
+                c[i * self.n + j] = sum;
+            }
+        }
+        c
+    }
+}
+
+/// Sample `n` binary `{0, 1}` bytes. Each element is 0 with probability
+/// `p_zero`, 1 otherwise.
+fn sample_binary_bytes(n: usize, p_zero: f32, rng: &mut dyn rand::RngCore) -> Vec<u8> {
+    use rand::Rng;
+    (0..n)
+        .map(|_| if rng.gen_bool(p_zero as f64) { 0 } else { 1 })
+        .collect()
+}
+
+// ── Comparison logic ───────────────────────────────────────────────
+
+/// Compare GPU output against FP32 reference with threshold gating.
+///
+/// This is the core of the exact-match protocol. For each position where the
+/// reference value is at or below `threshold`, the GPU output must match
+/// exactly. Positions above the threshold are ignored.
+///
+/// This function is pure and testable without a GPU.
+pub fn compare_outputs(
+    gpu_output: &[f32],
+    reference: &[f32],
+    threshold: f32,
+) -> NumericalCheckResult {
+    let mut positions_checked = 0usize;
+    let mut positions_exact = 0usize;
+    let mut max_diff_below_threshold = 0.0f32;
+
+    for (gpu_val, ref_val) in gpu_output.iter().zip(reference.iter()) {
+        if *ref_val <= threshold {
+            positions_checked += 1;
+            let diff = (gpu_val - ref_val).abs();
+            if diff == 0.0 {
+                positions_exact += 1;
+            }
+            if diff > max_diff_below_threshold {
+                max_diff_below_threshold = diff;
+            }
+        }
+    }
+
+    let passed = positions_checked > 0 && positions_exact == positions_checked;
+
+    NumericalCheckResult {
+        trials: 1,
+        positions_checked,
+        positions_exact,
+        max_diff_below_threshold,
+        passed,
+    }
+}
+
+// ── Full protocol (GPU-dependent) ──────────────────────────────────
+
+/// Run the exact-match protocol against a GPU kernel.
+///
+/// For each trial: generates binary inputs, computes the FP32 CPU reference,
+/// dispatches the kernel on GPU, reads back the output, and compares with
+/// bit-exact equality at positions where the reference is at or below the
+/// threshold.
+///
+/// Returns a combined [`NumericalCheckResult`] across all trials. The check
+/// passes only if every position at or below the threshold matched exactly
+/// across every trial.
+///
+/// # Errors
+///
+/// Returns an error if GPU dispatch or buffer read-back fails.
+pub fn verify_numerical<G: GpuBackend, R: NumericalReference>(
+    gpu: &G,
+    pipeline: &ComputePipeline,
+    reference: &R,
+    cfg: &ExactMatchConfig,
+) -> Result<NumericalCheckResult> {
+    let mut combined = NumericalCheckResult {
+        trials: 0,
+        positions_checked: 0,
+        positions_exact: 0,
+        max_diff_below_threshold: 0.0,
+        passed: true,
+    };
+
+    let mut rng = rand::thread_rng();
+
+    for trial in 0..cfg.trials {
+        let (input_bytes, input_sizes) = reference.generate_inputs(trial, cfg, &mut rng);
+        let ref_output = reference.compute_reference(&input_bytes, &input_sizes);
+
+        // Upload binary inputs to GPU buffers.
+        let gpu_buffers: Vec<GpuBuffer> = input_bytes
+            .iter()
+            .map(|bytes| gpu.create_buffer(bytes))
+            .collect::<Result<Vec<_>>>()?;
+
+        let buffer_refs: Vec<&GpuBuffer> = gpu_buffers.iter().collect();
+
+        // Dispatch the kernel.
+        // TODO: workgroup sizing should be derived from the kernel metadata.
+        gpu.dispatch(pipeline, &buffer_refs, (1, 1, 1))?;
+
+        // Read back the output (last buffer).
+        let gpu_output: Vec<f32> = gpu.read_buffer(gpu_buffers.last().unwrap())?;
+
+        // Compare with threshold gating.
+        let trial_result = compare_outputs(&gpu_output, &ref_output, cfg.threshold);
+
+        combined.trials += 1;
+        combined.positions_checked += trial_result.positions_checked;
+        combined.positions_exact += trial_result.positions_exact;
+        if trial_result.max_diff_below_threshold > combined.max_diff_below_threshold {
+            combined.max_diff_below_threshold = trial_result.max_diff_below_threshold;
+        }
+        if !trial_result.passed {
+            combined.passed = false;
+        }
+    }
+
+    Ok(combined)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Tests
+// ═══════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_config_has_fp16_threshold() {
+        let cfg = ExactMatchConfig::default();
+        assert_eq!(cfg.threshold, 2048.0);
+        assert!(cfg.trials >= 1);
+        assert!(cfg.p_zero > 0.0 && cfg.p_zero < 1.0);
+    }
+
+    // ── compare_outputs: correct kernel ──────────────────────────
+
+    #[test]
+    fn compare_outputs_exact_match_passes() {
+        let gpu_output = vec![1.0, 2.0, 3.0, 4.0];
+        let reference = vec![1.0, 2.0, 3.0, 4.0];
+
+        let result = compare_outputs(&gpu_output, &reference, 2048.0);
+
+        assert!(result.passed);
+        assert_eq!(result.positions_checked, 4);
+        assert_eq!(result.positions_exact, 4);
+        assert_eq!(result.max_diff_below_threshold, 0.0);
+    }
+
+    // ── compare_outputs: incorrect kernel detected ───────────────
+
+    #[test]
+    fn compare_outputs_mismatch_detected() {
+        let gpu_output = vec![1.0, 2.0, 3.0, 5.0]; // last element wrong
+        let reference = vec![1.0, 2.0, 3.0, 4.0];
+
+        let result = compare_outputs(&gpu_output, &reference, 2048.0);
+
+        assert!(!result.passed);
+        assert_eq!(result.positions_checked, 4);
+        assert_eq!(result.positions_exact, 3);
+        assert_eq!(result.max_diff_below_threshold, 1.0);
+    }
+
+    // ── compare_outputs: threshold gating ────────────────────────
+
+    #[test]
+    fn compare_outputs_ignores_positions_above_threshold() {
+        // GPU output differs from reference at a position above threshold.
+        // That position should be ignored, not counted as a failure.
+        let gpu_output = vec![1.0, 2.0, 3000.0]; // 3000 > 2048 threshold
+        let reference = vec![1.0, 2.0, 2049.0]; // 2049 > 2048, ignored
+
+        let result = compare_outputs(&gpu_output, &reference, 2048.0);
+
+        assert!(result.passed);
+        assert_eq!(result.positions_checked, 2); // only positions 0 and 1
+        assert_eq!(result.positions_exact, 2);
+    }
+
+    #[test]
+    fn compare_outputs_threshold_boundary_inclusive() {
+        // Reference value exactly at threshold should be checked.
+        let gpu_output = vec![2048.0];
+        let reference = vec![2048.0];
+
+        let result = compare_outputs(&gpu_output, &reference, 2048.0);
+
+        assert!(result.passed);
+        assert_eq!(result.positions_checked, 1);
+    }
+
+    // ── compare_outputs: edge cases ──────────────────────────────
+
+    #[test]
+    fn compare_outputs_all_above_threshold_reports_no_evidence() {
+        let gpu_output = vec![5000.0, 6000.0];
+        let reference = vec![5000.0, 6000.0];
+
+        let result = compare_outputs(&gpu_output, &reference, 2048.0);
+
+        // No positions checked means no verification happened — not a pass.
+        // The caller should adjust inputs to get positions below threshold.
+        assert!(!result.passed, "vacuous pass hides lack of evidence");
+        assert_eq!(result.positions_checked, 0);
+    }
+
+    // ── AddOneReference ──────────────────────────────────────────
+
+    #[test]
+    fn add_one_reference_computes_correctly() {
+        let reference = AddOneReference { len: 4 };
+        // Binary inputs: [0, 1, 0, 1] as bytes
+        let inputs = vec![vec![0u8, 1, 0, 1]];
+        let sizes = vec![4];
+
+        let output = reference.compute_reference(&inputs, &sizes);
+
+        // add_one: 0+1=1, 1+1=2, 0+1=1, 1+1=2
+        assert_eq!(output, vec![1.0, 2.0, 1.0, 2.0]);
+    }
+
+    // ── MatmulReference ──────────────────────────────────────────
+
+    #[test]
+    fn matmul_reference_computes_2x2_correctly() {
+        let reference = MatmulReference { m: 2, k: 2, n: 2 };
+        // A = [[1, 0], [0, 1]], B = [[1, 1], [0, 0]] (binary, column-major or row-major?)
+        // We use row-major flat.
+        // A @ B = [[1*1+0*0, 1*1+0*0], [0*1+1*0, 0*1+1*0]] = [[1, 1], [0, 0]]
+        let inputs = vec![
+            vec![1u8, 0, 0, 1], // A row-major
+            vec![1u8, 1, 0, 0], // B row-major
+        ];
+        let sizes = vec![4, 4];
+
+        let output = reference.compute_reference(&inputs, &sizes);
+
+        assert_eq!(output.len(), 4);
+        assert_eq!(output, vec![1.0, 1.0, 0.0, 0.0]);
+    }
+
+    // ── SaxpyReference ───────────────────────────────────────────
+
+    #[test]
+    fn saxpy_reference_computes_correctly() {
+        let reference = SaxpyReference { len: 3, alpha: 1.0 };
+        // x = [1, 0, 1], y = [0, 1, 0]
+        // saxpy: alpha*x + y = [1, 1, 1]
+        let inputs = vec![vec![1u8, 0, 1], vec![0u8, 1, 0]];
+        let sizes = vec![3, 3];
+
+        let output = reference.compute_reference(&inputs, &sizes);
+
+        assert_eq!(output, vec![1.0, 1.0, 1.0]);
+    }
+
+    // ── Binary input generation ──────────────────────────────────
+
+    #[test]
+    fn add_one_generates_binary_inputs() {
+        let reference = AddOneReference { len: 100 };
+        let cfg = ExactMatchConfig::default();
+        let mut rng = rand::thread_rng();
+
+        let (inputs, sizes) = reference.generate_inputs(0, &cfg, &mut rng);
+
+        assert_eq!(inputs.len(), 1);
+        assert_eq!(sizes[0], 100);
+        // All values must be 0 or 1.
+        for &byte in &inputs[0] {
+            assert!(byte == 0 || byte == 1, "non-binary value: {byte}");
+        }
+    }
+}

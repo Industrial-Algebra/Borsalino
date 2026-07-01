@@ -9,20 +9,43 @@
 //! [`ObligationBundle`] instances that can be exported to SMT,
 //! Lean 4, and Kani verification backends.
 //!
+//! # Verification Tiers
+//!
+//! Borsalino verifies two distinct dimensions of kernel safety:
+//!
+//! ## Structural Safety (compile-time)
+//!
+//! Type-level guards that prevent GPU faults, undefined behavior, and
+//! validation errors. These are checked at compile time via
+//! [`Proven`] phantom types and exported to
+//! SMT/Lean/Kani proof backends.
+//!
+//! ## Numerical Correctness (runtime, v0.5.0+)
+//!
+//! Runtime verification that a kernel produces the correct output, using
+//! the DeepReinforce exact-match protocol. Restricted to linear kernels
+//! with binary inputs. See [`numerical_check`](crate::numerical_check) module.
+//! Does not apply to non-linear operations (log, exp, tanh).
+//!
+//! Reference: [Towards a Reliable Kernel Correctness Check in Matrix
+//! Multiplication](https://deep-reinforce.com/correctness_check.html)
+//!
 //! # Properties verified
 //!
-//! | Property | What it prevents | Mechanism |
-//! |---|---|---|
-//! | Buffer aligned to 16 bytes | Unaligned buffer → GPU fault | Type-level guard |
-//! | Workgroup size divides thread count | Mismatch → undefined behavior | Type-level guard |
-//! | Dispatch within device limits | Excess threads → validation error | Type-level guard |
-//! | Kernel output is deterministic | Nondeterministic GPU behaviour | Statistical (amari-flynn) |
+//! | Property | What it prevents | Mechanism | Tier |
+//! |---|---|---|---|
+//! | Buffer aligned to 16 bytes | Unaligned buffer → GPU fault | Type-level guard | Structural |
+//! | Workgroup size divides thread count | Mismatch → undefined behavior | Type-level guard | Structural |
+//! | Dispatch within device limits | Excess threads → validation error | Type-level guard | Structural |
+//! | Kernel output is deterministic | Nondeterministic GPU behaviour | Statistical (amari-flynn) | Structural |
+//! | Kernel output is numerically correct | Wrong answer in FP16/BF16 | Exact-match protocol (runtime) | Numerical |
 //!
 //! # Phase
 //!
 //! Phase 2 of the verification migration path: obligation bundles
 //! and property types. Phase 3 adds `Proven<>` gates on dispatch.
 //! Phase 4 adds Kani harnesses and statistical verification.
+//! Phase 5 adds numerical correctness (v0.5.0).
 
 use karpal_verify::gpu::GpuObligationBundle;
 use karpal_verify::{ObligationBundle, Origin};
@@ -31,7 +54,8 @@ use karpal_verify::{ObligationBundle, Origin};
 
 pub use karpal_proof::{Property, Proven};
 pub use karpal_verify::gpu::{
-    IsBufferAlignedTo16, IsDispatchWithinLimits, IsMSLKernelDeterministic, IsWorkgroupSizeDivisible,
+    IsBufferAlignedTo16, IsDispatchWithinLimits, IsMSLKernelDeterministic, IsNumericallyCorrect,
+    IsWorkgroupSizeDivisible,
 };
 
 // ── Obligation bundles ────────────────────────────────────────────
@@ -53,6 +77,7 @@ pub fn add_one_obligations() -> ObligationBundle {
     .with_workgroup_divisibility("thread_count", 256)
     .with_dispatch_limit("workgroup_count", 65_535)
     .with_kernel_determinism("add_one_kernel")
+    .with_numerical_correctness("add_one_kernel", 2048, 16)
     .into_bundle()
 }
 
@@ -67,6 +92,7 @@ pub fn scale_obligations() -> ObligationBundle {
     .with_workgroup_divisibility("thread_count", 256)
     .with_dispatch_limit("workgroup_count", 65_535)
     .with_kernel_determinism("scale_kernel")
+    .with_numerical_correctness("scale_kernel", 2048, 16)
     .into_bundle()
 }
 
@@ -82,6 +108,7 @@ pub fn saxpy_obligations() -> ObligationBundle {
     .with_workgroup_divisibility("thread_count", 256)
     .with_dispatch_limit("workgroup_count", 65_535)
     .with_kernel_determinism("saxpy_kernel")
+    .with_numerical_correctness("saxpy_kernel", 2048, 16)
     .into_bundle()
 }
 

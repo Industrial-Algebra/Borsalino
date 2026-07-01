@@ -46,7 +46,7 @@ checksum = "84d7ced0ae9557296835c32bf1b1e02b44c746701f898460fb000d7eaa84f00a"
 
 [[package]]
 name = "borsalino"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "ash",
  "bytemuck",
@@ -54,6 +54,7 @@ dependencies = [
  "karpal-verify",
  "naga",
  "objc",
+ "rand",
  "thiserror",
 ]
 
@@ -117,6 +118,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
 
 [[package]]
+name = "getrandom"
+version = "0.2.17"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ff2abc00be7fca6ebc474524697ae276ad847ad0a6b3faa4bcb027e9a4614ad0"
+dependencies = [
+ "cfg-if",
+ "libc",
+ "wasi",
+]
+
+[[package]]
 name = "half"
 version = "2.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -161,24 +173,18 @@ dependencies = [
 
 [[package]]
 name = "karpal-algebra"
-version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "015423e85d8778d4ee91a89d3fa8cd5e12b0d5ea8e432527172e2b06a07ee29e"
+version = "0.6.0"
 dependencies = [
  "karpal-core",
 ]
 
 [[package]]
 name = "karpal-core"
-version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2df04b5af9bde122fee5d7359cd15afedcbcdd54a2e4b969446fd8e5430ca656"
+version = "0.6.0"
 
 [[package]]
 name = "karpal-proof"
-version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a51d84a83dc578ccac1ed5cad493825427f129ffeabebe46b89febeed7fa6285"
+version = "0.6.0"
 dependencies = [
  "karpal-algebra",
  "karpal-core",
@@ -187,9 +193,7 @@ dependencies = [
 
 [[package]]
 name = "karpal-proof-derive"
-version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aba2d03289e10dd05fabee5658ff17fbca9aa2440d458d7b5beda9b7cec30b5f"
+version = "0.6.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -198,9 +202,7 @@ dependencies = [
 
 [[package]]
 name = "karpal-verify"
-version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a8a5b29e036beeac069fd35ea652e00a8fae3b318a043c5f9e1c5f9d9f159284"
+version = "0.6.0"
 dependencies = [
  "karpal-proof",
  "karpal-verify-derive",
@@ -208,9 +210,7 @@ dependencies = [
 
 [[package]]
 name = "karpal-verify-derive"
-version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eef48c66632586152e59433db9e68bf8bee1f25b70c09623eaf7511dfe1adbc6"
+version = "0.6.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -306,6 +306,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
+name = "ppv-lite86"
+version = "0.2.21"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "85eae3c4ed2f50dcfe72643da4befc30deadb458a9b590d720cde2f2b1e97da9"
+dependencies = [
+ "zerocopy",
+]
+
+[[package]]
 name = "proc-macro2"
 version = "1.0.106"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -321,6 +330,36 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "41f2619966050689382d2b44f664f4bc593e129785a36d6ee376ddf37259b924"
 dependencies = [
  "proc-macro2",
+]
+
+[[package]]
+name = "rand"
+version = "0.8.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5ca0ecfa931c29007047d1bc58e623ab12e5590e8c7cc53200d5202b69266d8a"
+dependencies = [
+ "libc",
+ "rand_chacha",
+ "rand_core",
+]
+
+[[package]]
+name = "rand_chacha"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e6c10a63a0fa32252be49d21e7709d4d4baf8d231c2dbce1eaa8141b9b127d88"
+dependencies = [
+ "ppv-lite86",
+ "rand_core",
+]
+
+[[package]]
+name = "rand_core"
+version = "0.6.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ec0be4795e2f6a28069bec0b5ff3e2ac9bafc99e6a9a7dc3547996c5c816922c"
+dependencies = [
+ "getrandom",
 ]
 
 [[package]]
@@ -380,6 +419,12 @@ name = "unicode-width"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b4ac048d71ede7ee76d585517add45da530660ef4390e49b098733c6e897f254"
+
+[[package]]
+name = "wasi"
+version = "0.11.1+wasi-snapshot-preview1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ccf3ec651a847eb01de73ccad15eb7d99f80485de043efb2f370cd654f4ea44b"
 
 [[package]]
 name = "windows-link"

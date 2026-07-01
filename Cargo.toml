@@ -1,6 +1,6 @@
 [package]
 name = "borsalino"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 rust-version = "1.85"
 description = "Thin GPU compute abstraction — Metal and Vulkan backends for Industrial Algebra"
@@ -13,7 +13,7 @@ categories = ["hardware-support", "mathematics"]
 default = []
 metal = []
 vulkan = ["dep:ash"]
-verify = ["dep:karpal-verify", "dep:karpal-proof"]
+verify = ["dep:karpal-verify", "dep:karpal-proof", "dep:rand"]
 
 [dependencies]
 thiserror = "2"
@@ -22,8 +22,9 @@ naga = { version = "27", features = ["wgsl-in", "spv-out", "msl-out"] }
 
 # Verification (GPU safety properties, obligation bundles)
 # For local development, add: path = "../karpal/karpal-verify"
-karpal-verify = { version = "0.5", optional = true }
-karpal-proof = { version = "0.5", optional = true }
+karpal-verify = { version = "0.6", optional = true }
+karpal-proof = { version = "0.6", optional = true }
+rand = { version = "0.8", optional = true }
 
 # Metal backend (macOS) — objc crate for safe ARM64 msg_send dispatch
 [target.'cfg(target_os = "macos")'.dependencies]
@@ -34,3 +35,4 @@ objc = "0.2"
 ash = { version = "0.38", optional = true }
 
 [dev-dependencies]
+rand = "0.8"
