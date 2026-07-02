@@ -61,7 +61,7 @@ cargo run --features vulkan --example hello_compute   # Linux / Windows
 |---|---|
 | `metal` | Metal backend (macOS only) |
 | `vulkan` | Vulkan backend via ash (Linux / Windows) |
-| `verify` | karpal-verify 0.5 GPU obligation bundles (SMT, Lean, Kani export) |
+| `verify` | karpal-verify 0.6 GPU obligation bundles (SMT, Lean, Kani export) + numerical correctness verification |
 
 ## Architecture
 
@@ -160,8 +160,13 @@ See [BENCHMARKS.md](./BENCHMARKS.md) for full cross-platform performance data.
 
 ## Verification
 
-GPU safety properties are encoded as karpal-verify 0.5 obligation bundles
-(feature `verify`, fetches from crates.io):
+Borsalino verifies two distinct dimensions of kernel safety:
+
+### Structural Safety (compile-time)
+
+Type-level guards that prevent GPU faults, undefined behavior, and
+validation errors. Encoded as karpal-verify 0.6 obligation bundles
+(feature `verify`, fetched from crates.io):
 
 ```rust
 use borsalino::verify::{add_one_obligations, IsBufferAlignedTo16, Property};
@@ -171,6 +176,36 @@ assert!(bundle.obligations().iter().any(|o| o.property == IsBufferAlignedTo16::N
 ```
 
 Bundles export to SMT-LIB2, Lean 4, and Kani verification backends.
+
+### Numerical Correctness (runtime)
+
+Runtime verification that a linear kernel produces the correct output,
+using the [DeepReinforce exact-match protocol](https://deep-reinforce.com/correctness_check.html).
+Restricts kernel inputs to binary `{0,1}` values so that floating-point
+associativity holds exactly in the FP16 integer range `[0, 2048]`, then
+compares GPU output against an FP32 CPU reference with bit-exact equality.
+
+```rust
+use borsalino::numerical_check::{self, ExactMatchConfig, AddOneReference};
+
+let gpu = borsalino::init()?;
+let pipeline = gpu.compile("add_one", wgsl)?;
+let result = numerical_check::verify_numerical(
+    &gpu,
+    &pipeline,
+    &AddOneReference { len: 1024 },
+    &ExactMatchConfig::default(),
+)?;
+assert!(result.passed);
+```
+
+Built-in reference implementations: `AddOneReference`, `ScaleReference`,
+`SaxpyReference`, `MatmulReference`. Applicable to all linear kernels —
+does not cover non-linear operations (log, exp, tanh).
+
+This approach is based on the analysis by [DeepReinforce](https://deep-reinforce.com)
+in [_Towards a Reliable Kernel Correctness Check in Matrix
+Multiplication_](https://deep-reinforce.com/correctness_check.html) (Dec. 2025).
 
 ## Examples
 
