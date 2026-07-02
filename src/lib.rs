@@ -76,6 +76,12 @@ mod metal;
 #[cfg(feature = "verify")]
 pub mod verify;
 
+/// DeepReinforce exact-match numerical correctness protocol for linear kernels.
+///
+/// See [`numerical_check`] module docs for the protocol description.
+#[cfg(feature = "verify")]
+pub mod numerical_check;
+
 /// Reusable WGSL kernels for the Industrial Algebra ecosystem.
 ///
 /// These constants provide ready-to-compile WGSL source for common

@@ -2,6 +2,26 @@
 
 All notable changes to Borsalino are documented in this file.
 
+## [0.5.0] — 2026-06-29
+
+### Added
+- **Numerical correctness verification** — `numerical_check` module implementing the DeepReinforce exact-match protocol for linear GPU kernels. Binary `{0,1}` inputs guarantee floating-point associativity holds exactly in the FP16 integer range `[0, 2048]`. Runtime comparison against FP32 CPU reference with bit-exact equality.
+  - `ExactMatchConfig` — configurable threshold (default 2048), trials (default 16), zero-bias probability (default 0.7)
+  - `NumericalReference` trait — implement per kernel for CPU reference computation
+  - `AddOneReference`, `ScaleReference`, `SaxpyReference`, `MatmulReference` — built-in reference implementations
+  - `verify_numerical()` — runs the full protocol against a GPU kernel
+  - `compare_outputs()` — pure comparison logic with threshold gating (testable without GPU)
+  - Behind the `verify` feature gate
+- **`IsNumericallyCorrect` property** in obligation bundles (re-exported from karpal-verify 0.6.0)
+
+### Changed
+- **karpal-verify dependency** bumped 0.5 → 0.6 (adds `IsNumericallyCorrect` property, `with_numerical_correctness()` builder)
+- **`verify.rs` docs** — now distinguishes structural safety (compile-time) from numerical correctness (runtime) in a two-tier table
+- **Obligation bundles** — `add_one`, `scale`, `saxpy` bundles now include `.with_numerical_correctness()`
+
+### Reference
+- [DeepReinforce — Towards a Reliable Kernel Correctness Check](https://deep-reinforce.com/correctness_check.html)
+
 ## [0.2.0] — 2026-06-11
 
 ### Added
@@ -49,7 +69,7 @@ Version 0.4.0+ carries Apache-2.0.
 ### Removed
 - `candle_tropical_mask` example (pending pre-print publication).
 
-## [0.2.0] — 2026-06-11
+## [0.1.0] — 2026-06-03
 
 ### Added
 - **Vulkan backend** — full `GpuBackend` trait implementation via `ash` raw FFI. WGSL→SPIR-V translation via `naga`, synchronous dispatch, pre-allocated descriptor sets and command pool. Tested on AMD Radeon, NVIDIA RTX 5080, and NVIDIA GB10.
