@@ -2,6 +2,16 @@
 
 All notable changes to Borsalino are documented in this file.
 
+## [0.5.1] — 2026-07-20
+
+### Fixed
+- **Vulkan init SIGSEGV under Mesa ICD setups (#34)** — `init()` no longer hard-codes `API_VERSION_1_3` in `VkApplicationInfo`. It now queries `vkEnumerateInstanceVersion` first and requests only the available version, capped at 1.3. This avoids a driver crash in Mesa lavapipe (and multi-ICD headless VMs) where requesting an unsupported API version triggers a SIGSEGV inside the ICD instead of returning `VK_ERROR_INCOMPATIBLE_DRIVER`.
+
+  Workaround for broken ICDs in headless VMs: set `VK_ICD_FILENAMES` to filter to a known-good ICD (e.g. `lvp_icd.json` for lavapipe software rendering).
+
+### Added
+- `negotiate_api_version()` helper (5 TDD tests) — pure function for version negotiation logic, testable without GPU hardware.
+
 ## [0.5.0] — 2026-06-29
 
 ### Added
