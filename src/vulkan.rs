@@ -293,6 +293,31 @@ fn contents_vulkan_buffer(raw: *mut std::ffi::c_void) -> *const std::ffi::c_void
 // Initialisation helpers
 // ═══════════════════════════════════════════════════════════════════
 
+/// Negotiate the API version to request from `vkCreateInstance`.
+///
+/// Requesting an API version the driver doesn't support can trigger driver
+/// crashes (SIGSEGV) in some Mesa ICDs — notably lavapipe in older Mesa
+/// versions that only implement Vulkan 1.2 when asked for 1.3. This function
+/// caps the requested version at whatever `vkEnumerateInstanceVersion`
+/// reports as available, avoiding the buggy code path.
+///
+/// # Parameters
+///
+/// - `available`: The result of `vkEnumerateInstanceVersion` (`None` if the
+///   loader only supports Vulkan 1.0, in which case the entry point doesn't
+///   exist).
+///
+/// # Returns
+///
+/// The highest API version we should request, capped at our max of 1.3.
+fn negotiate_api_version(available: Option<u32>) -> u32 {
+    const MAX_DESIRED: u32 = vk::API_VERSION_1_3;
+    match available {
+        None => vk::API_VERSION_1_0, // Vulkan 1.0-only loader
+        Some(v) => v.min(MAX_DESIRED),
+    }
+}
+
 /// Score a device type for preference ordering.
 fn device_type_score(ty: vk::PhysicalDeviceType) -> i32 {
     match ty {
@@ -632,13 +657,22 @@ impl GpuBackend for VulkanBackend {
     fn init_with_strategy(strategy: MemoryStrategy) -> Result<Self> {
         let entry = unsafe { Entry::load().map_err(|e| GpuError::InitFailed(format!("{e}")))? };
 
+        // Query the available instance version before requesting one.
+        // Requesting an unsupported version (e.g. 1.3 on lavapipe/Mesa <23.x)
+        // can trigger driver crashes (SIGSEGV) instead of a clean error.
+        // See issue #34.
+        let available_version = unsafe { entry.try_enumerate_instance_version() }
+            .ok()
+            .flatten();
+        let api_version = negotiate_api_version(available_version);
+
         let app_name = std::ffi::CString::new("borsalino").unwrap();
         let engine_name = std::ffi::CString::new("borsalino").unwrap();
 
         let app_info = vk::ApplicationInfo::default()
             .application_name(&app_name)
             .engine_name(&engine_name)
-            .api_version(vk::API_VERSION_1_3);
+            .api_version(api_version);
 
         let instance_create_info = vk::InstanceCreateInfo::default().application_info(&app_info);
 
@@ -1872,6 +1906,46 @@ impl GpuBackend for VulkanBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── API version negotiation (issue #34: SIGSEGV under Mesa ICDs) ───
+
+    #[test]
+    fn negotiate_version_caps_at_driver_max() {
+        // lavapipe (Mesa <23.x) supports 1.2; requesting 1.3 crashes it.
+        // We must request 1.2 instead.
+        let available = Some(vk::API_VERSION_1_2);
+        assert_eq!(negotiate_api_version(available), vk::API_VERSION_1_2);
+    }
+
+    #[test]
+    fn negotiate_version_caps_at_our_max() {
+        // A future driver supports 1.4; we cap at 1.3 (our max tested).
+        let future = vk::make_api_version(0, 1, 4, 0);
+        assert_eq!(negotiate_api_version(Some(future)), vk::API_VERSION_1_3);
+    }
+
+    #[test]
+    fn negotiate_version_full_1_3_when_supported() {
+        // RTX / modern Mesa supports 1.3; we take full advantage.
+        assert_eq!(
+            negotiate_api_version(Some(vk::API_VERSION_1_3)),
+            vk::API_VERSION_1_3
+        );
+    }
+
+    #[test]
+    fn negotiate_version_falls_back_to_1_0() {
+        // Vulkan 1.0-only loader (no vkEnumerateInstanceVersion).
+        assert_eq!(negotiate_api_version(None), vk::API_VERSION_1_0);
+    }
+
+    #[test]
+    fn negotiate_version_1_1() {
+        assert_eq!(
+            negotiate_api_version(Some(vk::API_VERSION_1_1)),
+            vk::API_VERSION_1_1
+        );
+    }
 
     #[test]
     fn device_init() {
