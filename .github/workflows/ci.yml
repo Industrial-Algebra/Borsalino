@@ -89,3 +89,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Run Miri on buffer lifecycle tests
         run: cargo miri test --features vulkan buffer_lifecycle
+
+  gpu:
+    name: GPU dispatch tests (self-hosted)
+    runs-on: [self-hosted, gpu]
+    if: contains(github.event.pull_request.labels.*.name, 'run-gpu')
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - name: Run GPU dispatch tests (Vulkan)
+        run: cargo test --features vulkan -- --ignored
