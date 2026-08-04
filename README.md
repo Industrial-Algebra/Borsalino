@@ -8,6 +8,9 @@
 Thin GPU compute abstraction for the Industrial Algebra ecosystem.
 
 > One trait, two backends, zero ceremony.
+>
+> v0.6.0: GC-safe dispatch tracking, determinism verification,
+> expanded structural gates, and GeometricProductReference.
 
 Write WGSL compute kernels. Dispatch them synchronously on Metal or Vulkan.
 Read results back. No bind groups, no pipeline layouts, no descriptor sets,
@@ -61,20 +64,25 @@ cargo run --features vulkan --example hello_compute   # Linux / Windows
 |---|---|
 | `metal` | Metal backend (macOS only) |
 | `vulkan` | Vulkan backend via ash (Linux / Windows) |
-| `verify` | karpal-verify 0.6 GPU obligation bundles (SMT, Lean, Kani export) + numerical correctness verification |
+| `verify` | karpal-verify 0.6 obligation bundles + numerical correctness + determinism verification |
 
 ## Architecture
 
 ```
-GpuBackend trait (7 methods)
+GpuBackend trait
     │
     ├── MetalBackend     (metal.rs)
     │   ├── naga WGSL → MSL translation
     │   └── objc_msgSend FFI (19 selectors, 0 Metal crate deps)
     │
-    └── VulkanBackend    (vulkan.rs)
-        ├── naga WGSL → SPIR-V translation
-        └── ash FFI (Vulkan 1.3)
+    ├── VulkanBackend    (vulkan.rs)
+    │   ├── naga WGSL → SPIR-V translation
+    │   └── ash FFI (Vulkan 1.3)
+    │
+    ├── epoch            (epoch.rs) — AtomicU64 dispatch tracking
+    ├── determinism      (determinism.rs) — empirical determinism check
+    ├── numerical_check  (numerical_check.rs) — exact-match protocol
+    └── kani_harnesses   (kani_harnesses.rs) — bounded model checking
 ```
 
 Opaque handle types (`ComputePipeline`, `GpuBuffer`) carry raw pointers and
@@ -200,12 +208,58 @@ assert!(result.passed);
 ```
 
 Built-in reference implementations: `AddOneReference`, `ScaleReference`,
-`SaxpyReference`, `MatmulReference`. Applicable to all linear kernels —
-does not cover non-linear operations (log, exp, tanh).
+`SaxpyReference`, `MatmulReference`, `GeometricProductReference`. The
+geometric product reference computes the Cl(n,0) sign table independently
+from the algebraic structure, catching sign-table bugs in the WGSL kernel.
+Applicable to all linear kernels — does not cover non-linear operations
+(log, exp, tanh).
 
 This approach is based on the analysis by [DeepReinforce](https://deep-reinforce.com)
 in [_Towards a Reliable Kernel Correctness Check in Matrix
 Multiplication_](https://deep-reinforce.com/correctness_check.html) (Dec. 2025).
+
+### Determinism Verification (runtime)
+
+Dispatches the same inputs multiple times and compares outputs
+bit-for-bit. Catches nondeterministic atomic operations, race
+conditions, and implementation-defined reductions:
+
+```rust
+use borsalino::determinism::{verify_deterministic, DeterminismResult};
+
+let result = verify_deterministic(&gpu, &pipeline, &[input], output_len, 5)?;
+assert!(result.is_deterministic());
+```
+
+### GC Safety — Dispatch Epoch Tracking (v0.6.0)
+
+When a WASM runtime (e.g., Baedeker) runs a moving garbage collector,
+it must know whether any GPU dispatches are in-flight before compacting
+host memory. The epoch counter tracks this with one `AtomicU64` operation
+per dispatch:
+
+```rust
+// GC checks before compaction
+if gpu.is_quiescent() {
+    // Safe to compact — no GPU operations outstanding
+    gc_compact();
+}
+
+// Or construct a compile-time proof
+if let Some(proof) = gpu.prove_quiescent() {
+    gpu.dispatch_verified_gc(&pipeline, &buffers, (4, 1, 1), (256, 1, 1),
+                             &workgroup_proof, &proof)?;
+}
+```
+
+Zero-copy pinned buffers bind the host data lifetime via the borrow
+checker:
+
+```rust
+let data = vec![1.0f32; 1024];
+let (buffer, _pin) = gpu.create_buffer_pinned(&data)?;
+// _pin borrows `data` — cannot reallocate while buffer is alive
+```
 
 ## Examples
 
@@ -217,6 +271,8 @@ Multiplication_](https://deep-reinforce.com/correctness_check.html) (Dec. 2025).
 | `dispatch_profile` | Per-component dispatch cost profiling | `cargo run --example dispatch_profile --features vulkan --release` |
 | `tiled_matmul` | 2D tiled matrix multiply with shared memory | `cargo run --example tiled_matmul --features vulkan --release` |
 | `ia_geometric_product` | IA kernel: 32-blade geometric product (5D GA) | `cargo run --example ia_geometric_product --features vulkan --release` |
+| `numerical_verification` | Exact-match protocol on geometric product | `cargo run --example numerical_verification --features vulkan,verify` |
+| `determinism_check` | Dispatch N times, compare bit-for-bit | `cargo run --example determinism_check --features vulkan,verify` |
 
 ## Shader Caching
 
@@ -233,25 +289,34 @@ let pipeline2 = gpu.compile_cached("add_one", wgsl)?;
 ## Verified Dispatch
 
 [`dispatch_verified`](GpuBackend::dispatch_verified) gates dispatches behind a
-runtime workgroup divisibility proof:
+runtime workgroup divisibility proof. [`verify_with_limits`](DispatchConfig::verify_with_limits)
+also checks against device dispatch limits:
 
 ```rust
 let config = DispatchConfig { total_threads: 1024, threads_per_group: 256 };
-let proof = config.verify()?;
+let proof = config.verify_with_limits(65535)?;  // divisibility + device limit
 gpu.dispatch_verified(&pipeline, &buffers, (4, 1, 1), (256, 1, 1), &proof)?;
 ```
 
+For GC-sensitive contexts, [`dispatch_verified_gc`](GpuBackend::dispatch_verified_gc)
+requires both a workgroup proof and a quiescence proof (see
+[GC Safety](#gc-safety--dispatch-epoch-tracking-v060) above).
+
 ## Verification (Miri + Kani)
 
-Buffer lifecycle safety is verified under Miri (undefined behaviour detection)
-and Kani (bounded model checking):
+Buffer lifecycle and epoch counter safety are verified under Miri
+(undefined behaviour detection) and Kani (bounded model checking):
 
 ```sh
-cargo +nightly miri test --features vulkan buffer_lifecycle
+cargo +nightly miri test epoch           # epoch counter atomic safety
 cargo kani --harness buffer_alignment_boundary
 ```
 
-CI runs both on label-gated PRs (`run-miri`, `run-kani`).
+Kani runs on a self-hosted x86_64 runner (norma-wall). Miri runs on
+GitHub-hosted runners. Both auto-run on release PRs (→ main) and are
+label-gated (`run-miri`, `run-kani`) on feature PRs. GPU dispatch tests
+run on a self-hosted ARM64 runner (dgx-spark, NVIDIA GB10) with the
+`run-gpu` label.
 
 ## Async Dispatch
 
