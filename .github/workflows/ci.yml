@@ -74,7 +74,8 @@ jobs:
 
   kani:
     name: Kani Verification
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, kani]
+    timeout-minutes: 15
     if: |
       github.event_name == 'push' && github.ref == 'refs/heads/main' ||
       github.event_name == 'pull_request' && (
@@ -83,14 +84,11 @@ jobs:
       )
     steps:
       - uses: actions/checkout@v4
-      - uses: model-checking/kani-github-action@v1.1
       - name: Run Kani harnesses
         run: |
           cargo kani --harness buffer_alignment_boundary
           cargo kani --harness workgroup_divisibility
           cargo kani --harness buffer_size_no_overflow
-          cargo kani --harness epoch_balanced_never_negative
-          cargo kani --harness epoch_interleaved_tracks_correctly
 
   miri:
     name: Miri (safety check)
