@@ -82,6 +82,11 @@ pub mod verify;
 #[cfg(feature = "verify")]
 pub mod numerical_check;
 
+/// GPU dispatch epoch tracking for GC safety.
+///
+/// See [`epoch`] module docs for the GC safety protocol.
+pub mod epoch;
+
 /// Kani bounded model-checking harnesses for buffer safety invariants.
 ///
 /// These harnesses verify structural properties that hold for all possible
@@ -431,6 +436,25 @@ pub trait GpuBackend: Sized {
     /// let elapsed_ns = gpu.timestamp()? - t0;
     /// ```
     fn timestamp(&self) -> Result<u64>;
+
+    /// Number of dispatches that have begun but not yet completed.
+    ///
+    /// Zero means the GPU is idle — safe for a WASM runtime to compact
+    /// memory. The default implementation returns `0` (no tracking).
+    /// Backends with epoch tracking override this.
+    ///
+    /// See [`crate::epoch::GpuEpochTracker`] for the full GC safety protocol.
+    fn in_flight(&self) -> u64 {
+        0
+    }
+
+    /// True when no GPU operations are outstanding.
+    ///
+    /// The WASM runtime (e.g., Baedeker) calls this before GC compaction.
+    /// If `false`, compaction must be deferred until the GPU quiesces.
+    fn is_quiescent(&self) -> bool {
+        self.in_flight() == 0
+    }
 
     /// Dispatch multiple kernels in a single command buffer.
     ///
