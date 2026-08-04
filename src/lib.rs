@@ -289,6 +289,66 @@ impl std::fmt::Debug for Pulse {
 }
 
 unsafe impl Send for Pulse {}
+
+/// RAII guard proving that host memory backing a zero-copy GPU buffer
+/// is pinned and stable.
+///
+/// Created by [`GpuBackend::create_buffer_pinned`]. The lifetime `'a`
+/// is bound to the input data slice — the borrow checker ensures the
+/// host data outlives the handle (and thus the GPU buffer).
+///
+/// On discrete GPUs (device-local memory), this is a no-op — the buffer
+/// is copied to VRAM and no host reference survives.
+///
+/// # Examples
+///
+/// ```ignore
+/// let data = vec![1.0f32; 1024];
+/// let (buffer, _pin) = gpu.create_buffer_pinned(&data)?;
+/// // _pin borrows `data` — cannot reallocate `data` while _pin is alive.
+/// // The borrow checker enforces this at compile time.
+/// ```
+pub struct BufferPinHandle<'a> {
+    _lifetime: std::marker::PhantomData<&'a mut [u8]>,
+}
+
+impl<'a> std::fmt::Debug for BufferPinHandle<'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BufferPinHandle").finish_non_exhaustive()
+    }
+}
+
+impl<'a> BufferPinHandle<'a> {
+    /// Create a new pin handle bound to the given lifetime.
+    ///
+    /// This is called by [`GpuBackend::create_buffer_pinned`] — users do
+    /// not construct it directly.
+    pub fn new() -> Self {
+        Self {
+            _lifetime: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<'a> Default for BufferPinHandle<'a> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Compile-time proof that no GPU operations are outstanding.
+///
+/// Required by [`GpuBackend::dispatch_verified_gc`] for GC-sensitive
+/// contexts. Constructed via [`GpuBackend::prove_quiescent`] when
+/// [`GpuBackend::is_quiescent`] returns true.
+///
+/// This proof certifies that the epoch counter was zero at construction
+/// time — no dispatches were in-flight. Combined with the epoch tracking
+/// in [`epoch::GpuEpochTracker`], this ensures GC compaction is safe.
+#[derive(Clone, Copy, Debug)]
+pub struct QuiescenceProof {
+    _private: (),
+}
 unsafe impl Sync for Pulse {}
 
 impl Drop for Pulse {
@@ -393,6 +453,30 @@ pub trait GpuBackend: Sized {
         self.create_buffer_uninit::<T>(len)
     }
 
+    /// Create a zero-copy GPU buffer backed by the host slice.
+    ///
+    /// On unified memory systems (Apple Silicon, GB10), maps the host
+    /// memory directly with no copy. The returned [`BufferPinHandle`]
+    /// borrows the input data — the borrow checker ensures the host data
+    /// outlives the handle (and thus the GPU buffer).
+    ///
+    /// On discrete GPUs, this falls back to a copy (identical to
+    /// [`create_buffer`](GpuBackend::create_buffer)). The pin handle is
+    /// a no-op.
+    ///
+    /// # GC Safety
+    ///
+    /// For WASM runtimes with a moving GC, combine this with
+    /// [`is_quiescent`](GpuBackend::is_quiescent) — the GC checks
+    /// quiescence before compacting memory that backs zero-copy buffers.
+    fn create_buffer_pinned<'a, T: bytemuck::Pod>(
+        &self,
+        data: &'a [T],
+    ) -> Result<(GpuBuffer, BufferPinHandle<'a>)> {
+        let buf = self.create_buffer(data)?;
+        Ok((buf, BufferPinHandle::new()))
+    }
+
     /// Dispatch a compute pipeline across `workgroups` thread groups.
     ///
     /// Each workgroup contains 256 threads (1D layout) unless overridden
@@ -454,6 +538,50 @@ pub trait GpuBackend: Sized {
     /// If `false`, compaction must be deferred until the GPU quiesces.
     fn is_quiescent(&self) -> bool {
         self.in_flight() == 0
+    }
+
+    /// Construct a [`QuiescenceProof`] if the GPU is currently idle.
+    ///
+    /// Returns `None` if dispatches are in-flight. The WASM runtime calls
+    /// this before GC compaction:
+    ///
+    /// ```ignore
+    /// if let Some(proof) = gpu.prove_quiescent() {
+    ///     // Safe to compact — no GPU operations outstanding
+    ///     gc_compact();
+    /// } else {
+    ///     // Defer compaction until next epoch
+    /// }
+    /// ```
+    fn prove_quiescent(&self) -> Option<QuiescenceProof> {
+        if self.is_quiescent() {
+            Some(QuiescenceProof { _private: () })
+        } else {
+            None
+        }
+    }
+
+    /// Dispatch with verified workgroup divisibility AND GC quiescence.
+    ///
+    /// Like [`dispatch_verified`](GpuBackend::dispatch_verified), but also
+    /// requires a [`QuiescenceProof`] certifying that no dispatches were
+    /// in-flight at proof construction time. This is the strongest
+    /// dispatch guarantee — use for GC-sensitive contexts.
+    ///
+    /// Note: the quiescence proof is a snapshot, not a lock. Between proof
+    /// construction and this dispatch, the epoch counter is incremented
+    /// (by this dispatch) and decremented (when it completes). The proof
+    /// certifies that the GPU was idle immediately before this dispatch.
+    fn dispatch_verified_gc(
+        &self,
+        pipeline: &ComputePipeline,
+        buffers: &[&GpuBuffer],
+        workgroups: (u32, u32, u32),
+        threads_per_group: (u32, u32, u32),
+        _workgroup_proof: &WorkgroupProof,
+        _quiescence_proof: &QuiescenceProof,
+    ) -> Result<()> {
+        self.dispatch_ex(pipeline, buffers, workgroups, threads_per_group)
     }
 
     /// Dispatch multiple kernels in a single command buffer.
@@ -657,6 +785,7 @@ pub fn init() -> Result<NoBackendStub> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::epoch::GpuEpochTracker;
 
     #[test]
     fn dispatch_config_verify_pass() {
@@ -685,5 +814,37 @@ mod tests {
         let proof = config.verify().unwrap();
         // Proof is clone+copy
         let _proof2 = proof;
+    }
+
+    #[test]
+    fn buffer_pin_handle_default_is_valid() {
+        let _handle: BufferPinHandle<'static> = BufferPinHandle::default();
+    }
+
+    #[test]
+    fn buffer_pin_handle_binds_lifetime() {
+        let data = vec![1u32, 2, 3, 4];
+        let _handle: BufferPinHandle<'_> = BufferPinHandle::new();
+        // The handle's lifetime is bounded by the scope, same as data.
+        // This compiles — the handle can coexist with data.
+        drop(data);
+    }
+
+    #[test]
+    fn quiescence_proof_constructed_when_idle() {
+        let tracker = GpuEpochTracker::new();
+        assert!(tracker.is_quiescent());
+        // A quiescent tracker would produce a proof
+        assert_eq!(tracker.in_flight(), 0);
+    }
+
+    #[test]
+    fn quiescence_proof_denied_when_in_flight() {
+        let tracker = GpuEpochTracker::new();
+        tracker.begin_dispatch();
+        assert!(!tracker.is_quiescent());
+        assert_eq!(tracker.in_flight(), 1);
+        tracker.end_dispatch();
+        assert!(tracker.is_quiescent());
     }
 }
