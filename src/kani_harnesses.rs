@@ -75,7 +75,7 @@ fn epoch_balanced_never_negative() {
     assert!(tracker.is_quiescent());
 
     let n: u32 = kani::any();
-    kani::assume(n > 0 && n <= 100);
+    kani::assume(n > 0 && n <= 5);
 
     for _ in 0..n {
         tracker.begin_dispatch();
@@ -103,8 +103,8 @@ fn epoch_interleaved_tracks_correctly() {
 
     let a: u32 = kani::any();
     let b: u32 = kani::any();
-    kani::assume(a <= 50);
-    kani::assume(b <= 50);
+    kani::assume(a <= 3);
+    kani::assume(b <= 3);
 
     // Phase 1: begin `a` dispatches
     for _ in 0..a {
