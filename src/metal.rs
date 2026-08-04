@@ -214,10 +214,56 @@ fn fix_device_line(line: &str, mutable: bool) -> Option<String> {
 pub struct MetalBackend {
     device: MetalDevice,
     queue: MetalQueue,
+    /// Epoch tracker for GC safety — counts in-flight dispatches.
+    epoch: crate::epoch::GpuEpochTracker,
 }
 
 impl MetalBackend {
     const STORAGE_MODE_SHARED: u64 = 0;
+}
+
+/// Inner state for an async Metal dispatch [`Pulse`].
+struct MetalPulseInner {
+    cmd: *mut std::ffi::c_void,
+    epoch: *const crate::epoch::GpuEpochTracker,
+    /// Tracks whether end_dispatch has been called (prevents double-decrement
+    /// when wait() + drop() both fire).
+    epoch_completed: std::sync::atomic::AtomicBool,
+}
+
+fn wait_metal_pulse(raw: *mut std::ffi::c_void) {
+    if !raw.is_null() {
+        let inner = unsafe { &*(raw as *const MetalPulseInner) };
+        let _: () = unsafe { msg_send![obj(inner.cmd), waitUntilCompleted] };
+        // Balance the begin_dispatch from dispatch_async.
+        if !inner.epoch.is_null()
+            && !inner
+                .epoch_completed
+                .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            unsafe { (*inner.epoch).end_dispatch() };
+        }
+    }
+}
+
+fn drop_metal_pulse(raw: *mut std::ffi::c_void) {
+    if !raw.is_null() {
+        let inner = unsafe { Box::from_raw(raw as *mut MetalPulseInner) };
+        unsafe {
+            // Ensure GPU completes before releasing the command buffer.
+            let _: () = msg_send![obj(inner.cmd), waitUntilCompleted];
+            // Balance the begin_dispatch from dispatch_async (only if
+            // wait() hasn't already done so).
+            if !inner.epoch.is_null()
+                && !inner
+                    .epoch_completed
+                    .swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                (*inner.epoch).end_dispatch();
+            }
+            let _: () = msg_send![obj(inner.cmd), release];
+        }
+    }
 }
 
 impl GpuBackend for MetalBackend {
@@ -246,6 +292,7 @@ impl GpuBackend for MetalBackend {
             queue: MetalQueue {
                 ptr: NonNull::new(queue_ptr).unwrap(),
             },
+            epoch: crate::epoch::GpuEpochTracker::new(),
         })
     }
 
@@ -514,8 +561,14 @@ impl GpuBackend for MetalBackend {
 
             // Finish
             let _: () = msg_send![obj(encoder), endEncoding];
+
+            self.epoch.begin_dispatch();
+
             let _: () = msg_send![obj(cmd), commit];
             let _: () = msg_send![obj(cmd), waitUntilCompleted];
+
+            self.epoch.end_dispatch();
+
             let _: () = msg_send![obj(cmd), release];
         }
 
@@ -562,17 +615,22 @@ impl GpuBackend for MetalBackend {
             ];
 
             let _: () = msg_send![obj(encoder), endEncoding];
+
+            self.epoch.begin_dispatch();
+
             let _: () = msg_send![obj(cmd), commit];
 
             // Store command buffer in Pulse; wait+release on demand
+            let inner = Box::new(MetalPulseInner {
+                cmd,
+                epoch: &self.epoch,
+                epoch_completed: std::sync::atomic::AtomicBool::new(false),
+            });
+
             Ok(Pulse {
-                raw: cmd,
-                wait_fn: |raw| {
-                    let _: () = unsafe { msg_send![obj(raw), waitUntilCompleted] };
-                },
-                drop_fn: |raw| {
-                    let _: () = unsafe { msg_send![obj(raw), release] };
-                },
+                raw: Box::into_raw(inner) as *mut std::ffi::c_void,
+                wait_fn: wait_metal_pulse,
+                drop_fn: drop_metal_pulse,
             })
         }
     }
@@ -761,12 +819,22 @@ impl GpuBackend for MetalBackend {
             }
 
             let _: () = msg_send![obj(encoder), endEncoding];
+
+            self.epoch.begin_dispatch();
+
             let _: () = msg_send![obj(cmd), commit];
             let _: () = msg_send![obj(cmd), waitUntilCompleted];
+
+            self.epoch.end_dispatch();
+
             let _: () = msg_send![obj(cmd), release];
         }
 
         Ok(())
+    }
+
+    fn in_flight(&self) -> u64 {
+        self.epoch.in_flight()
     }
 }
 
