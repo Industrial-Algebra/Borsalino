@@ -2,6 +2,41 @@
 
 All notable changes to Borsalino are documented in this file.
 
+## [0.6.0] — 2026-08-04
+
+### Added — GC Safety (Pin-and-Track)
+- **`GpuEpochTracker`** — `AtomicU64` counter tracking in-flight GPU dispatches. Incremented on dispatch, decremented on completion. The WASM runtime (Baedeker) checks `is_quiescent()` before GC compaction — if false, compaction is deferred until the GPU quiesces.
+  - Wired into both Vulkan and Metal backends (all dispatch paths including async)
+  - `AtomicBool` guard prevents double-decrement when `wait()` + `drop()` both fire
+  - Fixed pre-existing bug: `drop_vulkan_pulse` now waits for fence before destroying (Vulkan spec requires signaled fence)
+- **`BufferPinHandle<'a>`** — RAII guard with `PhantomData` lifetime binding. The borrow checker prevents host memory reallocation while a zero-copy buffer is alive.
+- **`create_buffer_pinned()`** — zero-copy buffer creation API (defaults to copy on discrete GPUs)
+- **`QuiescenceProof`** — phantom type certifying the GPU was idle at proof construction time
+- **`prove_quiescent()` → `Option<QuiescenceProof>`** — constructs proof when `is_quiescent()` is true
+- **`dispatch_verified_gc()`** — strongest dispatch guarantee, requiring both `WorkgroupProof` and `QuiescenceProof`
+
+### Added — Structural Verification
+- **`DispatchConfig::verify_with_limits(max_workgroups)`** — checks workgroup divisibility AND device dispatch limits
+
+### Added — Determinism Verification
+- **`determinism` module** — empirical determinism check: dispatches the same inputs N times, compares outputs bit-for-bit
+  - `DeterminismResult` with `is_deterministic()` and `disagreement_fraction`
+  - `compare_determinism()` — pure comparison logic (testable without GPU)
+  - `verify_deterministic()` — GPU-dependent dispatch driver
+
+### Added — Numerical Verification
+- **`GeometricProductReference`** — independent CPU reference for the IA geometric product kernel (5D GA). Sign table computed from the algebraic structure of Cl(n,0), catching sign-table bugs in the WGSL kernel.
+  - `blade_product_output(i, j) = i XOR j` (symmetric difference of basis vectors)
+  - `blade_product_sign(i, j) = (-1)^swaps`
+
+### Added — Kani Harnesses
+- **`epoch_balanced_never_negative`** — proves `AtomicU64` counter cannot underflow
+- **`epoch_interleaved_tracks_correctly`** — proves interleaved begin/end sequences track correctly
+- Wired the previously-dead `kani_harnesses` module (was missing `mod` declaration)
+
+### Added — GPU CI
+- Numerical verification and determinism check wired into `run-gpu`-gated CI jobs
+
 ## [0.5.1] — 2026-07-20
 
 ### Fixed

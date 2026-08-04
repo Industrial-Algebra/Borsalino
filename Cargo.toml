@@ -1,6 +1,6 @@
 [package]
 name = "borsalino"
-version = "0.5.1"
+version = "0.6.0"
 edition = "2024"
 rust-version = "1.85"
 description = "Thin GPU compute abstraction — Metal and Vulkan backends for Industrial Algebra"
@@ -40,3 +40,11 @@ ash = { version = "0.38", optional = true }
 
 [dev-dependencies]
 rand = "0.8"
+
+[[example]]
+name = "numerical_verification"
+required-features = ["verify"]
+
+[[example]]
+name = "determinism_check"
+required-features = ["verify"]
