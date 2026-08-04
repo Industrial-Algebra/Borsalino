@@ -49,7 +49,10 @@ fn main() {
     println!("{result:#?}");
 
     if result.is_deterministic() {
-        println!("✅ PASS: kernel is deterministic ({} identical runs)", result.trials);
+        println!(
+            "✅ PASS: kernel is deterministic ({} identical runs)",
+            result.trials
+        );
     } else {
         println!(
             "❌ FAIL: kernel is nondeterministic ({}% byte disagreement)",
