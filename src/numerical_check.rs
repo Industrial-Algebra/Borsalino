@@ -190,6 +190,20 @@ pub struct MatmulReference {
     pub n: usize,
 }
 
+/// Reference for the IA geometric product kernel (5D Geometric Algebra).
+///
+/// Computes `c = a * b` where `a` and `b` are multivectors with `blades`
+/// components. The sign table is computed independently from the algebraic
+/// structure of Cl(n,0) — if the WGSL kernel's sign table has a bug, this
+/// reference will catch it.
+///
+/// Bilinear with binary {0,1} inputs — exact-match protocol applies.
+#[derive(Debug, Clone)]
+pub struct GeometricProductReference {
+    /// Number of blades (32 for 5D GA, 2^n for n-dimensional GA).
+    pub blades: usize,
+}
+
 // ── Trait implementations ──────────────────────────────────────────
 
 impl NumericalReference for AddOneReference {
@@ -284,6 +298,74 @@ impl NumericalReference for MatmulReference {
                     sum += a[i * self.k + k] as f32 * b[k * self.n + j] as f32;
                 }
                 c[i * self.n + j] = sum;
+            }
+        }
+        c
+    }
+}
+
+// ── Geometric product sign table (independent computation) ─────────
+
+/// Compute the output blade index for the geometric product of two basis
+/// blades.
+///
+/// In Cl(n,0), the product of blade `i` and blade `j` is the blade
+/// indexed by the symmetric difference (XOR) of their basis vector sets.
+fn blade_product_output(i: usize, j: usize) -> usize {
+    i ^ j
+}
+
+/// Compute the sign (+1 or -1) for the geometric product of two basis
+/// blades.
+///
+/// The sign is `(-1)^s` where `s` is the number of basis vector swaps
+/// needed to bring the common factors into cancellation position.
+/// Specifically, `s` counts pairs `(a, b)` where bit `a` is set in `i`,
+/// bit `b` is set in `j`, and `a > b`.
+fn blade_product_sign(i: usize, j: usize) -> i8 {
+    let mut swaps = 0u32;
+    let mut remaining_i = i;
+    while remaining_i != 0 {
+        let a = remaining_i.trailing_zeros();
+        remaining_i &= remaining_i - 1;
+        // Count bits set in j at positions below a
+        let mask = (1usize << a) - 1;
+        swaps += (j & mask).count_ones();
+    }
+    if swaps % 2 == 0 { 1 } else { -1 }
+}
+
+impl NumericalReference for GeometricProductReference {
+    fn generate_inputs(
+        &self,
+        _trial_idx: u32,
+        cfg: &ExactMatchConfig,
+        rng: &mut dyn rand::RngCore,
+    ) -> (Vec<Vec<u8>>, Vec<usize>) {
+        let a = sample_binary_bytes(self.blades, cfg.p_zero, rng);
+        let b = sample_binary_bytes(self.blades, cfg.p_zero, rng);
+        let sizes = vec![self.blades, self.blades];
+        (vec![a, b], sizes)
+    }
+
+    fn compute_reference(&self, inputs: &[Vec<u8>], input_sizes: &[usize]) -> Vec<f32> {
+        debug_assert_eq!(inputs.len(), 2);
+        debug_assert_eq!(input_sizes[0], self.blades);
+        debug_assert_eq!(input_sizes[1], self.blades);
+        let a = &inputs[0];
+        let b = &inputs[1];
+        let mut c = vec![0.0f32; self.blades];
+        for (i, &ai) in a.iter().enumerate() {
+            if ai == 0 {
+                continue;
+            }
+            for (j, &bj) in b.iter().enumerate() {
+                if bj == 0 {
+                    continue;
+                }
+                let out = blade_product_output(i, j);
+                let sign = blade_product_sign(i, j);
+                c[out] += sign as f32 * ai as f32 * bj as f32;
             }
         }
         c
@@ -564,5 +646,75 @@ mod tests {
         for &byte in &inputs[0] {
             assert!(byte == 0 || byte == 1, "non-binary value: {byte}");
         }
+    }
+
+    // ── Geometric product reference ──────────────────────────────
+
+    #[test]
+    fn gp_scalar_times_scalar_is_scalar() {
+        // 1D GA (2 blades): blade 0 = scalar, blade 1 = vector e0
+        // e0 * e0 = 1 (scalar), 1 * 1 = 1, 1 * e0 = e0, e0 * 1 = e0
+        let reference = GeometricProductReference { blades: 2 };
+        // a = [1, 0] (scalar 1), b = [1, 0] (scalar 1)
+        let inputs = vec![vec![1u8, 0], vec![1u8, 0]];
+        let sizes = vec![2, 2];
+        let output = reference.compute_reference(&inputs, &sizes);
+        // 1 * 1 = 1 → c[0] = 1
+        assert_eq!(output, vec![1.0, 0.0]);
+    }
+
+    #[test]
+    fn gp_vector_times_vector_is_scalar() {
+        // e0 * e0 = 1 (blade 0), sign = -1 (one swap)
+        let reference = GeometricProductReference { blades: 2 };
+        // a = [0, 1] (vector e0), b = [0, 1] (vector e0)
+        let inputs = vec![vec![0u8, 1], vec![0u8, 1]];
+        let sizes = vec![2, 2];
+        let output = reference.compute_reference(&inputs, &sizes);
+        // e0 * e0: output blade = 1 XOR 1 = 0 (scalar)
+        // sign: pairs where bit a in i > bit b in j: i=1 (bit 0), j=1 (bit 0)
+        // bit 0 > bit 0? No → 0 swaps → sign +1
+        assert_eq!(output[0], 1.0); // scalar component
+    }
+
+    #[test]
+    fn gp_generates_binary_multivectors() {
+        let reference = GeometricProductReference { blades: 32 };
+        let cfg = ExactMatchConfig::default();
+        let mut rng = rand::thread_rng();
+
+        let (inputs, sizes) = reference.generate_inputs(0, &cfg, &mut rng);
+
+        assert_eq!(inputs.len(), 2); // two multivectors
+        assert_eq!(sizes[0], 32);
+        assert_eq!(sizes[1], 32);
+        for buf in &inputs {
+            for &byte in buf {
+                assert!(byte == 0 || byte == 1, "non-binary value: {byte}");
+            }
+        }
+    }
+
+    #[test]
+    fn gp_blade_product_output_is_xor() {
+        // Output blade = XOR of input blades
+        assert_eq!(blade_product_output(0b101, 0b011), 0b110);
+        assert_eq!(blade_product_output(0, 0), 0);
+        assert_eq!(blade_product_output(0b11111, 0b11111), 0);
+    }
+
+    #[test]
+    fn gp_blade_product_sign_antisymmetric_for_vectors() {
+        // e1 * e2 = +e12 (blade 0b110)
+        // e2 * e1 = -e12 (blade 0b110)
+        // i=2 (bit 1), j=4 (bit 2): a=1, b=2, a>b → 1 swap → sign +1
+        let s12 = blade_product_sign(2, 4);
+        // i=4 (bit 2), j=2 (bit 1): a=2, b=1, a>b? No, 2>1 yes
+        // Wait: i=4 → bit 2, j=2 → bit 1
+        // mask = (1 << 2) - 1 = 0b11, j & mask = 0b10 & 0b11 = 0b10 → 1 one → 1 swap
+        let s21 = blade_product_sign(4, 2);
+        // They should be opposite signs
+        assert_eq!(s12, -s21);
+        assert_eq!(s12 * s21, -1);
     }
 }
