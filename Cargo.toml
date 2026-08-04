@@ -9,6 +9,10 @@ repository = "https://github.com/industrial-algebra/Borsalino"
 keywords = ["gpu", "compute", "metal", "vulkan", "shader"]
 categories = ["hardware-support", "mathematics"]
 
+# Register Kani verifier cfg flag (set by `cargo kani`)
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
+
 [features]
 default = []
 metal = []
