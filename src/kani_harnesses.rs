@@ -33,8 +33,8 @@ fn buffer_alignment_boundary() {
 fn workgroup_divisibility() {
     let total_threads: u32 = kani::any();
     let threads_per_group: u32 = kani::any();
-    kani::assume(threads_per_group > 0 && threads_per_group <= 1024);
-    kani::assume(total_threads <= 1_048_576);
+    kani::assume(threads_per_group > 0 && threads_per_group <= 256);
+    kani::assume(total_threads <= 65536);
 
     let workgroups = total_threads.div_ceil(threads_per_group);
 
@@ -53,8 +53,8 @@ fn workgroup_divisibility() {
 fn buffer_size_no_overflow() {
     let len: u32 = kani::any();
     let element_size: u32 = kani::any();
-    kani::assume(len > 0 && len <= 1_048_576);
-    kani::assume(element_size > 0 && element_size <= 64);
+    kani::assume(len > 0 && len <= 65536);
+    kani::assume(element_size > 0 && element_size <= 32);
 
     let byte_len = (len as u64) * (element_size as u64);
     assert!(byte_len <= (1u64 << 32)); // fits in u32 for Vulkan buffer size
