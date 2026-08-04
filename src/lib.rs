@@ -104,6 +104,11 @@ pub mod epoch;
 #[cfg(kani)]
 mod kani_harnesses;
 
+/// Statistical determinism verification for GPU kernels.
+///
+/// See [`determinism`] module docs for the determinism protocol.
+pub mod determinism;
+
 /// Reusable WGSL kernels for the Industrial Algebra ecosystem.
 ///
 /// These constants provide ready-to-compile WGSL source for common
@@ -691,6 +696,34 @@ impl DispatchConfig {
         }
         Ok(WorkgroupProof { _private: () })
     }
+
+    /// Verify with explicit device limits.
+    ///
+    /// Checks:
+    /// - workgroup divisibility (`total_threads % threads_per_group == 0`)
+    /// - dispatch within device limits (workgroup count ≤ `max_workgroups`)
+    ///
+    /// Use this when you know the device's `max_compute_work_group_count`
+    /// (queried from the backend at init time).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GpuError::InvalidBinding`] if divisibility fails or if the
+    /// computed workgroup count exceeds `max_workgroups`.
+    pub fn verify_with_limits(self, max_workgroups: u32) -> Result<WorkgroupProof> {
+        // Existing divisibility check
+        self.verify()?;
+
+        // New: dispatch limit check
+        let workgroups = self.total_threads / self.threads_per_group;
+        if workgroups > max_workgroups {
+            return Err(GpuError::InvalidBinding {
+                message: format!("workgroups ({workgroups}) exceeds device max ({max_workgroups})"),
+            });
+        }
+
+        Ok(WorkgroupProof { _private: () })
+    }
 }
 
 // ── Stub backend (compile-time sentinel) ──────────────────────────
@@ -846,5 +879,35 @@ mod tests {
         assert_eq!(tracker.in_flight(), 1);
         tracker.end_dispatch();
         assert!(tracker.is_quiescent());
+    }
+
+    #[test]
+    fn verify_with_limits_passes_when_within_bounds() {
+        let config = DispatchConfig {
+            total_threads: 1024,
+            threads_per_group: 256,
+        };
+        // 4 workgroups, max 65535 — should pass
+        assert!(config.verify_with_limits(65535).is_ok());
+    }
+
+    #[test]
+    fn verify_with_limits_fails_when_exceeds_max() {
+        let config = DispatchConfig {
+            total_threads: 1_048_576,
+            threads_per_group: 1,
+        };
+        // 1_048_576 workgroups, max 65535 — should fail
+        assert!(config.verify_with_limits(65535).is_err());
+    }
+
+    #[test]
+    fn verify_with_limits_still_checks_divisibility() {
+        let config = DispatchConfig {
+            total_threads: 1000,
+            threads_per_group: 256,
+        };
+        // Not divisible AND within limits — should fail on divisibility
+        assert!(config.verify_with_limits(65535).is_err());
     }
 }
