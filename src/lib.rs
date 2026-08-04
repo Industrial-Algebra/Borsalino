@@ -82,6 +82,23 @@ pub mod verify;
 #[cfg(feature = "verify")]
 pub mod numerical_check;
 
+/// Kani bounded model-checking harnesses for buffer safety invariants.
+///
+/// These harnesses verify structural properties that hold for all possible
+/// inputs: buffer alignment boundaries, workgroup divisibility, and buffer
+/// size overflow safety. They are compiled only under `cargo kani`.
+///
+/// Run with:
+/// ```sh
+/// cargo kani --features vulkan --harness buffer_alignment_boundary
+/// cargo kani --features vulkan --harness workgroup_divisibility
+/// cargo kani --features vulkan --harness buffer_size_no_overflow
+/// ```
+///
+/// Requires Kani installed: <https://model-checking.github.io/kani/>
+#[cfg(kani)]
+mod kani_harnesses;
+
 /// Reusable WGSL kernels for the Industrial Algebra ecosystem.
 ///
 /// These constants provide ready-to-compile WGSL source for common
