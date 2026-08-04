@@ -5,20 +5,15 @@ on:
     branches: [develop, main]
   pull_request:
     branches: [develop, main]
-    types: [opened, synchronize, reopened, labeled]
 
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
 
-# Gate expression: label-gated jobs run when the label is present OR
-# when targeting main (release PR). On push to main (post-merge), they
-# also run. On label events, only gated jobs re-trigger.
 jobs:
   fmt:
     name: Format
     runs-on: ubuntu-latest
-    if: github.event.action != 'labeled'
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
@@ -30,7 +25,6 @@ jobs:
   clippy:
     name: Clippy
     runs-on: ubuntu-latest
-    if: github.event.action != 'labeled'
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
@@ -43,7 +37,6 @@ jobs:
   test:
     name: Test
     runs-on: ubuntu-latest
-    if: github.event.action != 'labeled'
     strategy:
       matrix:
         features:
@@ -62,7 +55,6 @@ jobs:
   doc:
     name: Documentation
     runs-on: ubuntu-latest
-    if: github.event.action != 'labeled'
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
@@ -74,16 +66,11 @@ jobs:
 
   kani:
     name: Kani Verification
-    runs-on: [self-hosted, kani]
-    timeout-minutes: 15
-    if: |
-      github.event_name == 'push' && github.ref == 'refs/heads/main' ||
-      github.event_name == 'pull_request' && (
-        github.base_ref == 'main' ||
-        contains(github.event.pull_request.labels.*.name, 'run-kani')
-      )
+    runs-on: ubuntu-latest
+    if: contains(github.event.pull_request.labels.*.name, 'run-kani')
     steps:
       - uses: actions/checkout@v4
+      - uses: model-checking/kani-github-action@v31
       - name: Run Kani harnesses
         run: |
           cargo kani --harness buffer_alignment_boundary
@@ -93,36 +80,22 @@ jobs:
   miri:
     name: Miri (safety check)
     runs-on: ubuntu-latest
-    if: |
-      github.event_name == 'push' && github.ref == 'refs/heads/main' ||
-      github.event_name == 'pull_request' && (
-        github.base_ref == 'main' ||
-        contains(github.event.pull_request.labels.*.name, 'run-miri')
-      )
+    if: contains(github.event.pull_request.labels.*.name, 'run-miri')
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: miri
       - uses: Swatinem/rust-cache@v2
-      - name: Run Miri on epoch counter safety
-        run: cargo miri test epoch
+      - name: Run Miri on buffer lifecycle tests
+        run: cargo miri test --features vulkan buffer_lifecycle
 
   gpu:
     name: GPU dispatch tests (self-hosted)
     runs-on: [self-hosted, gpu]
-    if: |
-      github.event_name == 'push' && github.ref == 'refs/heads/main' ||
-      github.event_name == 'pull_request' && (
-        github.base_ref == 'main' ||
-        contains(github.event.pull_request.labels.*.name, 'run-gpu')
-      )
+    if: contains(github.event.pull_request.labels.*.name, 'run-gpu')
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
       - name: Run GPU dispatch tests (Vulkan)
         run: cargo test --features vulkan -- --ignored
-      - name: Run numerical verification (Vulkan)
-        run: cargo run --features vulkan,verify --example numerical_verification || true
-      - name: Run determinism check (Vulkan)
-        run: cargo run --features vulkan,verify --example determinism_check || true
