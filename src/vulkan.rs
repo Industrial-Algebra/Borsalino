@@ -86,6 +86,8 @@ pub struct VulkanBackend {
     timestamp_pool: Option<vk::QueryPool>,
     /// GPU timestamp period in nanoseconds (from device limits).
     timestamp_period: f32,
+    /// Epoch tracker for GC safety — counts in-flight dispatches.
+    epoch: crate::epoch::GpuEpochTracker,
 }
 
 impl VulkanBackend {
@@ -243,6 +245,10 @@ fn drop_vulkan_pipeline(raw: *mut std::ffi::c_void) {
 struct VulkanPulseInner {
     fence: vk::Fence,
     device: ash::Device,
+    epoch: *const crate::epoch::GpuEpochTracker,
+    /// Tracks whether end_dispatch has been called (prevents double-decrement
+    /// when wait() + drop() both fire).
+    epoch_completed: std::sync::atomic::AtomicBool,
 }
 
 fn wait_vulkan_pulse(raw: *mut std::ffi::c_void) {
@@ -254,6 +260,16 @@ fn wait_vulkan_pulse(raw: *mut std::ffi::c_void) {
                     .device
                     .wait_for_fences(std::slice::from_ref(&inner.fence), true, u64::MAX);
         }
+        // Mark this dispatch as complete (balances the begin_dispatch at
+        // dispatch_async submit time). Only decrements once even if wait()
+        // is called multiple times.
+        if !inner.epoch.is_null()
+            && !inner
+                .epoch_completed
+                .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            unsafe { (*inner.epoch).end_dispatch() };
+        }
     }
 }
 
@@ -261,6 +277,21 @@ fn drop_vulkan_pulse(raw: *mut std::ffi::c_void) {
     if !raw.is_null() {
         let inner = unsafe { Box::from_raw(raw as *mut VulkanPulseInner) };
         unsafe {
+            // Ensure GPU completes before destroying fence — a fence
+            // that is still in use must not be destroyed.
+            let _ =
+                inner
+                    .device
+                    .wait_for_fences(std::slice::from_ref(&inner.fence), true, u64::MAX);
+            // Balance the begin_dispatch from dispatch_async (only if
+            // wait() hasn't already done so).
+            if !inner.epoch.is_null()
+                && !inner
+                    .epoch_completed
+                    .swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                (*inner.epoch).end_dispatch();
+            }
             inner.device.destroy_fence(inner.fence, None);
         }
     }
@@ -821,6 +852,7 @@ impl GpuBackend for VulkanBackend {
             transfer_command_pool,
             timestamp_pool,
             timestamp_period,
+            epoch: crate::epoch::GpuEpochTracker::new(),
         })
     }
 
@@ -1437,6 +1469,8 @@ impl GpuBackend for VulkanBackend {
 
         let submit_info = vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&cmd));
 
+        self.epoch.begin_dispatch();
+
         unsafe {
             self.device
                 .queue_submit(self.queue, &[submit_info], vk::Fence::null())
@@ -1450,6 +1484,8 @@ impl GpuBackend for VulkanBackend {
                     message: format!("vkQueueWaitIdle: {e}"),
                 })?;
         }
+
+        self.epoch.end_dispatch();
 
         // ── Cleanup ───────────────────────────────────────────────
 
@@ -1589,6 +1625,8 @@ impl GpuBackend for VulkanBackend {
 
         let submit_info = vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&cmd));
 
+        self.epoch.begin_dispatch();
+
         unsafe {
             self.device
                 .queue_submit(self.queue, &[submit_info], vk::Fence::null())
@@ -1602,6 +1640,8 @@ impl GpuBackend for VulkanBackend {
                     message: format!("vkQueueWaitIdle: {e}"),
                 })?;
         }
+
+        self.epoch.end_dispatch();
 
         // ── Cleanup ─────────────────────────────────────────────
 
@@ -1729,6 +1769,8 @@ impl GpuBackend for VulkanBackend {
 
         let submit_info = vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&cmd));
 
+        self.epoch.begin_dispatch();
+
         unsafe {
             self.device
                 .queue_submit(self.queue, &[submit_info], fence)
@@ -1746,6 +1788,8 @@ impl GpuBackend for VulkanBackend {
         let inner = Box::new(VulkanPulseInner {
             fence,
             device: self.device.clone(),
+            epoch: &self.epoch,
+            epoch_completed: std::sync::atomic::AtomicBool::new(false),
         });
 
         Ok(Pulse {
@@ -1900,6 +1944,10 @@ impl GpuBackend for VulkanBackend {
             // Convert ticks to nanoseconds
             Ok((ts_data[0] as f64 * self.timestamp_period as f64) as u64)
         }
+    }
+
+    fn in_flight(&self) -> u64 {
+        self.epoch.in_flight()
     }
 }
 

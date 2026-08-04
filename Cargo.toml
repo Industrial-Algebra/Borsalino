@@ -1,6 +1,6 @@
 [package]
 name = "borsalino"
-version = "0.5.1"
+version = "0.6.0"
 edition = "2024"
 rust-version = "1.85"
 description = "Thin GPU compute abstraction — Metal and Vulkan backends for Industrial Algebra"
@@ -8,6 +8,10 @@ license = "Apache-2.0"
 repository = "https://github.com/industrial-algebra/Borsalino"
 keywords = ["gpu", "compute", "metal", "vulkan", "shader"]
 categories = ["hardware-support", "mathematics"]
+
+# Register Kani verifier cfg flag (set by `cargo kani`)
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
 
 [features]
 default = []
@@ -36,3 +40,11 @@ ash = { version = "0.38", optional = true }
 
 [dev-dependencies]
 rand = "0.8"
+
+[[example]]
+name = "numerical_verification"
+required-features = ["verify"]
+
+[[example]]
+name = "determinism_check"
+required-features = ["verify"]
