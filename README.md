@@ -386,3 +386,4 @@ cargo test --features metal
 Apache-2.0. Copyright (C) 2026 Industrial Algebra.
 
 Contributors must sign the [CLA](https://github.com/Industrial-Algebra/.github/blob/main/CLA.md).
+
