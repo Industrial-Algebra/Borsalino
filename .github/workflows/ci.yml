@@ -59,6 +59,22 @@ jobs:
       - name: Run tests ${{ matrix.features }}
         run: cargo test ${{ matrix.features }}
 
+  test-macos:
+    name: Test (macOS Apple Silicon, self-hosted)
+    runs-on: [self-hosted, macOS, ARM64]
+    timeout-minutes: 45
+    # Public repo + self-hosted runner: same-repo heads only (agent
+    # branches), never fork PRs. See Holmberg docs/ci-runners.md.
+    if: |
+      github.event.action != 'labeled' &&
+      (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+      - name: Run tests (metal)
+        run: cargo test --features metal
+
   doc:
     name: Documentation
     runs-on: ubuntu-latest
