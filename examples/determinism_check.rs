@@ -8,16 +8,21 @@
 //! ```sh
 //! cargo run --features vulkan,verify --example determinism_check
 //! ```
+//!
+//! **Exit codes are the contract**: 0 = deterministic, 1 = NOT
+//! deterministic or could not run.
+
+use std::process::ExitCode;
 
 use borsalino::determinism::{DeterminismResult, verify_deterministic};
 use borsalino::{GpuBackend, init};
 
-fn main() {
+fn main() -> ExitCode {
     let gpu = match init() {
         Ok(g) => g,
         Err(e) => {
-            eprintln!("No GPU backend available: {e}");
-            return;
+            eprintln!("determinism_check: no GPU backend available: {e}");
+            return ExitCode::FAILURE;
         }
     };
 
@@ -53,10 +58,12 @@ fn main() {
             "✅ PASS: kernel is deterministic ({} identical runs)",
             result.trials
         );
+        ExitCode::SUCCESS
     } else {
         println!(
             "❌ FAIL: kernel is nondeterministic ({}% byte disagreement)",
             (result.disagreement_fraction * 100.0) as u32
         );
+        ExitCode::FAILURE
     }
 }

@@ -2,6 +2,55 @@
 
 All notable changes to Borsalino are documented in this file.
 
+## [0.7.0] — Unreleased
+
+### Fixed — the numerical verification driver could not verify (2026-09-29 research dive)
+
+The v0.6.0 "Comprehensive GPU Verification" release shipped a
+`verify_numerical` that was structurally unable to verify anything:
+
+- **No output buffer was ever allocated.** The driver uploaded one buffer
+  per input, dispatched, then read back `gpu_buffers.last()` — the last
+  *input*. Kernels writing output to a later binding (all of them —
+  `add_one` writes binding 1, the geometric product writes binding 3)
+  wrote into stale/null descriptors under the Vulkan backend's universal
+  layout.
+- **Binary inputs were uploaded as raw u8 bytes** while kernels read
+  `array<f32>` — a `0x01` byte is a denormal, not `1.0`.
+- **The geometric product's sign table was never supplied** — the kernel's
+  binding 0 got an operand multivector instead.
+- **Three stacked silence mechanisms** meant none of this could fail CI:
+  `|| true` on the verification steps, no `exit(1)` on FAIL in the
+  examples, and exit-0 early-returns when no GPU was present.
+
+Fixes:
+
+- **`NumericalReference` redesign (breaking)** — the reference is now the
+  kernel's metadata: `generate_inputs` returns every input binding in
+  order (sign table included) as `Vec<f32>` storage, `output_len` gives
+  the f32 element count, `workgroups` sizes the dispatch. The redundant
+  `input_sizes` half-tuple is gone.
+- **Driver wiring** — allocates the output via `create_buffer_uninit`,
+  chains inputs + output, dispatches with the reference's workgroups,
+  reads back the **output** buffer.
+- **Recording-fake backend** (`#[cfg(test)]`) — the driver's wiring is now
+  testable without hardware: dispatch bindings, workgroups, and the
+  read-back identity are all asserted. Pattern borrowed from Baedeker's
+  `baedeker_core::runtime::verify`.
+- **First `#[ignore]`d GPU tests in the repo** — the CI GPU job's
+  `-- --ignored` step previously selected nothing. Now:
+  `gp_kernel_verifies_on_hardware` (verified end-to-end on an RTX 5080 —
+  the first recorded PASS of this protocol anywhere) and
+  `gp_mutation_fails_on_hardware` (a sign-flipped kernel must FAIL).
+- **Examples gate on exit codes** — 0 = verified, 1 = FAILED or could not
+  run. A verification tool that cannot fail is not a verification tool.
+- **CI gates for real** — both `|| true`s deleted from the self-hosted GPU
+  job.
+
+### Changed
+- `serial_test` added as a dev-dependency (GPU tests must not race the
+  Vulkan loader, matching Zunesha's discipline).
+
 ## [0.6.0] — 2026-08-04
 
 ### Added — GC Safety (Pin-and-Track)

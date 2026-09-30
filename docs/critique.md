@@ -39,6 +39,10 @@
 | **Limited testing** | The repository contains only a few unit tests.  No stress tests, no CI for all three platforms (macOS, Linux, Windows). |
 | **No benchmark data** | No published performance numbers; it's unclear how the abstraction overhead compares to raw Metal/Vulkan usage. |
 | **Verification optional** | The `verify` feature is powerful but optional; without it you lose the formal safety guarantees that the `karpal` ecosystem provides. |
+| **`verify_numerical` could not verify (found 2026-09-29, fixed in 0.7.0)** | The v0.6.0 driver never allocated an output buffer (read back the last *input*), uploaded binary inputs as u8 bytes against f32-reading kernels (denormals), omitted the GP sign table, and could not fail CI (`|| true` + no exit code + exit-0 no-GPU). Three stacked silence layers hid all of it. Fixed with the reference-as-metadata redesign, a recording-fake driver test, mutation tests, exit-code gating, and real `#[ignore]`d GPU tests — see CHANGELOG 0.7.0. |
+| **Verdicts lived in no type** | Even post-fix, a numerical verdict is a runtime `NumericalCheckResult` value — printed by examples, gated by exit codes. The doctrine-shaped next step (`Proven<NumericallyCorrect, Pipeline>` carried by dispatch itself) is unbuilt anywhere in the ecosystem (2026-09-29 dive §4). |
+| **karpal-verify pinned at 0.6.1** | The registry is at 0.9.1 (2026-09-13); the obligation-bundle API has moved. Any verification-stack work starts with a port. |
+| **`compare_outputs` duplicated in Baedeker** | The exact-match core now exists in both `borsalino::numerical_check` and `baedeker_core::runtime::verify`. Where the canonical core should live is unresolved. |
 | **No async or multi-GPU support** | The design assumes a single device and blocks until completion; scaling to multi-GPU or multi-threaded dispatches would require substantial changes. |
 
 ---
