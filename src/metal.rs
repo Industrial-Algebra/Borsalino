@@ -382,8 +382,7 @@ impl GpuBackend for MetalBackend {
                     let desc: *mut c_void =
                         msg_send![err as *const objc::runtime::Object, localizedDescription];
                     let s = nsstring_read(desc);
-                    // (err is an autoreleased out-param — the pool owns it)
-                    let _: () = 
+                    // (err/perr is an autoreleased out-param — the pool owns it)
                     s
                 } else {
                     "unknown compilation error".into()
@@ -423,8 +422,7 @@ impl GpuBackend for MetalBackend {
                 let msg = if !perr.is_null() {
                     let desc: *mut c_void = msg_send![obj(perr), localizedDescription];
                     let s = nsstring_read(desc);
-                    // (err is an autoreleased out-param — the pool owns it)
-                    let _: () = 
+                    // (err/perr is an autoreleased out-param — the pool owns it)
                     s
                 } else {
                     "unknown pipeline error".into()
@@ -796,8 +794,7 @@ impl MetalBackend {
                 let msg = if !err.is_null() {
                     let desc: *mut c_void = msg_send![err as *const Object, localizedDescription];
                     let s = nsstring_read(desc);
-                    // (err is an autoreleased out-param — the pool owns it)
-                    let _: () = 
+                    // (err/perr is an autoreleased out-param — the pool owns it)
                     s
                 } else {
                     "unknown compilation error".into()
@@ -835,8 +832,7 @@ impl MetalBackend {
                 let msg = if !perr.is_null() {
                     let desc: *mut c_void = msg_send![perr as *const Object, localizedDescription];
                     let s = nsstring_read(desc);
-                    // (err is an autoreleased out-param — the pool owns it)
-                    let _: () = 
+                    // (err/perr is an autoreleased out-param — the pool owns it)
                     s
                 } else {
                     "unknown pipeline error".into()
