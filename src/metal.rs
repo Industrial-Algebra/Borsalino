@@ -214,8 +214,10 @@ fn fix_device_line(line: &str, mutable: bool) -> Option<String> {
 pub struct MetalBackend {
     device: MetalDevice,
     queue: MetalQueue,
-    /// Epoch tracker for GC safety — counts in-flight dispatches.
-    epoch: crate::epoch::GpuEpochTracker,
+    /// Epoch tracker for GC safety — counts in-flight dispatches. Shared
+    /// with async `Pulse`s so they cannot outlive it (review finding:
+    /// a raw `&'a GpuEpochTracker` in `MetalPulseInner` could dangle).
+    epoch: std::sync::Arc<crate::epoch::GpuEpochTracker>,
 }
 
 impl MetalBackend {
@@ -225,7 +227,9 @@ impl MetalBackend {
 /// Inner state for an async Metal dispatch [`Pulse`].
 struct MetalPulseInner {
     cmd: *mut std::ffi::c_void,
-    epoch: *const crate::epoch::GpuEpochTracker,
+    /// Owned share of the backend's tracker — the pulse may outlive the
+    /// backend, so it must not borrow it (P1 review finding).
+    epoch: std::sync::Arc<crate::epoch::GpuEpochTracker>,
     /// Tracks whether end_dispatch has been called (prevents double-decrement
     /// when wait() + drop() both fire).
     epoch_completed: std::sync::atomic::AtomicBool,
@@ -236,12 +240,11 @@ fn wait_metal_pulse(raw: *mut std::ffi::c_void) {
         let inner = unsafe { &*(raw as *const MetalPulseInner) };
         let _: () = unsafe { msg_send![obj(inner.cmd), waitUntilCompleted] };
         // Balance the begin_dispatch from dispatch_async.
-        if !inner.epoch.is_null()
-            && !inner
-                .epoch_completed
-                .swap(true, std::sync::atomic::Ordering::SeqCst)
+        if !inner
+            .epoch_completed
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
         {
-            unsafe { (*inner.epoch).end_dispatch() };
+            inner.epoch.end_dispatch();
         }
     }
 }
@@ -254,12 +257,11 @@ fn drop_metal_pulse(raw: *mut std::ffi::c_void) {
             let _: () = msg_send![obj(inner.cmd), waitUntilCompleted];
             // Balance the begin_dispatch from dispatch_async (only if
             // wait() hasn't already done so).
-            if !inner.epoch.is_null()
-                && !inner
-                    .epoch_completed
-                    .swap(true, std::sync::atomic::Ordering::SeqCst)
+            if !inner
+                .epoch_completed
+                .swap(true, std::sync::atomic::Ordering::SeqCst)
             {
-                (*inner.epoch).end_dispatch();
+                inner.epoch.end_dispatch();
             }
             let _: () = msg_send![obj(inner.cmd), release];
         }
@@ -292,7 +294,7 @@ impl GpuBackend for MetalBackend {
             queue: MetalQueue {
                 ptr: NonNull::new(queue_ptr).unwrap(),
             },
-            epoch: crate::epoch::GpuEpochTracker::new(),
+            epoch: std::sync::Arc::new(crate::epoch::GpuEpochTracker::new()),
         })
     }
 
@@ -524,7 +526,12 @@ impl GpuBackend for MetalBackend {
         workgroups: (u32, u32, u32),
         _threads_per_group: (u32, u32, u32),
     ) -> Result<()> {
-        unsafe {
+        // Scoped autorelease pool: the command buffer and encoder are
+        // autoreleased (+0) objc objects; without a pool on a plain Rust
+        // worker thread they would never be reclaimed (and with one owned
+        // by someone else, reclaimed at that pool's whim). Draining per
+        // dispatch bounds them deterministically (P2 review finding).
+        objc::rc::autoreleasepool(|| unsafe {
             let cmd: *mut c_void = msg_send![obj(self.queue.ptr.as_ptr()), commandBuffer];
             if cmd.is_null() {
                 return Err(GpuError::DispatchFailed {
@@ -570,13 +577,13 @@ impl GpuBackend for MetalBackend {
 
             self.epoch.end_dispatch();
 
-            // `commandBuffer` returns an autoreleased object — the pool
-            // owns it; releasing here would double-free at pool drain
-            // (SIGSEGV on any thread with an autorelease pool: the test
-            // harness, real apps). Found live on the Apple Silicon runner.
-        }
+            // `commandBuffer` returns an autoreleased object — this pool
+            // owns it; no explicit release (the old release was the
+            // over-release that SIGSEGV'd at drain).
+        })
 
-        Ok(())
+        // The sync path waits for completion inside the pool, so nothing
+        // escapes it.
     }
 
     fn dispatch_async(
@@ -585,7 +592,11 @@ impl GpuBackend for MetalBackend {
         buffers: &[&GpuBuffer],
         workgroups: (u32, u32, u32),
     ) -> Result<Pulse> {
-        unsafe {
+        // Scoped pool: bounds the encoder and any intermediates. The
+        // command buffer deliberately ESCAPES this pool — the explicit
+        // retain below (+1) owns it past the drain, balanced by the
+        // release in wait_metal_pulse / drop_metal_pulse.
+        objc::rc::autoreleasepool(|| unsafe {
             let cmd: *mut c_void = msg_send![obj(self.queue.ptr.as_ptr()), commandBuffer];
             if cmd.is_null() {
                 return Err(GpuError::DispatchFailed {
@@ -624,15 +635,17 @@ impl GpuBackend for MetalBackend {
 
             let _: () = msg_send![obj(cmd), commit];
 
-            // The command buffer is autoreleased; the Pulse may outlive the
-            // current autorelease pool, so take our own reference. Balanced
-            // by the release in wait_metal_pulse / drop_metal_pulse.
+            // +1 retain: the command buffer escapes the pool scope.
+            // Balanced by the release in wait_metal_pulse /
+            // drop_metal_pulse.
             let _: () = msg_send![obj(cmd), retain];
 
-            // Store command buffer in Pulse; wait+release on demand
+            // Store command buffer in Pulse; wait+release on demand.
+            // The epoch tracker is shared (Arc) — the pulse owns a
+            // reference and cannot dangle if the backend is dropped first.
             let inner = Box::new(MetalPulseInner {
                 cmd,
-                epoch: &self.epoch,
+                epoch: std::sync::Arc::clone(&self.epoch),
                 epoch_completed: std::sync::atomic::AtomicBool::new(false),
             });
 
@@ -641,7 +654,7 @@ impl GpuBackend for MetalBackend {
                 wait_fn: wait_metal_pulse,
                 drop_fn: drop_metal_pulse,
             })
-        }
+        })
     }
 
     fn read_buffer<T: bytemuck::Pod>(&self, buffer: &GpuBuffer) -> Result<Vec<T>> {
@@ -698,7 +711,9 @@ impl GpuBackend for MetalBackend {
             return Ok(());
         }
 
-        unsafe {
+        // Scoped autorelease pool — same ownership discipline as
+        // dispatch_ex (P2 review finding).
+        objc::rc::autoreleasepool(|| unsafe {
             let cmd: *mut c_void = msg_send![obj(self.queue.ptr.as_ptr()), commandBuffer];
             if cmd.is_null() {
                 return Err(GpuError::DispatchFailed {
@@ -756,12 +771,10 @@ impl GpuBackend for MetalBackend {
 
             self.epoch.end_dispatch();
 
-            // `commandBuffer` returns an autoreleased object — the pool
-            // owns it; do not release it here (over-release SIGSEGV at
-            // pool drain — see dispatch_ex).
-        }
+            // autoreleased command buffer — owned by this pool's drain.
+        })
 
-        Ok(())
+        // Sync path: everything completed inside the pool.
     }
 
     fn in_flight(&self) -> u64 {
@@ -862,26 +875,32 @@ impl MetalBackend {
 mod tests {
     use super::*;
 
-    #[test]
-    fn device_init() {
+    /// Acquire a device for tests: skip politely on machines without one,
+    /// but FAIL hard when `BORSALINO_REQUIRE_METAL` is set — the dedicated
+    /// Apple Silicon CI job sets it, so that job can never pass without
+    /// executing real kernels (P2 review finding).
+    fn test_device() -> Option<MetalBackend> {
         match MetalBackend::init() {
-            Ok(_) => {}
-            Err(GpuError::InitFailed(msg)) => {
-                eprintln!("Metal init failed (expected in CI/headless): {msg}");
+            Ok(b) => Some(b),
+            Err(e) => {
+                assert!(
+                    std::env::var("BORSALINO_REQUIRE_METAL").is_err(),
+                    "BORSALINO_REQUIRE_METAL is set but Metal init failed: {e}"
+                );
+                eprintln!("skipping: no Metal device ({e})");
+                None
             }
-            Err(e) => panic!("unexpected error: {e}"),
         }
     }
 
     #[test]
+    fn device_init() {
+        let _backend = test_device();
+    }
+
+    #[test]
     fn add_one_kernel() {
-        let backend = match MetalBackend::init() {
-            Ok(b) => b,
-            Err(_) => {
-                eprintln!("skipping: no Metal device");
-                return;
-            }
-        };
+        let Some(backend) = test_device() else { return };
 
         let wgsl = r#"
             @group(0) @binding(0) var<storage, read> input: array<f32>;
@@ -904,26 +923,14 @@ mod tests {
         let result: Vec<f32> = backend.read_buffer(&output).unwrap();
         assert_eq!(result, vec![2.0, 3.0, 4.0, 5.0]);
 
-        let result: Vec<f32> = backend.read_buffer(&output).unwrap();
-        assert_eq!(result, vec![2.0, 3.0, 4.0, 5.0]);
-
-        // Prevent Drop: known Metal thread-cleanup SIGSEGV in test harness.
-        // Examples (main thread) work correctly without this workaround.
-        std::mem::forget(output);
-        std::mem::forget(input);
-        std::mem::forget(pipeline);
-        std::mem::forget(backend);
+        // Normal destruction: with the ownership fixes (scoped pools, no
+        // over-releases) the drop path is part of what this test verifies
+        // (P2 review finding — the mem::forgets were the old workaround).
     }
 
     #[test]
     fn vector_scale_1024() {
-        let backend = match MetalBackend::init() {
-            Ok(b) => b,
-            Err(_) => {
-                eprintln!("skipping: no Metal device");
-                return;
-            }
-        };
+        let Some(backend) = test_device() else { return };
 
         let wgsl = r#"
             @group(0) @binding(0) var<storage, read> input: array<f32>;
@@ -956,9 +963,85 @@ mod tests {
             );
         }
 
-        std::mem::forget(output);
-        std::mem::forget(input);
-        std::mem::forget(pipeline);
-        std::mem::forget(backend);
+        // Normal destruction — see add_one_kernel.
+    }
+
+    /// Regression (P2 review finding): an async `Pulse` must survive an
+    /// autorelease-pool drain after `dispatch_async`. The command buffer
+    /// escapes the pool via its explicit retain; the epoch tracker is a
+    /// shared `Arc`, not a borrow of the backend.
+    #[test]
+    fn async_pulse_survives_pool_drain() {
+        let Some(backend) = test_device() else { return };
+
+        let wgsl = r#"
+            @group(0) @binding(0) var<storage, read> input: array<f32>;
+            @group(0) @binding(1) var<storage, read_write> output: array<f32>;
+            @compute @workgroup_size(256)
+            fn add_one(@builtin(global_invocation_id) gid: vec3<u32>) {
+                let i = gid.x;
+                output[i] = input[i] + 1.0;
+            }
+        "#;
+        let pipeline = backend.compile("add_one", wgsl).unwrap();
+        let input = backend.create_buffer(&[1.0f32, 2.0, 3.0, 4.0]).unwrap();
+        let output = backend.create_buffer_uninit::<f32>(4).unwrap();
+
+        // dispatch_async INSIDE a pool scope; the Pulse (retained cmd)
+        // crosses the drain by design.
+        let pulse = objc::rc::autoreleasepool(|| {
+            backend
+                .dispatch_async(&pipeline, &[&input, &output], (1, 1, 1))
+                .unwrap()
+        });
+
+        // Pool has drained. Wait, read back, verify — then normal drops.
+        pulse.wait();
+        let result: Vec<f32> = backend.read_buffer(&output).unwrap();
+        assert_eq!(result, vec![2.0, 3.0, 4.0, 5.0]);
+        drop(pulse);
+    }
+
+    /// Regression (P2 review finding): batch dispatch through
+    /// `dispatch_many` — a single command buffer carrying two encodes,
+    /// verifying the last kernel's output plus normal destruction.
+    #[test]
+    fn dispatch_many_executes_batch() {
+        use crate::DispatchSpec;
+
+        let Some(backend) = test_device() else { return };
+
+        let wgsl = r#"
+            @group(0) @binding(0) var<storage, read> input: array<f32>;
+            @group(0) @binding(1) var<storage, read_write> output: array<f32>;
+            @compute @workgroup_size(256)
+            fn add_one(@builtin(global_invocation_id) gid: vec3<u32>) {
+                let i = gid.x;
+                output[i] = input[i] + 1.0;
+            }
+        "#;
+        let pipeline = backend.compile("add_one", wgsl).unwrap();
+        let input = backend.create_buffer(&[1.0f32, 2.0, 3.0, 4.0]).unwrap();
+        let output = backend.create_buffer_uninit::<f32>(4).unwrap();
+
+        let specs = [
+            DispatchSpec {
+                pipeline: &pipeline,
+                buffers: &[&input, &output],
+                workgroups: (1, 1, 1),
+                threads_per_group: (256, 1, 1),
+            },
+            DispatchSpec {
+                pipeline: &pipeline,
+                buffers: &[&output, &output],
+                workgroups: (1, 1, 1),
+                threads_per_group: (256, 1, 1),
+            },
+        ];
+        backend.dispatch_many(&specs).unwrap();
+
+        // Second spec feeds the first spec's output back through add_one.
+        let result: Vec<f32> = backend.read_buffer(&output).unwrap();
+        assert_eq!(result, vec![3.0, 4.0, 5.0, 6.0]);
     }
 }

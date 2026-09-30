@@ -68,6 +68,10 @@ jobs:
     if: |
       github.event.action != 'labeled' &&
       (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+    env:
+      # The dedicated hardware job must never pass without executing real
+      # Metal kernels: device-init failures hard-fail instead of skipping.
+      BORSALINO_REQUIRE_METAL: "1"
     steps:
       - uses: actions/checkout@v4
       # Self-hosted launchd agents inherit a bare PATH with no nix
