@@ -39,6 +39,7 @@ objc = "0.2"
 ash = { version = "0.38", optional = true }
 
 [dev-dependencies]
+serial_test = "3"
 rand = "0.8"
 
 [[example]]

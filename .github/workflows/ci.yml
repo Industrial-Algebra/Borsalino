@@ -123,6 +123,6 @@ jobs:
       - name: Run GPU dispatch tests (Vulkan)
         run: cargo test --features vulkan -- --ignored
       - name: Run numerical verification (Vulkan)
-        run: cargo run --features vulkan,verify --example numerical_verification || true
+        run: cargo run --features vulkan,verify --example numerical_verification
       - name: Run determinism check (Vulkan)
-        run: cargo run --features vulkan,verify --example determinism_check || true
+        run: cargo run --features vulkan,verify --example determinism_check
