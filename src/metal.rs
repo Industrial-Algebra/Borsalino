@@ -580,6 +580,7 @@ impl GpuBackend for MetalBackend {
             // `commandBuffer` returns an autoreleased object — this pool
             // owns it; no explicit release (the old release was the
             // over-release that SIGSEGV'd at drain).
+            Ok(())
         })
 
         // The sync path waits for completion inside the pool, so nothing
@@ -772,6 +773,7 @@ impl GpuBackend for MetalBackend {
             self.epoch.end_dispatch();
 
             // autoreleased command buffer — owned by this pool's drain.
+            Ok(())
         })
 
         // Sync path: everything completed inside the pool.
