@@ -382,7 +382,8 @@ impl GpuBackend for MetalBackend {
                     let desc: *mut c_void =
                         msg_send![err as *const objc::runtime::Object, localizedDescription];
                     let s = nsstring_read(desc);
-                    let _: () = msg_send![err as *const objc::runtime::Object, release];
+                    // (err is an autoreleased out-param — the pool owns it)
+                    let _: () = 
                     s
                 } else {
                     "unknown compilation error".into()
@@ -422,7 +423,8 @@ impl GpuBackend for MetalBackend {
                 let msg = if !perr.is_null() {
                     let desc: *mut c_void = msg_send![obj(perr), localizedDescription];
                     let s = nsstring_read(desc);
-                    let _: () = msg_send![obj(perr), release];
+                    // (err is an autoreleased out-param — the pool owns it)
+                    let _: () = 
                     s
                 } else {
                     "unknown pipeline error".into()
@@ -436,7 +438,8 @@ impl GpuBackend for MetalBackend {
             }
 
             // Release intermediates (desc may be retained by the pipeline)
-            // let _: () = msg_send![obj(desc), release];
+            // `new` returns a retained object — release our reference.
+            let _: () = msg_send![obj(desc), release];
             let _: () = msg_send![obj(func), release];
             let _: () = msg_send![obj(library), release];
 
@@ -533,7 +536,7 @@ impl GpuBackend for MetalBackend {
 
             let encoder: *mut c_void = msg_send![obj(cmd), computeCommandEncoder];
             if encoder.is_null() {
-                let _: () = msg_send![obj(cmd), release];
+                // cmd is autoreleased — do not release it here.
                 return Err(GpuError::DispatchFailed {
                     message: "failed to create MTLComputeCommandEncoder".into(),
                 });
@@ -569,7 +572,10 @@ impl GpuBackend for MetalBackend {
 
             self.epoch.end_dispatch();
 
-            let _: () = msg_send![obj(cmd), release];
+            // `commandBuffer` returns an autoreleased object — the pool
+            // owns it; releasing here would double-free at pool drain
+            // (SIGSEGV on any thread with an autorelease pool: the test
+            // harness, real apps). Found live on the Apple Silicon runner.
         }
 
         Ok(())
@@ -591,7 +597,7 @@ impl GpuBackend for MetalBackend {
 
             let encoder: *mut c_void = msg_send![obj(cmd), computeCommandEncoder];
             if encoder.is_null() {
-                let _: () = msg_send![obj(cmd), release];
+                // cmd is autoreleased — do not release it here.
                 return Err(GpuError::DispatchFailed {
                     message: "failed to create MTLComputeCommandEncoder".into(),
                 });
@@ -619,6 +625,11 @@ impl GpuBackend for MetalBackend {
             self.epoch.begin_dispatch();
 
             let _: () = msg_send![obj(cmd), commit];
+
+            // The command buffer is autoreleased; the Pulse may outlive the
+            // current autorelease pool, so take our own reference. Balanced
+            // by the release in wait_metal_pulse / drop_metal_pulse.
+            let _: () = msg_send![obj(cmd), retain];
 
             // Store command buffer in Pulse; wait+release on demand
             let inner = Box::new(MetalPulseInner {
@@ -699,7 +710,7 @@ impl GpuBackend for MetalBackend {
 
             let encoder: *mut c_void = msg_send![obj(cmd), computeCommandEncoder];
             if encoder.is_null() {
-                let _: () = msg_send![obj(cmd), release];
+                // cmd is autoreleased — do not release it here.
                 return Err(GpuError::DispatchFailed {
                     message: "failed to create MTLComputeCommandEncoder".into(),
                 });
@@ -747,7 +758,9 @@ impl GpuBackend for MetalBackend {
 
             self.epoch.end_dispatch();
 
-            let _: () = msg_send![obj(cmd), release];
+            // `commandBuffer` returns an autoreleased object — the pool
+            // owns it; do not release it here (over-release SIGSEGV at
+            // pool drain — see dispatch_ex).
         }
 
         Ok(())
@@ -783,7 +796,8 @@ impl MetalBackend {
                 let msg = if !err.is_null() {
                     let desc: *mut c_void = msg_send![err as *const Object, localizedDescription];
                     let s = nsstring_read(desc);
-                    let _: () = msg_send![err as *const Object, release];
+                    // (err is an autoreleased out-param — the pool owns it)
+                    let _: () = 
                     s
                 } else {
                     "unknown compilation error".into()
@@ -821,7 +835,8 @@ impl MetalBackend {
                 let msg = if !perr.is_null() {
                     let desc: *mut c_void = msg_send![perr as *const Object, localizedDescription];
                     let s = nsstring_read(desc);
-                    let _: () = msg_send![perr as *const Object, release];
+                    // (err is an autoreleased out-param — the pool owns it)
+                    let _: () = 
                     s
                 } else {
                     "unknown pipeline error".into()
@@ -834,6 +849,8 @@ impl MetalBackend {
                 });
             }
 
+            // `new` returns a retained object — release our reference.
+            let _: () = msg_send![obj(desc), release];
             let _: () = msg_send![obj(func), release];
             let _: () = msg_send![obj(library), release];
 
