@@ -8,7 +8,7 @@
 //! host memory. A zero-copy GPU buffer backed by GC-managed memory would
 //! dangle if the GC moves the underlying allocation.
 //!
-//! [`GpuEpochTracker`][crate::epoch::GpuEpochTracker] provides an atomic counter
+//! [`GpuEpochTracker`] provides an atomic counter
 //! that is incremented on dispatch and decremented on completion. The WASM
 //! runtime checks
 //! [`is_quiescent`][crate::epoch::GpuEpochTracker::is_quiescent] before
