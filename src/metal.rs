@@ -429,6 +429,9 @@ impl GpuBackend for MetalBackend {
                 } else {
                     "unknown pipeline error".into()
                 };
+                // desc is +1 from `new` — the failure path used to leak
+                // it (review finding). func/library are also +1.
+                let _: () = msg_send![obj(desc), release];
                 let _: () = msg_send![obj(func), release];
                 let _: () = msg_send![obj(library), release];
                 return Err(GpuError::PipelineFailed {
@@ -852,6 +855,9 @@ impl MetalBackend {
                 } else {
                     "unknown pipeline error".into()
                 };
+                // desc is +1 from `new` — the failure path used to leak
+                // it (review finding). func/library are also +1.
+                let _: () = msg_send![obj(desc), release];
                 let _: () = msg_send![obj(func), release];
                 let _: () = msg_send![obj(library), release];
                 return Err(GpuError::PipelineFailed {
@@ -896,11 +902,13 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn device_init() {
         let _backend = test_device();
     }
 
     #[test]
+    #[serial_test::serial]
     fn add_one_kernel() {
         let Some(backend) = test_device() else { return };
 
@@ -911,6 +919,10 @@ mod tests {
             @compute @workgroup_size(256)
             fn add_one(@builtin(global_invocation_id) gid: vec3<u32>) {
                 let i = gid.x;
+                // The pipeline compiles with Unchecked buffer bounds, so
+                // the shader itself must bound its accesses (review
+                // finding: 256 threads over 4 elements read/wrote OOB).
+                if (i >= 4u) { return; }
                 output[i] = input[i] + 1.0;
             }
         "#;
@@ -931,6 +943,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn vector_scale_1024() {
         let Some(backend) = test_device() else { return };
 
@@ -973,6 +986,7 @@ mod tests {
     /// escapes the pool via its explicit retain; the epoch tracker is a
     /// shared `Arc`, not a borrow of the backend.
     #[test]
+    #[serial_test::serial]
     fn async_pulse_survives_pool_drain() {
         let Some(backend) = test_device() else { return };
 
@@ -982,6 +996,10 @@ mod tests {
             @compute @workgroup_size(256)
             fn add_one(@builtin(global_invocation_id) gid: vec3<u32>) {
                 let i = gid.x;
+                // The pipeline compiles with Unchecked buffer bounds, so
+                // the shader itself must bound its accesses (review
+                // finding: 256 threads over 4 elements read/wrote OOB).
+                if (i >= 4u) { return; }
                 output[i] = input[i] + 1.0;
             }
         "#;
@@ -1008,6 +1026,7 @@ mod tests {
     /// `dispatch_many` — a single command buffer carrying two encodes,
     /// verifying the last kernel's output plus normal destruction.
     #[test]
+    #[serial_test::serial]
     fn dispatch_many_executes_batch() {
         use crate::DispatchSpec;
 
@@ -1019,6 +1038,10 @@ mod tests {
             @compute @workgroup_size(256)
             fn add_one(@builtin(global_invocation_id) gid: vec3<u32>) {
                 let i = gid.x;
+                // The pipeline compiles with Unchecked buffer bounds, so
+                // the shader itself must bound its accesses (review
+                // finding: 256 threads over 4 elements read/wrote OOB).
+                if (i >= 4u) { return; }
                 output[i] = input[i] + 1.0;
             }
         "#;
