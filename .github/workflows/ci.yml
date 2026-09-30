@@ -70,6 +70,14 @@ jobs:
       (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
     steps:
       - uses: actions/checkout@v4
+      # Self-hosted launchd agents inherit a bare PATH with no nix
+      # profiles — rustup/cargo would be invisible to the toolchain action
+      # (it would bootstrap rustup.rs, which cannot amend home-manager's
+      # read-only ~/.bash_profile). Prepend the fleet shell paths via
+      # $GITHUB_PATH — portable across the nix-darwin fleet Macs. Remove if
+      # the runner agent ever ships a full PATH (Holmberg module PR #109).
+      - name: Fleet PATH (nix profiles)
+        run: echo "$HOME/.nix-profile/bin:/run/current-system/sw/bin" >> "$GITHUB_PATH"
       - uses: dtolnay/rust-toolchain@nightly
       - uses: Swatinem/rust-cache@v2
       - name: Run tests (metal)
