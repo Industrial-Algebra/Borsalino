@@ -47,13 +47,95 @@ use crate::{
 ///
 /// Available on Linux and Windows with the `vulkan` feature enabled.
 /// Requires a Vulkan 1.3-capable driver with compute support.
-pub struct VulkanBackend {
-    /// Vulkan entry (loader). Kept alive for the lifetime of the instance.
-    _entry: Entry,
-    /// Vulkan instance handle.
+/// Shared Vulkan instance. `ash::Instance` has no refcount — this wrapper
+/// gives the backend and every shared device joint ownership, so the
+/// instance is destroyed only when the last holder drops (spec: an
+/// instance must outlive the devices created from it).
+struct SharedInstance(std::sync::Arc<InstanceInner>);
+
+struct InstanceInner {
     instance: ash::Instance,
-    /// Logical device handle.
+    /// Keeps the Vulkan loader alive: dropping [`Entry`] unloads
+    /// libvulkan, after which any instance/device call is a call through
+    /// an unloaded library (SIGSEGV — found at test-teardown on the
+    /// 5080 after destruction moved from the backend's explicit `Drop`
+    /// to Arc-drop time).
+    _entry: std::sync::Arc<Entry>,
+}
+
+impl Drop for InstanceInner {
+    fn drop(&mut self) {
+        unsafe { self.instance.destroy_instance(None) };
+    }
+}
+
+impl Clone for SharedInstance {
+    fn clone(&self) -> Self {
+        Self(std::sync::Arc::clone(&self.0))
+    }
+}
+
+impl std::ops::Deref for SharedInstance {
+    type Target = ash::Instance;
+    fn deref(&self) -> &Self::Target {
+        &self.0.instance
+    }
+}
+
+/// Shared logical device (P1 review finding). `ash::Device::clone()`
+/// copies a handle; it does NOT keep the device alive — a pulse (or
+/// buffer/pipeline inner) dropped after its backend used to call into a
+/// device the backend's `drop` had already destroyed. Holding this
+/// wrapper shares ownership: the device is destroyed only when the LAST
+/// holder drops, and its `Drop` idles the device first as a defensive
+/// backstop for in-flight work.
+struct SharedDevice(std::sync::Arc<DeviceInner>);
+
+struct DeviceInner {
     device: ash::Device,
+    /// Keeps the instance alive for at least as long as the device.
+    _instance: SharedInstance,
+}
+
+impl Drop for DeviceInner {
+    fn drop(&mut self) {
+        unsafe {
+            // NOTE: no blanket device_wait_idle here. Every pulse path
+            // waits its own fence BEFORE releasing its SharedDevice, and
+            // the backend's drop idles first when something is actually
+            // in flight — so by the time this runs, submissions are
+            // retired. A blanket wait_idle on every last-holder drop
+            // stampedes the driver's internal locks under parallel load
+            // (deadlocked the parallel test suite on the 5080).
+            self.device.destroy_device(None);
+        }
+    }
+}
+
+impl Clone for SharedDevice {
+    fn clone(&self) -> Self {
+        Self(std::sync::Arc::clone(&self.0))
+    }
+}
+
+impl std::ops::Deref for SharedDevice {
+    type Target = ash::Device;
+    fn deref(&self) -> &Self::Target {
+        &self.0.device
+    }
+}
+
+pub struct VulkanBackend {
+    /// Vulkan entry (loader). Shared with the instance/device chain so
+    /// the loader outlives every device call.
+    _entry: std::sync::Arc<Entry>,
+    /// Shared Vulkan instance (see [`SharedInstance`]). Redundant with
+    /// the device's own instance reference — kept so the backend's public
+    /// teardown story is explicit.
+    #[allow(dead_code)]
+    instance: SharedInstance,
+    /// Shared logical device (see [`SharedDevice`]).
+    device: SharedDevice,
     /// Compute queue handle.
     queue: vk::Queue,
     /// Queue family index for the compute queue.
@@ -87,7 +169,9 @@ pub struct VulkanBackend {
     /// GPU timestamp period in nanoseconds (from device limits).
     timestamp_period: f32,
     /// Epoch tracker for GC safety — counts in-flight dispatches.
-    epoch: crate::epoch::GpuEpochTracker,
+    /// Shared with async `Pulse`s so they cannot outlive it (P1 review
+    /// finding — same defect as the Metal backend, same fix).
+    epoch: std::sync::Arc<crate::epoch::GpuEpochTracker>,
 }
 
 impl VulkanBackend {
@@ -157,6 +241,16 @@ impl VulkanBackend {
 impl Drop for VulkanBackend {
     fn drop(&mut self) {
         unsafe {
+            // Defensive quiescence: a pulse may still hold an in-flight
+            // dispatch (its command buffer comes from our command pool,
+            // its set from our descriptor pool). Destroying pools a
+            // pending submission references is UB — idle the device
+            // first, but ONLY when something is actually in flight (a
+            // blanket wait_idle on every backend drop stampedes the
+            // driver's internal locks under parallel test load).
+            if self.epoch.in_flight() > 0 {
+                let _ = self.device.device_wait_idle();
+            }
             if let Some(pool) = self.timestamp_pool {
                 self.device.destroy_query_pool(pool, None);
             }
@@ -169,8 +263,9 @@ impl Drop for VulkanBackend {
                 .destroy_descriptor_set_layout(self.descriptor_set_layout, None);
             self.device
                 .destroy_pipeline_layout(self.pipeline_layout, None);
-            self.device.destroy_device(None);
-            self.instance.destroy_instance(None);
+            // Device and instance destruction happen in SharedDevice /
+            // SharedInstance `Drop`, when the last holder (backend or
+            // pulse/buffer/pipeline inner) goes away — not here.
         }
     }
 }
@@ -192,8 +287,9 @@ struct VulkanBufferInner {
     staging_buffer: Option<vk::Buffer>,
     /// Staging buffer memory (None if unified).
     staging_memory: Option<vk::DeviceMemory>,
-    /// Clone of the logical device, used for destroy / unmap in drop.
-    device: ash::Device,
+    /// Shared logical device — keeps the device alive past backend drop
+    /// (destroy / unmap in `drop`).
+    device: SharedDevice,
 }
 
 unsafe impl Send for VulkanBufferInner {}
@@ -222,8 +318,9 @@ impl Drop for VulkanBufferInner {
 /// `ComputePipeline.raw` pointer.
 struct VulkanPipelineInner {
     pipeline: vk::Pipeline,
-    /// Clone of the logical device, used for destroy in drop.
-    device: ash::Device,
+    /// Shared logical device — keeps the device alive past backend drop
+    /// (destroy in `drop`).
+    device: SharedDevice,
 }
 
 /// Drop function stored in [`ComputePipeline`] — destroys the Vulkan pipeline.
@@ -244,8 +341,11 @@ fn drop_vulkan_pipeline(raw: *mut std::ffi::c_void) {
 /// `Pulse.raw` pointer.
 struct VulkanPulseInner {
     fence: vk::Fence,
-    device: ash::Device,
-    epoch: *const crate::epoch::GpuEpochTracker,
+    /// Shared logical device — the pulse owns a reference, so
+    /// wait/drop keep a LIVE device even after the backend is gone
+    /// (P1 review finding).
+    device: SharedDevice,
+    epoch: std::sync::Arc<crate::epoch::GpuEpochTracker>,
     /// Tracks whether end_dispatch has been called (prevents double-decrement
     /// when wait() + drop() both fire).
     epoch_completed: std::sync::atomic::AtomicBool,
@@ -263,12 +363,11 @@ fn wait_vulkan_pulse(raw: *mut std::ffi::c_void) {
         // Mark this dispatch as complete (balances the begin_dispatch at
         // dispatch_async submit time). Only decrements once even if wait()
         // is called multiple times.
-        if !inner.epoch.is_null()
-            && !inner
-                .epoch_completed
-                .swap(true, std::sync::atomic::Ordering::SeqCst)
+        if !inner
+            .epoch_completed
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
         {
-            unsafe { (*inner.epoch).end_dispatch() };
+            inner.epoch.end_dispatch();
         }
     }
 }
@@ -285,12 +384,11 @@ fn drop_vulkan_pulse(raw: *mut std::ffi::c_void) {
                     .wait_for_fences(std::slice::from_ref(&inner.fence), true, u64::MAX);
             // Balance the begin_dispatch from dispatch_async (only if
             // wait() hasn't already done so).
-            if !inner.epoch.is_null()
-                && !inner
-                    .epoch_completed
-                    .swap(true, std::sync::atomic::Ordering::SeqCst)
+            if !inner
+                .epoch_completed
+                .swap(true, std::sync::atomic::Ordering::SeqCst)
             {
-                (*inner.epoch).end_dispatch();
+                inner.epoch.end_dispatch();
             }
             inner.device.destroy_fence(inner.fence, None);
         }
@@ -686,7 +784,9 @@ impl GpuBackend for VulkanBackend {
     }
 
     fn init_with_strategy(strategy: MemoryStrategy) -> Result<Self> {
-        let entry = unsafe { Entry::load().map_err(|e| GpuError::InitFailed(format!("{e}")))? };
+        let entry = std::sync::Arc::new(unsafe {
+            Entry::load().map_err(|e| GpuError::InitFailed(format!("{e}")))?
+        });
 
         // Query the available instance version before requesting one.
         // Requesting an unsupported version (e.g. 1.3 on lavapipe/Mesa <23.x)
@@ -834,6 +934,20 @@ impl GpuBackend for VulkanBackend {
         };
         let timestamp_period = device_props.limits.timestamp_period;
 
+        // Wrap in shared ownership: the pulse and the buffer/pipeline
+        // inner structs hold clones, so the device and instance are
+        // destroyed only when the LAST holder drops (P1 review finding —
+        // a backend dropped before its pulse used to destroy the device
+        // out from under the pulse's wait/drop path).
+        let instance = SharedInstance(std::sync::Arc::new(InstanceInner {
+            instance,
+            _entry: std::sync::Arc::clone(&entry),
+        }));
+        let device = SharedDevice(std::sync::Arc::new(DeviceInner {
+            device,
+            _instance: instance.clone(),
+        }));
+
         Ok(Self {
             _entry: entry,
             instance,
@@ -852,7 +966,7 @@ impl GpuBackend for VulkanBackend {
             transfer_command_pool,
             timestamp_pool,
             timestamp_period,
-            epoch: crate::epoch::GpuEpochTracker::new(),
+            epoch: std::sync::Arc::new(crate::epoch::GpuEpochTracker::new()),
         })
     }
 
@@ -1788,7 +1902,7 @@ impl GpuBackend for VulkanBackend {
         let inner = Box::new(VulkanPulseInner {
             fence,
             device: self.device.clone(),
-            epoch: &self.epoch,
+            epoch: std::sync::Arc::clone(&self.epoch),
             epoch_completed: std::sync::atomic::AtomicBool::new(false),
         });
 
@@ -1996,6 +2110,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn device_init() {
         match VulkanBackend::init() {
             Ok(_) => {}
@@ -2010,6 +2125,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn add_one_kernel() {
         let backend = match VulkanBackend::init() {
             Ok(b) => b,
@@ -2026,6 +2142,10 @@ mod tests {
             @compute @workgroup_size(256)
             fn add_one(@builtin(global_invocation_id) gid: vec3<u32>) {
                 let i = gid.x;
+                // Bound the access: 256 threads over a 4-element buffer
+                // (review finding on the Metal twin; naga's default
+                // bounds-check policies are Unchecked for SPIR-V too).
+                if (i >= 4u) { return; }
                 output[i] = input[i] + 1.0;
             }
         "#;
@@ -2042,6 +2162,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn vector_scale_1024() {
         let backend = match VulkanBackend::init() {
             Ok(b) => b,
@@ -2084,6 +2205,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn compile_error() {
         let backend = match VulkanBackend::init() {
             Ok(b) => b,
@@ -2103,6 +2225,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn roundtrip_empty() {
         let backend = match VulkanBackend::init() {
             Ok(b) => b,
@@ -2119,6 +2242,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn timestamp_works() {
         let backend = match VulkanBackend::init() {
             Ok(b) => b,
@@ -2135,6 +2259,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn shader_caching() {
         let backend = match VulkanBackend::init() {
             Ok(b) => b,
@@ -2170,6 +2295,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn async_dispatch() {
         let backend = match VulkanBackend::init() {
             Ok(b) => b,
@@ -2184,6 +2310,8 @@ mod tests {
             @group(0) @binding(1) var<storage, read_write> output: array<f32>;
             @compute @workgroup_size(256)
             fn add_one(@builtin(global_invocation_id) gid: vec3<u32>) {
+                // 256 threads over a 4-element buffer — bound the access.
+                if (gid.x >= 4u) { return; }
                 output[gid.x] = input[gid.x] + 1.0;
             }
         "#;
@@ -2201,7 +2329,56 @@ mod tests {
         assert_eq!(result, vec![2.0, 3.0, 4.0, 5.0]);
     }
 
+    /// Regression (P1 review finding): a pulse, its buffers, and its
+    /// pipeline must survive the backend being dropped first. The old
+    /// code stored a cloned `ash::Device` handle, and the backend's
+    /// `drop` destroyed the device — the pulse's wait/drop then called
+    /// into a destroyed device. Shared ownership (`SharedDevice`) keeps
+    /// the device (and the loader) alive until the last holder drops.
     #[test]
+    #[serial_test::serial]
+    fn pulse_outlives_backend() {
+        let backend = match VulkanBackend::init() {
+            Ok(b) => b,
+            Err(_) => {
+                eprintln!("skipping: no Vulkan device");
+                return;
+            }
+        };
+
+        let wgsl = r#"
+            @group(0) @binding(0) var<storage, read> input: array<f32>;
+            @group(0) @binding(1) var<storage, read_write> output: array<f32>;
+            @compute @workgroup_size(256)
+            fn add_one(@builtin(global_invocation_id) gid: vec3<u32>) {
+                if (gid.x >= 4u) { return; }
+                output[gid.x] = input[gid.x] + 1.0;
+            }
+        "#;
+        let pipeline = backend.compile("add_one", wgsl).unwrap();
+        let input = backend.create_buffer(&[1.0f32, 2.0, 3.0, 4.0]).unwrap();
+        let output = backend.create_buffer_uninit::<f32>(4).unwrap();
+        let pulse = backend
+            .dispatch_async(&pipeline, &[&input, &output], (1, 1, 1))
+            .unwrap();
+
+        // Wait first: the submission retires, so the backend's pool
+        // destruction below is legal (backend drop also idles the
+        // device defensively, but we keep the deterministic order).
+        pulse.wait();
+
+        // The backend (and its epoch tracker) go away next; everything
+        // below runs through shared ownership only.
+        drop(backend);
+
+        drop(pulse);
+        drop(output);
+        drop(input);
+        drop(pipeline);
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn persistent_buffer_multi_dispatch() {
         let backend = match VulkanBackend::init() {
             Ok(b) => b,
@@ -2246,6 +2423,7 @@ mod tests {
     /// Miri-compatible: exercises buffer create → read → drop lifecycle.
     /// Run: `cargo +nightly miri test --features vulkan buffer_lifecycle`
     #[test]
+    #[serial_test::serial]
     fn buffer_lifecycle_safety() {
         let backend = match VulkanBackend::init() {
             Ok(b) => b,

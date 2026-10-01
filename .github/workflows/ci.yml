@@ -59,6 +59,41 @@ jobs:
       - name: Run tests ${{ matrix.features }}
         run: cargo test ${{ matrix.features }}
 
+  test-macos:
+    name: Test (macOS Apple Silicon, self-hosted)
+    runs-on: [self-hosted, macOS, ARM64]
+    timeout-minutes: 45
+    # Public repo + self-hosted runner: same-repo heads only (agent
+    # branches), never fork PRs. See Holmberg docs/ci-runners.md.
+    if: |
+      github.event.action != 'labeled' &&
+      (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+    env:
+      # The dedicated hardware job must never pass without executing real
+      # Metal kernels: device-init failures hard-fail instead of skipping.
+      BORSALINO_REQUIRE_METAL: "1"
+    steps:
+      - uses: actions/checkout@v4
+      # Self-hosted launchd agents inherit a bare PATH with no nix
+      # profiles — rustup/cargo would be invisible to the toolchain action
+      # (it would bootstrap rustup.rs, which cannot amend home-manager's
+      # read-only ~/.bash_profile). Prepend the fleet shell paths via
+      # $GITHUB_PATH — portable across the nix-darwin fleet Macs. Remove if
+      # the runner agent ever ships a full PATH (Holmberg module PR #109).
+      - name: Fleet PATH (nix profiles)
+        run: |
+          echo "$HOME/.nix-profile/bin:/run/current-system/sw/bin" >> "$GITHUB_PATH"
+          # The nix gcc-wrapper in ~/.nix-profile shadows Apple's cc and
+          # cannot satisfy rustc's darwin `-liconv` at final link
+          # ("ld: library not found for -liconv"). Keep nix on PATH for
+          # rustup discovery, but pin the target linker to Apple's cc
+          # (CLT is present on the fleet Macs).
+          echo "CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER=/usr/bin/cc" >> "$GITHUB_ENV"
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+      - name: Run tests (metal)
+        run: cargo test --features metal
+
   doc:
     name: Documentation
     runs-on: ubuntu-latest

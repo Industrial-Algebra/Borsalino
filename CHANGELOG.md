@@ -51,6 +51,52 @@ Fixes:
 - `serial_test` added as a dev-dependency (GPU tests must not race the
   Vulkan loader, matching Zunesha's discipline).
 
+### Fixed — review findings (2026-09-30 code review, round 2)
+
+- **Shader bounds in tests (P1)**: compute tests dispatched 256-thread
+  groups against 4-element buffers with no shader-side guard, while
+  pipelines compile with `Unchecked` bounds policies — invocations
+  4–255 read/wrote outside the buffers. All undersized dispatches
+  (Metal and Vulkan tests alike) now guard `if (i >= N) { return; }`.
+- **Compilation paths pooled (P2)**: `compile()` and `compile_msl()`
+  now run inside scoped autorelease pools (autoreleased source strings
+  and NSError out-params no longer depend on the caller's pool), and
+  the pipeline-creation failure path releases the retained
+  `MTLComputePipelineDescriptor` it used to leak.
+- **Vulkan pulse device lifetime (P1)**: sharing the epoch tracker did
+  not make backend-before-pulse drop safe — the pulse held a cloned
+  `ash::Device` handle while the backend's drop destroyed the device.
+  The device and instance are now behind shared ownership
+  (`SharedDevice`/`SharedInstance`), destroyed only when the last
+  holder drops; the chain also keeps the loader (`Entry`) alive past
+  destruction. New regression: `pulse_outlives_backend`. The backend's
+  drop defensively idles the device when dispatches are in flight
+  (destroying pools a pending submission references is UB).
+- **GPU tests serialized**: `serial_test` was a declared dev-dependency
+  but no test carried `#[serial]` — parallel GPU tests on real hardware
+  deadlocked the driver's internal locks (reproduced 3-in-5 on the RTX
+  5080). All GPU-touching tests in both backends now run serialized.
+
+### Fixed — review findings (2026-09-30 code review)
+
+- **Scoped autorelease pools** (Metal): `dispatch_ex`, `dispatch_many`,
+  and `dispatch_async` now run inside `objc::rc::autoreleasepool(...)`,
+  so autoreleased command buffers/encoders are reclaimed per dispatch
+  even on plain Rust worker threads with no Cocoa pool of their own.
+  The async `Pulse`'s command buffer deliberately escapes its pool via
+  the explicit retain.
+- **`Pulse` could outlive its epoch tracker (P1, both backends)**: the
+  pulse inner structs stored `*const GpuEpochTracker` with no lifetime
+  tie — dropping the backend before waiting on a pulse was a dangling
+  dereference. Both `MetalBackend` and `VulkanBackend` now hold
+  `Arc<GpuEpochTracker>` and share it with their pulses.
+- **Metal tests hardened**: the `mem::forget` teardown workaround is
+  gone (normal destruction is now part of what the tests verify); the
+  dedicated Apple Silicon CI job sets `BORSALINO_REQUIRE_METAL=1` so
+  device-init failures fail the job instead of silently skipping; new
+  regressions: `async_pulse_survives_pool_drain` and
+  `dispatch_many_executes_batch`.
+
 ## [0.6.0] — 2026-08-04
 
 ### Added — GC Safety (Pin-and-Track)
