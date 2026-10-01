@@ -3,6 +3,7 @@
 [![crates.io](https://img.shields.io/crates/v/borsalino)](https://crates.io/crates/borsalino)
 [![docs.rs](https://img.shields.io/docsrs/borsalino)](https://docs.rs/borsalino)
 [![CI](https://github.com/Industrial-Algebra/Borsalino/actions/workflows/ci.yml/badge.svg)](https://github.com/Industrial-Algebra/Borsalino/actions/workflows/ci.yml)
+[![Docs](https://img.shields.io/badge/docs-book-blue)](https://borsalino.industrial-algebra.com)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](./LICENSE)
 
 Thin GPU compute abstraction for the Industrial Algebra ecosystem.

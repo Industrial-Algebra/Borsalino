@@ -2,6 +2,14 @@
 
 All notable changes to Borsalino are documented in this file.
 
+### Added
+- mdBook documentation (IA Navy theme) — `book/` with Introduction,
+  Getting Started, Concepts (trait/handles/epoch/memory), Guide
+  (installation, WGSL authoring incl. index-bounding, batched/async
+  dispatch, verification incl. the five-silences lesson), API overview,
+  Design pages, and example walkthroughs. Netlify deploy config and a
+  `v*`-tag docs workflow; README badge.
+
 ## [0.7.0] — Unreleased
 
 ### Fixed — the numerical verification driver could not verify (2026-09-29 research dive)
