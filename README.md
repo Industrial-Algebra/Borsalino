@@ -30,6 +30,8 @@ let wgsl = r#"
     @compute @workgroup_size(256)
     fn add_one(@builtin(global_invocation_id) gid: vec3<u32>) {
         let i = gid.x;
+        if (i >= 4u) { return; }  // 4-element buffers, 256-thread group:
+                                  // bounds are the kernel's job (Unchecked)
         output[i] = input[i] + 1.0;
     }
 "#;

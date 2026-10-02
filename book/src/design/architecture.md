@@ -23,12 +23,13 @@ Opaque handle types (`ComputePipeline`, `GpuBuffer`) carry raw pointers and
 backend-specific drop functions — no coupling between `lib.rs` and backend
 modules.
 
-## Substrate split (v0.7)
+## Substrate split (planned)
 
-The device/buffer/queue substrate is being extracted into
-[Zunesha](https://github.com/Industrial-Algebra/Zunesha); Borsalino is its
-compute consumer. Cross-crate proof agreement (quiescence proofs valid across
-the boundary) is governed by Zunesha ADR 0003.
+The device/buffer/queue substrate is *planned* to be extracted into
+[Zunesha](https://github.com/Industrial-Algebra/Zunesha); Borsalino will
+become its compute consumer. As of v0.7 this crate still owns its device,
+buffers, and epoch tracker. Cross-crate proof agreement (quiescence proofs
+valid across the boundary) is already specified as Zunesha ADR 0003.
 
 ## Verification docs
 

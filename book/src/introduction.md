@@ -24,7 +24,10 @@ no async runtime.
 
 ## Relation to the ecosystem
 
-Borsalino is the **compute** face of the IA GPU stack. As of v0.7 it stands on
-[Zunesha](https://github.com/Industrial-Algebra/Zunesha), the shared device
-substrate — Goldenweek (graphics) stands on the same device, which makes
-zero-copy compute→render interop possible.
+Borsalino is the **compute** face of the IA GPU stack. The planned direction
+(roadmap): the device/buffer/epoch substrate moves into
+[Zunesha](https://github.com/Industrial-Algebra/Zunesha), with Borsalino as
+its compute consumer and Goldenweek (graphics) beside it on the same device —
+enabling zero-copy compute→render interop. **This release still owns its
+device and buffers internally; the Zunesha migration is upcoming work**, not
+shipped in v0.7.

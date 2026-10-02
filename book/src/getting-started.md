@@ -10,6 +10,7 @@ let wgsl = r#"
     @compute @workgroup_size(256)
     fn add_one(@builtin(global_invocation_id) gid: vec3<u32>) {
         let i = gid.x;
+        if (i >= 4u) { return; }
         output[i] = input[i] + 1.0;
     }
 "#;
@@ -31,6 +32,6 @@ cargo run --features metal --example hello_compute    # macOS
 cargo run --features vulkan --example hello_compute   # Linux / Windows
 ```
 
-Note: dispatches of a 256-thread workgroup over a shorter buffer must guard
-the index in the kernel (`if (i >= N) { return; }`) — pipelines compile with
-`Unchecked` bounds policies, so bounding is the kernel's job.
+The `if (i >= 4u) { return; }` guard is load-bearing: the workgroup launches
+256 invocations but the buffers hold four elements, and pipelines compile
+with `Unchecked` bounds policies — see [Writing Kernels](./guide/wgsl.md).
