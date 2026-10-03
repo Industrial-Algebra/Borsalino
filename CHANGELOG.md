@@ -2,6 +2,29 @@
 
 All notable changes to Borsalino are documented in this file.
 
+### Fixed — review findings (2026-10-01)
+
+- Quick-start kernel (book, README, and `examples/hello_compute.rs`)
+  now guards `if (i >= 4u) { return; }` — 256-thread group over
+  4-element buffers with Unchecked bounds policies needs the guard in
+  the copied code, not just a warning below it.
+- `docs/critique.md` (repo source and book copy) corrected to release
+  reality: the stale AGPL-obligation sentence removed (Apache-2.0
+  since v0.4.0), bounds-checking claim inverted (Unchecked — the
+  kernel's job), async-dispatch statements updated
+  (`dispatch_async`/`Pulse` exist), maturity/testing/benchmark rows
+  refreshed, resolved recommendations struck through.
+- Book introduction and architecture pages state the Zunesha migration
+  as planned upcoming work, not shipped in v0.7.
+
+### Added
+- mdBook documentation (IA Navy theme) — `book/` with Introduction,
+  Getting Started, Concepts (trait/handles/epoch/memory), Guide
+  (installation, WGSL authoring incl. index-bounding, batched/async
+  dispatch, verification incl. the five-silences lesson), API overview,
+  Design pages, and example walkthroughs. Netlify deploy config and a
+  `v*`-tag docs workflow; README badge.
+
 ## [0.7.0] — Unreleased
 
 ### Fixed — the numerical verification driver could not verify (2026-09-29 research dive)

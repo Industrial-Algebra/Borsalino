@@ -25,6 +25,9 @@ fn main() -> Result<(), borsalino::GpuError> {
         @compute @workgroup_size(256)
         fn add_one(@builtin(global_invocation_id) gid: vec3<u32>) {
             let i = gid.x;
+            // Buffers hold 4 elements; the workgroup launches 256 threads
+            // and pipelines compile with Unchecked bounds — guard the index.
+            if (i >= 4u) { return; }
             output[i] = input[i] + 1.0;
         }
     "#;
