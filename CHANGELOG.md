@@ -2,6 +2,8 @@
 
 All notable changes to Borsalino are documented in this file.
 
+## [0.7.0] — 2026-10-03
+
 ### Fixed — review findings (2026-10-01)
 
 - Quick-start kernel (book, README, and `examples/hello_compute.rs`)
@@ -25,7 +27,6 @@ All notable changes to Borsalino are documented in this file.
   Design pages, and example walkthroughs. Netlify deploy config and a
   `v*`-tag docs workflow; README badge.
 
-## [0.7.0] — Unreleased
 
 ### Fixed — the numerical verification driver could not verify (2026-09-29 research dive)
 
