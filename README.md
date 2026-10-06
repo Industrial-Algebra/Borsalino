@@ -3,6 +3,7 @@
 [![crates.io](https://img.shields.io/crates/v/borsalino)](https://crates.io/crates/borsalino)
 [![docs.rs](https://img.shields.io/docsrs/borsalino)](https://docs.rs/borsalino)
 [![CI](https://github.com/Industrial-Algebra/Borsalino/actions/workflows/ci.yml/badge.svg)](https://github.com/Industrial-Algebra/Borsalino/actions/workflows/ci.yml)
+[![Docs](https://img.shields.io/badge/docs-book-blue)](https://borsalino.industrial-algebra.com)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](./LICENSE)
 
 Thin GPU compute abstraction for the Industrial Algebra ecosystem.
@@ -29,6 +30,8 @@ let wgsl = r#"
     @compute @workgroup_size(256)
     fn add_one(@builtin(global_invocation_id) gid: vec3<u32>) {
         let i = gid.x;
+        if (i >= 4u) { return; }  // 4-element buffers, 256-thread group:
+                                  // bounds are the kernel's job (Unchecked)
         output[i] = input[i] + 1.0;
     }
 "#;

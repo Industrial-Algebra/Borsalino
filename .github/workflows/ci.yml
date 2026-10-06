@@ -5,15 +5,20 @@ on:
     branches: [develop, main]
   pull_request:
     branches: [develop, main]
+    types: [opened, synchronize, reopened, labeled]
 
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
 
+# Gate expression: label-gated jobs run when the label is present OR
+# when targeting main (release PR). On push to main (post-merge), they
+# also run. On label events, only gated jobs re-trigger.
 jobs:
   fmt:
     name: Format
     runs-on: ubuntu-latest
+    if: github.event.action != 'labeled'
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
@@ -25,6 +30,7 @@ jobs:
   clippy:
     name: Clippy
     runs-on: ubuntu-latest
+    if: github.event.action != 'labeled'
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
@@ -37,6 +43,7 @@ jobs:
   test:
     name: Test
     runs-on: ubuntu-latest
+    if: github.event.action != 'labeled'
     strategy:
       matrix:
         features:
@@ -52,9 +59,45 @@ jobs:
       - name: Run tests ${{ matrix.features }}
         run: cargo test ${{ matrix.features }}
 
+  test-macos:
+    name: Test (macOS Apple Silicon, self-hosted)
+    runs-on: [self-hosted, macOS, ARM64]
+    timeout-minutes: 45
+    # Public repo + self-hosted runner: same-repo heads only (agent
+    # branches), never fork PRs. See Holmberg docs/ci-runners.md.
+    if: |
+      github.event.action != 'labeled' &&
+      (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+    env:
+      # The dedicated hardware job must never pass without executing real
+      # Metal kernels: device-init failures hard-fail instead of skipping.
+      BORSALINO_REQUIRE_METAL: "1"
+    steps:
+      - uses: actions/checkout@v4
+      # Self-hosted launchd agents inherit a bare PATH with no nix
+      # profiles — rustup/cargo would be invisible to the toolchain action
+      # (it would bootstrap rustup.rs, which cannot amend home-manager's
+      # read-only ~/.bash_profile). Prepend the fleet shell paths via
+      # $GITHUB_PATH — portable across the nix-darwin fleet Macs. Remove if
+      # the runner agent ever ships a full PATH (Holmberg module PR #109).
+      - name: Fleet PATH (nix profiles)
+        run: |
+          echo "$HOME/.nix-profile/bin:/run/current-system/sw/bin" >> "$GITHUB_PATH"
+          # The nix gcc-wrapper in ~/.nix-profile shadows Apple's cc and
+          # cannot satisfy rustc's darwin `-liconv` at final link
+          # ("ld: library not found for -liconv"). Keep nix on PATH for
+          # rustup discovery, but pin the target linker to Apple's cc
+          # (CLT is present on the fleet Macs).
+          echo "CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER=/usr/bin/cc" >> "$GITHUB_ENV"
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+      - name: Run tests (metal)
+        run: cargo test --features metal
+
   doc:
     name: Documentation
     runs-on: ubuntu-latest
+    if: github.event.action != 'labeled'
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
@@ -66,11 +109,16 @@ jobs:
 
   kani:
     name: Kani Verification
-    runs-on: ubuntu-latest
-    if: contains(github.event.pull_request.labels.*.name, 'run-kani')
+    runs-on: [self-hosted, kani]
+    timeout-minutes: 15
+    if: |
+      github.event_name == 'push' && github.ref == 'refs/heads/main' ||
+      github.event_name == 'pull_request' && (
+        github.base_ref == 'main' ||
+        contains(github.event.pull_request.labels.*.name, 'run-kani')
+      )
     steps:
       - uses: actions/checkout@v4
-      - uses: model-checking/kani-github-action@v31
       - name: Run Kani harnesses
         run: |
           cargo kani --harness buffer_alignment_boundary
@@ -80,22 +128,36 @@ jobs:
   miri:
     name: Miri (safety check)
     runs-on: ubuntu-latest
-    if: contains(github.event.pull_request.labels.*.name, 'run-miri')
+    if: |
+      github.event_name == 'push' && github.ref == 'refs/heads/main' ||
+      github.event_name == 'pull_request' && (
+        github.base_ref == 'main' ||
+        contains(github.event.pull_request.labels.*.name, 'run-miri')
+      )
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: miri
       - uses: Swatinem/rust-cache@v2
-      - name: Run Miri on buffer lifecycle tests
-        run: cargo miri test --features vulkan buffer_lifecycle
+      - name: Run Miri on epoch counter safety
+        run: cargo miri test epoch
 
   gpu:
     name: GPU dispatch tests (self-hosted)
     runs-on: [self-hosted, gpu]
-    if: contains(github.event.pull_request.labels.*.name, 'run-gpu')
+    if: |
+      github.event_name == 'push' && github.ref == 'refs/heads/main' ||
+      github.event_name == 'pull_request' && (
+        github.base_ref == 'main' ||
+        contains(github.event.pull_request.labels.*.name, 'run-gpu')
+      )
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
       - name: Run GPU dispatch tests (Vulkan)
         run: cargo test --features vulkan -- --ignored
+      - name: Run numerical verification (Vulkan)
+        run: cargo run --features vulkan,verify --example numerical_verification
+      - name: Run determinism check (Vulkan)
+        run: cargo run --features vulkan,verify --example determinism_check

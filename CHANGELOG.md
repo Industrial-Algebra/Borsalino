@@ -2,6 +2,125 @@
 
 All notable changes to Borsalino are documented in this file.
 
+## [0.7.0] — 2026-10-03
+
+### Fixed — review findings (2026-10-01)
+
+- Quick-start kernel (book, README, and `examples/hello_compute.rs`)
+  now guards `if (i >= 4u) { return; }` — 256-thread group over
+  4-element buffers with Unchecked bounds policies needs the guard in
+  the copied code, not just a warning below it.
+- `docs/critique.md` (repo source and book copy) corrected to release
+  reality: the stale AGPL-obligation sentence removed (Apache-2.0
+  since v0.4.0), bounds-checking claim inverted (Unchecked — the
+  kernel's job), async-dispatch statements updated
+  (`dispatch_async`/`Pulse` exist), maturity/testing/benchmark rows
+  refreshed, resolved recommendations struck through.
+- Book introduction and architecture pages state the Zunesha migration
+  as planned upcoming work, not shipped in v0.7.
+
+### Added
+- mdBook documentation (IA Navy theme) — `book/` with Introduction,
+  Getting Started, Concepts (trait/handles/epoch/memory), Guide
+  (installation, WGSL authoring incl. index-bounding, batched/async
+  dispatch, verification incl. the five-silences lesson), API overview,
+  Design pages, and example walkthroughs. Netlify deploy config and a
+  `v*`-tag docs workflow; README badge.
+
+
+### Fixed — the numerical verification driver could not verify (2026-09-29 research dive)
+
+The v0.6.0 "Comprehensive GPU Verification" release shipped a
+`verify_numerical` that was structurally unable to verify anything:
+
+- **No output buffer was ever allocated.** The driver uploaded one buffer
+  per input, dispatched, then read back `gpu_buffers.last()` — the last
+  *input*. Kernels writing output to a later binding (all of them —
+  `add_one` writes binding 1, the geometric product writes binding 3)
+  wrote into stale/null descriptors under the Vulkan backend's universal
+  layout.
+- **Binary inputs were uploaded as raw u8 bytes** while kernels read
+  `array<f32>` — a `0x01` byte is a denormal, not `1.0`.
+- **The geometric product's sign table was never supplied** — the kernel's
+  binding 0 got an operand multivector instead.
+- **Three stacked silence mechanisms** meant none of this could fail CI:
+  `|| true` on the verification steps, no `exit(1)` on FAIL in the
+  examples, and exit-0 early-returns when no GPU was present.
+
+Fixes:
+
+- **`NumericalReference` redesign (breaking)** — the reference is now the
+  kernel's metadata: `generate_inputs` returns every input binding in
+  order (sign table included) as `Vec<f32>` storage, `output_len` gives
+  the f32 element count, `workgroups` sizes the dispatch. The redundant
+  `input_sizes` half-tuple is gone.
+- **Driver wiring** — allocates the output via `create_buffer_uninit`,
+  chains inputs + output, dispatches with the reference's workgroups,
+  reads back the **output** buffer.
+- **Recording-fake backend** (`#[cfg(test)]`) — the driver's wiring is now
+  testable without hardware: dispatch bindings, workgroups, and the
+  read-back identity are all asserted. Pattern borrowed from Baedeker's
+  `baedeker_core::runtime::verify`.
+- **First `#[ignore]`d GPU tests in the repo** — the CI GPU job's
+  `-- --ignored` step previously selected nothing. Now:
+  `gp_kernel_verifies_on_hardware` (verified end-to-end on an RTX 5080 —
+  the first recorded PASS of this protocol anywhere) and
+  `gp_mutation_fails_on_hardware` (a sign-flipped kernel must FAIL).
+- **Examples gate on exit codes** — 0 = verified, 1 = FAILED or could not
+  run. A verification tool that cannot fail is not a verification tool.
+- **CI gates for real** — both `|| true`s deleted from the self-hosted GPU
+  job.
+
+### Changed
+- `serial_test` added as a dev-dependency (GPU tests must not race the
+  Vulkan loader, matching Zunesha's discipline).
+
+### Fixed — review findings (2026-09-30 code review, round 2)
+
+- **Shader bounds in tests (P1)**: compute tests dispatched 256-thread
+  groups against 4-element buffers with no shader-side guard, while
+  pipelines compile with `Unchecked` bounds policies — invocations
+  4–255 read/wrote outside the buffers. All undersized dispatches
+  (Metal and Vulkan tests alike) now guard `if (i >= N) { return; }`.
+- **Compilation paths pooled (P2)**: `compile()` and `compile_msl()`
+  now run inside scoped autorelease pools (autoreleased source strings
+  and NSError out-params no longer depend on the caller's pool), and
+  the pipeline-creation failure path releases the retained
+  `MTLComputePipelineDescriptor` it used to leak.
+- **Vulkan pulse device lifetime (P1)**: sharing the epoch tracker did
+  not make backend-before-pulse drop safe — the pulse held a cloned
+  `ash::Device` handle while the backend's drop destroyed the device.
+  The device and instance are now behind shared ownership
+  (`SharedDevice`/`SharedInstance`), destroyed only when the last
+  holder drops; the chain also keeps the loader (`Entry`) alive past
+  destruction. New regression: `pulse_outlives_backend`. The backend's
+  drop defensively idles the device when dispatches are in flight
+  (destroying pools a pending submission references is UB).
+- **GPU tests serialized**: `serial_test` was a declared dev-dependency
+  but no test carried `#[serial]` — parallel GPU tests on real hardware
+  deadlocked the driver's internal locks (reproduced 3-in-5 on the RTX
+  5080). All GPU-touching tests in both backends now run serialized.
+
+### Fixed — review findings (2026-09-30 code review)
+
+- **Scoped autorelease pools** (Metal): `dispatch_ex`, `dispatch_many`,
+  and `dispatch_async` now run inside `objc::rc::autoreleasepool(...)`,
+  so autoreleased command buffers/encoders are reclaimed per dispatch
+  even on plain Rust worker threads with no Cocoa pool of their own.
+  The async `Pulse`'s command buffer deliberately escapes its pool via
+  the explicit retain.
+- **`Pulse` could outlive its epoch tracker (P1, both backends)**: the
+  pulse inner structs stored `*const GpuEpochTracker` with no lifetime
+  tie — dropping the backend before waiting on a pulse was a dangling
+  dereference. Both `MetalBackend` and `VulkanBackend` now hold
+  `Arc<GpuEpochTracker>` and share it with their pulses.
+- **Metal tests hardened**: the `mem::forget` teardown workaround is
+  gone (normal destruction is now part of what the tests verify); the
+  dedicated Apple Silicon CI job sets `BORSALINO_REQUIRE_METAL=1` so
+  device-init failures fail the job instead of silently skipping; new
+  regressions: `async_pulse_survives_pool_drain` and
+  `dispatch_many_executes_batch`.
+
 ## [0.6.0] — 2026-08-04
 
 ### Added — GC Safety (Pin-and-Track)

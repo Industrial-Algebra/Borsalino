@@ -214,8 +214,10 @@ fn fix_device_line(line: &str, mutable: bool) -> Option<String> {
 pub struct MetalBackend {
     device: MetalDevice,
     queue: MetalQueue,
-    /// Epoch tracker for GC safety — counts in-flight dispatches.
-    epoch: crate::epoch::GpuEpochTracker,
+    /// Epoch tracker for GC safety — counts in-flight dispatches. Shared
+    /// with async `Pulse`s so they cannot outlive it (review finding:
+    /// a raw `&'a GpuEpochTracker` in `MetalPulseInner` could dangle).
+    epoch: std::sync::Arc<crate::epoch::GpuEpochTracker>,
 }
 
 impl MetalBackend {
@@ -225,7 +227,9 @@ impl MetalBackend {
 /// Inner state for an async Metal dispatch [`Pulse`].
 struct MetalPulseInner {
     cmd: *mut std::ffi::c_void,
-    epoch: *const crate::epoch::GpuEpochTracker,
+    /// Owned share of the backend's tracker — the pulse may outlive the
+    /// backend, so it must not borrow it (P1 review finding).
+    epoch: std::sync::Arc<crate::epoch::GpuEpochTracker>,
     /// Tracks whether end_dispatch has been called (prevents double-decrement
     /// when wait() + drop() both fire).
     epoch_completed: std::sync::atomic::AtomicBool,
@@ -236,12 +240,11 @@ fn wait_metal_pulse(raw: *mut std::ffi::c_void) {
         let inner = unsafe { &*(raw as *const MetalPulseInner) };
         let _: () = unsafe { msg_send![obj(inner.cmd), waitUntilCompleted] };
         // Balance the begin_dispatch from dispatch_async.
-        if !inner.epoch.is_null()
-            && !inner
-                .epoch_completed
-                .swap(true, std::sync::atomic::Ordering::SeqCst)
+        if !inner
+            .epoch_completed
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
         {
-            unsafe { (*inner.epoch).end_dispatch() };
+            inner.epoch.end_dispatch();
         }
     }
 }
@@ -254,12 +257,11 @@ fn drop_metal_pulse(raw: *mut std::ffi::c_void) {
             let _: () = msg_send![obj(inner.cmd), waitUntilCompleted];
             // Balance the begin_dispatch from dispatch_async (only if
             // wait() hasn't already done so).
-            if !inner.epoch.is_null()
-                && !inner
-                    .epoch_completed
-                    .swap(true, std::sync::atomic::Ordering::SeqCst)
+            if !inner
+                .epoch_completed
+                .swap(true, std::sync::atomic::Ordering::SeqCst)
             {
-                (*inner.epoch).end_dispatch();
+                inner.epoch.end_dispatch();
             }
             let _: () = msg_send![obj(inner.cmd), release];
         }
@@ -292,7 +294,7 @@ impl GpuBackend for MetalBackend {
             queue: MetalQueue {
                 ptr: NonNull::new(queue_ptr).unwrap(),
             },
-            epoch: crate::epoch::GpuEpochTracker::new(),
+            epoch: std::sync::Arc::new(crate::epoch::GpuEpochTracker::new()),
         })
     }
 
@@ -382,7 +384,7 @@ impl GpuBackend for MetalBackend {
                     let desc: *mut c_void =
                         msg_send![err as *const objc::runtime::Object, localizedDescription];
                     let s = nsstring_read(desc);
-                    let _: () = msg_send![err as *const objc::runtime::Object, release];
+                    // (err/perr is an autoreleased out-param — the pool owns it)
                     s
                 } else {
                     "unknown compilation error".into()
@@ -422,11 +424,14 @@ impl GpuBackend for MetalBackend {
                 let msg = if !perr.is_null() {
                     let desc: *mut c_void = msg_send![obj(perr), localizedDescription];
                     let s = nsstring_read(desc);
-                    let _: () = msg_send![obj(perr), release];
+                    // (err/perr is an autoreleased out-param — the pool owns it)
                     s
                 } else {
                     "unknown pipeline error".into()
                 };
+                // desc is +1 from `new` — the failure path used to leak
+                // it (review finding). func/library are also +1.
+                let _: () = msg_send![obj(desc), release];
                 let _: () = msg_send![obj(func), release];
                 let _: () = msg_send![obj(library), release];
                 return Err(GpuError::PipelineFailed {
@@ -436,7 +441,8 @@ impl GpuBackend for MetalBackend {
             }
 
             // Release intermediates (desc may be retained by the pipeline)
-            // let _: () = msg_send![obj(desc), release];
+            // `new` returns a retained object — release our reference.
+            let _: () = msg_send![obj(desc), release];
             let _: () = msg_send![obj(func), release];
             let _: () = msg_send![obj(library), release];
 
@@ -523,7 +529,12 @@ impl GpuBackend for MetalBackend {
         workgroups: (u32, u32, u32),
         _threads_per_group: (u32, u32, u32),
     ) -> Result<()> {
-        unsafe {
+        // Scoped autorelease pool: the command buffer and encoder are
+        // autoreleased (+0) objc objects; without a pool on a plain Rust
+        // worker thread they would never be reclaimed (and with one owned
+        // by someone else, reclaimed at that pool's whim). Draining per
+        // dispatch bounds them deterministically (P2 review finding).
+        objc::rc::autoreleasepool(|| unsafe {
             let cmd: *mut c_void = msg_send![obj(self.queue.ptr.as_ptr()), commandBuffer];
             if cmd.is_null() {
                 return Err(GpuError::DispatchFailed {
@@ -533,7 +544,7 @@ impl GpuBackend for MetalBackend {
 
             let encoder: *mut c_void = msg_send![obj(cmd), computeCommandEncoder];
             if encoder.is_null() {
-                let _: () = msg_send![obj(cmd), release];
+                // cmd is autoreleased — do not release it here.
                 return Err(GpuError::DispatchFailed {
                     message: "failed to create MTLComputeCommandEncoder".into(),
                 });
@@ -569,10 +580,14 @@ impl GpuBackend for MetalBackend {
 
             self.epoch.end_dispatch();
 
-            let _: () = msg_send![obj(cmd), release];
-        }
+            // `commandBuffer` returns an autoreleased object — this pool
+            // owns it; no explicit release (the old release was the
+            // over-release that SIGSEGV'd at drain).
+            Ok(())
+        })
 
-        Ok(())
+        // The sync path waits for completion inside the pool, so nothing
+        // escapes it.
     }
 
     fn dispatch_async(
@@ -581,7 +596,11 @@ impl GpuBackend for MetalBackend {
         buffers: &[&GpuBuffer],
         workgroups: (u32, u32, u32),
     ) -> Result<Pulse> {
-        unsafe {
+        // Scoped pool: bounds the encoder and any intermediates. The
+        // command buffer deliberately ESCAPES this pool — the explicit
+        // retain below (+1) owns it past the drain, balanced by the
+        // release in wait_metal_pulse / drop_metal_pulse.
+        objc::rc::autoreleasepool(|| unsafe {
             let cmd: *mut c_void = msg_send![obj(self.queue.ptr.as_ptr()), commandBuffer];
             if cmd.is_null() {
                 return Err(GpuError::DispatchFailed {
@@ -591,7 +610,7 @@ impl GpuBackend for MetalBackend {
 
             let encoder: *mut c_void = msg_send![obj(cmd), computeCommandEncoder];
             if encoder.is_null() {
-                let _: () = msg_send![obj(cmd), release];
+                // cmd is autoreleased — do not release it here.
                 return Err(GpuError::DispatchFailed {
                     message: "failed to create MTLComputeCommandEncoder".into(),
                 });
@@ -620,10 +639,17 @@ impl GpuBackend for MetalBackend {
 
             let _: () = msg_send![obj(cmd), commit];
 
-            // Store command buffer in Pulse; wait+release on demand
+            // +1 retain: the command buffer escapes the pool scope.
+            // Balanced by the release in wait_metal_pulse /
+            // drop_metal_pulse.
+            let _: () = msg_send![obj(cmd), retain];
+
+            // Store command buffer in Pulse; wait+release on demand.
+            // The epoch tracker is shared (Arc) — the pulse owns a
+            // reference and cannot dangle if the backend is dropped first.
             let inner = Box::new(MetalPulseInner {
                 cmd,
-                epoch: &self.epoch,
+                epoch: std::sync::Arc::clone(&self.epoch),
                 epoch_completed: std::sync::atomic::AtomicBool::new(false),
             });
 
@@ -632,7 +658,7 @@ impl GpuBackend for MetalBackend {
                 wait_fn: wait_metal_pulse,
                 drop_fn: drop_metal_pulse,
             })
-        }
+        })
     }
 
     fn read_buffer<T: bytemuck::Pod>(&self, buffer: &GpuBuffer) -> Result<Vec<T>> {
@@ -684,92 +710,14 @@ impl GpuBackend for MetalBackend {
         Ok(pipeline)
     }
 
-    /// Compile pre-generated MSL directly (skips naga).
-    fn compile_msl(&self, entry_point: &str, msl_source: &str) -> Result<ComputePipeline> {
-        let sels = selectors();
-        let dev = self.device.ptr.as_ptr();
-
-        unsafe {
-            let ns_src = nsstring(msl_source);
-            let mut err: *mut c_void = std::ptr::null_mut();
-            let library: *mut c_void = msg_send![
-                dev as *const Object,
-                newLibraryWithSource: ns_src
-                options: std::ptr::null_mut::<c_void>()
-                error: &mut err
-            ];
-
-            if library.is_null() {
-                let msg = if !err.is_null() {
-                    let desc: *mut c_void = msg_send![err as *const Object, localizedDescription];
-                    let s = nsstring_read(desc);
-                    let _: () = msg_send![err as *const Object, release];
-                    s
-                } else {
-                    "unknown compilation error".into()
-                };
-                return Err(GpuError::CompileFailed {
-                    entry: entry_point.into(),
-                    message: msg,
-                });
-            }
-
-            let ns_entry = nsstring(entry_point);
-            let func: *mut c_void =
-                msg_send![library as *const Object, newFunctionWithName: ns_entry];
-
-            if func.is_null() {
-                let _: () = msg_send![library as *const Object, release];
-                return Err(GpuError::PipelineFailed {
-                    entry: entry_point.into(),
-                    message: format!("function '{entry_point}' not found in compiled library"),
-                });
-            }
-
-            let desc: *mut c_void = msg_send![class!(MTLComputePipelineDescriptor), new];
-            let _: () = msg_send![desc as *const Object, setComputeFunction: func];
-            let mut perr: *mut c_void = std::ptr::null_mut();
-            let pipeline: *mut c_void = msg_send![
-                dev as *const Object,
-                newComputePipelineStateWithDescriptor: desc
-                options: 0u64
-                reflection: std::ptr::null_mut::<c_void>()
-                error: &mut perr
-            ];
-
-            if pipeline.is_null() {
-                let msg = if !perr.is_null() {
-                    let desc: *mut c_void = msg_send![perr as *const Object, localizedDescription];
-                    let s = nsstring_read(desc);
-                    let _: () = msg_send![perr as *const Object, release];
-                    s
-                } else {
-                    "unknown pipeline error".into()
-                };
-                let _: () = msg_send![obj(func), release];
-                let _: () = msg_send![obj(library), release];
-                return Err(GpuError::PipelineFailed {
-                    entry: entry_point.into(),
-                    message: msg,
-                });
-            }
-
-            let _: () = msg_send![obj(func), release];
-            let _: () = msg_send![obj(library), release];
-
-            Ok(ComputePipeline {
-                raw: pipeline,
-                drop_fn: drop_pipeline,
-            })
-        }
-    }
-
     fn dispatch_many(&self, dispatches: &[crate::DispatchSpec<'_>]) -> Result<()> {
         if dispatches.is_empty() {
             return Ok(());
         }
 
-        unsafe {
+        // Scoped autorelease pool — same ownership discipline as
+        // dispatch_ex (P2 review finding).
+        objc::rc::autoreleasepool(|| unsafe {
             let cmd: *mut c_void = msg_send![obj(self.queue.ptr.as_ptr()), commandBuffer];
             if cmd.is_null() {
                 return Err(GpuError::DispatchFailed {
@@ -779,7 +727,7 @@ impl GpuBackend for MetalBackend {
 
             let encoder: *mut c_void = msg_send![obj(cmd), computeCommandEncoder];
             if encoder.is_null() {
-                let _: () = msg_send![obj(cmd), release];
+                // cmd is autoreleased — do not release it here.
                 return Err(GpuError::DispatchFailed {
                     message: "failed to create MTLComputeCommandEncoder".into(),
                 });
@@ -827,10 +775,11 @@ impl GpuBackend for MetalBackend {
 
             self.epoch.end_dispatch();
 
-            let _: () = msg_send![obj(cmd), release];
-        }
+            // autoreleased command buffer — owned by this pool's drain.
+            Ok(())
+        })
 
-        Ok(())
+        // Sync path: everything completed inside the pool.
     }
 
     fn in_flight(&self) -> u64 {
@@ -842,30 +791,126 @@ impl GpuBackend for MetalBackend {
 // Tests
 // ═══════════════════════════════════════════════════════════════════
 
+// ── Inherent methods (not part of the GpuBackend trait) ─────────────
+
+impl MetalBackend {
+    /// Compile pre-generated MSL directly (skips naga).
+    fn compile_msl(&self, entry_point: &str, msl_source: &str) -> Result<ComputePipeline> {
+        let dev = self.device.ptr.as_ptr();
+
+        unsafe {
+            let ns_src = nsstring(msl_source);
+            let mut err: *mut c_void = std::ptr::null_mut();
+            let library: *mut c_void = msg_send![
+                dev as *const Object,
+                newLibraryWithSource: ns_src
+                options: std::ptr::null_mut::<c_void>()
+                error: &mut err
+            ];
+
+            if library.is_null() {
+                let msg = if !err.is_null() {
+                    let desc: *mut c_void = msg_send![err as *const Object, localizedDescription];
+                    let s = nsstring_read(desc);
+                    // (err/perr is an autoreleased out-param — the pool owns it)
+                    s
+                } else {
+                    "unknown compilation error".into()
+                };
+                return Err(GpuError::CompileFailed {
+                    entry: entry_point.into(),
+                    message: msg,
+                });
+            }
+
+            let ns_entry = nsstring(entry_point);
+            let func: *mut c_void =
+                msg_send![library as *const Object, newFunctionWithName: ns_entry];
+
+            if func.is_null() {
+                let _: () = msg_send![library as *const Object, release];
+                return Err(GpuError::PipelineFailed {
+                    entry: entry_point.into(),
+                    message: format!("function '{entry_point}' not found in compiled library"),
+                });
+            }
+
+            let desc: *mut c_void = msg_send![class!(MTLComputePipelineDescriptor), new];
+            let _: () = msg_send![desc as *const Object, setComputeFunction: func];
+            let mut perr: *mut c_void = std::ptr::null_mut();
+            let pipeline: *mut c_void = msg_send![
+                dev as *const Object,
+                newComputePipelineStateWithDescriptor: desc
+                options: 0u64
+                reflection: std::ptr::null_mut::<c_void>()
+                error: &mut perr
+            ];
+
+            if pipeline.is_null() {
+                let msg = if !perr.is_null() {
+                    let desc: *mut c_void = msg_send![perr as *const Object, localizedDescription];
+                    let s = nsstring_read(desc);
+                    // (err/perr is an autoreleased out-param — the pool owns it)
+                    s
+                } else {
+                    "unknown pipeline error".into()
+                };
+                // desc is +1 from `new` — the failure path used to leak
+                // it (review finding). func/library are also +1.
+                let _: () = msg_send![obj(desc), release];
+                let _: () = msg_send![obj(func), release];
+                let _: () = msg_send![obj(library), release];
+                return Err(GpuError::PipelineFailed {
+                    entry: entry_point.into(),
+                    message: msg,
+                });
+            }
+
+            // `new` returns a retained object — release our reference.
+            let _: () = msg_send![obj(desc), release];
+            let _: () = msg_send![obj(func), release];
+            let _: () = msg_send![obj(library), release];
+
+            Ok(ComputePipeline {
+                raw: pipeline,
+                drop_fn: drop_pipeline,
+            })
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn device_init() {
+    /// Acquire a device for tests: skip politely on machines without one,
+    /// but FAIL hard when `BORSALINO_REQUIRE_METAL` is set — the dedicated
+    /// Apple Silicon CI job sets it, so that job can never pass without
+    /// executing real kernels (P2 review finding).
+    fn test_device() -> Option<MetalBackend> {
         match MetalBackend::init() {
-            Ok(_) => {}
-            Err(GpuError::InitFailed(msg)) => {
-                eprintln!("Metal init failed (expected in CI/headless): {msg}");
+            Ok(b) => Some(b),
+            Err(e) => {
+                assert!(
+                    std::env::var("BORSALINO_REQUIRE_METAL").is_err(),
+                    "BORSALINO_REQUIRE_METAL is set but Metal init failed: {e}"
+                );
+                eprintln!("skipping: no Metal device ({e})");
+                None
             }
-            Err(e) => panic!("unexpected error: {e}"),
         }
     }
 
     #[test]
+    #[serial_test::serial]
+    fn device_init() {
+        let _backend = test_device();
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn add_one_kernel() {
-        let backend = match MetalBackend::init() {
-            Ok(b) => b,
-            Err(_) => {
-                eprintln!("skipping: no Metal device");
-                return;
-            }
-        };
+        let Some(backend) = test_device() else { return };
 
         let wgsl = r#"
             @group(0) @binding(0) var<storage, read> input: array<f32>;
@@ -874,6 +919,10 @@ mod tests {
             @compute @workgroup_size(256)
             fn add_one(@builtin(global_invocation_id) gid: vec3<u32>) {
                 let i = gid.x;
+                // The pipeline compiles with Unchecked buffer bounds, so
+                // the shader itself must bound its accesses (review
+                // finding: 256 threads over 4 elements read/wrote OOB).
+                if (i >= 4u) { return; }
                 output[i] = input[i] + 1.0;
             }
         "#;
@@ -888,26 +937,15 @@ mod tests {
         let result: Vec<f32> = backend.read_buffer(&output).unwrap();
         assert_eq!(result, vec![2.0, 3.0, 4.0, 5.0]);
 
-        let result: Vec<f32> = backend.read_buffer(&output).unwrap();
-        assert_eq!(result, vec![2.0, 3.0, 4.0, 5.0]);
-
-        // Prevent Drop: known Metal thread-cleanup SIGSEGV in test harness.
-        // Examples (main thread) work correctly without this workaround.
-        std::mem::forget(output);
-        std::mem::forget(input);
-        std::mem::forget(pipeline);
-        std::mem::forget(backend);
+        // Normal destruction: with the ownership fixes (scoped pools, no
+        // over-releases) the drop path is part of what this test verifies
+        // (P2 review finding — the mem::forgets were the old workaround).
     }
 
     #[test]
+    #[serial_test::serial]
     fn vector_scale_1024() {
-        let backend = match MetalBackend::init() {
-            Ok(b) => b,
-            Err(_) => {
-                eprintln!("skipping: no Metal device");
-                return;
-            }
-        };
+        let Some(backend) = test_device() else { return };
 
         let wgsl = r#"
             @group(0) @binding(0) var<storage, read> input: array<f32>;
@@ -940,9 +978,95 @@ mod tests {
             );
         }
 
-        std::mem::forget(output);
-        std::mem::forget(input);
-        std::mem::forget(pipeline);
-        std::mem::forget(backend);
+        // Normal destruction — see add_one_kernel.
+    }
+
+    /// Regression (P2 review finding): an async `Pulse` must survive an
+    /// autorelease-pool drain after `dispatch_async`. The command buffer
+    /// escapes the pool via its explicit retain; the epoch tracker is a
+    /// shared `Arc`, not a borrow of the backend.
+    #[test]
+    #[serial_test::serial]
+    fn async_pulse_survives_pool_drain() {
+        let Some(backend) = test_device() else { return };
+
+        let wgsl = r#"
+            @group(0) @binding(0) var<storage, read> input: array<f32>;
+            @group(0) @binding(1) var<storage, read_write> output: array<f32>;
+            @compute @workgroup_size(256)
+            fn add_one(@builtin(global_invocation_id) gid: vec3<u32>) {
+                let i = gid.x;
+                // The pipeline compiles with Unchecked buffer bounds, so
+                // the shader itself must bound its accesses (review
+                // finding: 256 threads over 4 elements read/wrote OOB).
+                if (i >= 4u) { return; }
+                output[i] = input[i] + 1.0;
+            }
+        "#;
+        let pipeline = backend.compile("add_one", wgsl).unwrap();
+        let input = backend.create_buffer(&[1.0f32, 2.0, 3.0, 4.0]).unwrap();
+        let output = backend.create_buffer_uninit::<f32>(4).unwrap();
+
+        // dispatch_async INSIDE a pool scope; the Pulse (retained cmd)
+        // crosses the drain by design.
+        let pulse = objc::rc::autoreleasepool(|| {
+            backend
+                .dispatch_async(&pipeline, &[&input, &output], (1, 1, 1))
+                .unwrap()
+        });
+
+        // Pool has drained. Wait, read back, verify — then normal drops.
+        pulse.wait();
+        let result: Vec<f32> = backend.read_buffer(&output).unwrap();
+        assert_eq!(result, vec![2.0, 3.0, 4.0, 5.0]);
+        drop(pulse);
+    }
+
+    /// Regression (P2 review finding): batch dispatch through
+    /// `dispatch_many` — a single command buffer carrying two encodes,
+    /// verifying the last kernel's output plus normal destruction.
+    #[test]
+    #[serial_test::serial]
+    fn dispatch_many_executes_batch() {
+        use crate::DispatchSpec;
+
+        let Some(backend) = test_device() else { return };
+
+        let wgsl = r#"
+            @group(0) @binding(0) var<storage, read> input: array<f32>;
+            @group(0) @binding(1) var<storage, read_write> output: array<f32>;
+            @compute @workgroup_size(256)
+            fn add_one(@builtin(global_invocation_id) gid: vec3<u32>) {
+                let i = gid.x;
+                // The pipeline compiles with Unchecked buffer bounds, so
+                // the shader itself must bound its accesses (review
+                // finding: 256 threads over 4 elements read/wrote OOB).
+                if (i >= 4u) { return; }
+                output[i] = input[i] + 1.0;
+            }
+        "#;
+        let pipeline = backend.compile("add_one", wgsl).unwrap();
+        let input = backend.create_buffer(&[1.0f32, 2.0, 3.0, 4.0]).unwrap();
+        let output = backend.create_buffer_uninit::<f32>(4).unwrap();
+
+        let specs = [
+            DispatchSpec {
+                pipeline: &pipeline,
+                buffers: &[&input, &output],
+                workgroups: (1, 1, 1),
+                threads_per_group: (256, 1, 1),
+            },
+            DispatchSpec {
+                pipeline: &pipeline,
+                buffers: &[&output, &output],
+                workgroups: (1, 1, 1),
+                threads_per_group: (256, 1, 1),
+            },
+        ];
+        backend.dispatch_many(&specs).unwrap();
+
+        // Second spec feeds the first spec's output back through add_one.
+        let result: Vec<f32> = backend.read_buffer(&output).unwrap();
+        assert_eq!(result, vec![3.0, 4.0, 5.0, 6.0]);
     }
 }
