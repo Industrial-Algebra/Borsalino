@@ -1,8 +1,9 @@
 # Borsalino → Zunesha Migration Plan
 
 - **Date:** 2026-10-08
-- **Status:** approved and in execution — Phase 0/1 landed from this plan's
-  session; Phases 2–4 pending
+- **Status:** approved and in execution — Phase 0 (kernel guard, PR #58)
+  and Phase 1 (the swap, PR #59) filed from this plan's session, awaiting
+  review; Phases 2–4 pending
 - **Decision (Justin, 2026-10-08):** **staged migration — Vulkan first.**
   Borsalino's Vulkan backend swaps onto `zunesha::Device` now; the Metal
   backend keeps its internal device behind the same `GpuBackend` trait until
