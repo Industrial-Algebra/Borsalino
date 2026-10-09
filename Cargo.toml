@@ -16,13 +16,22 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
 [features]
 default = []
 metal = []
-vulkan = ["dep:ash"]
+vulkan = ["dep:ash", "dep:zunesha", "zunesha/vulkan"]
 verify = ["dep:karpal-verify", "dep:karpal-proof", "dep:rand"]
 
 [dependencies]
 thiserror = "2"
 bytemuck = { version = "1", features = ["derive"] }
 naga = { version = "27", features = ["wgsl-in", "spv-out", "msl-out"] }
+
+# Device substrate: instance/queue/buffer ownership lives in Zunesha;
+# Borsalino keeps pipelines, dispatch, and verification (ADR 0003).
+#
+# TEMPORARY git dep: Phase 1 needs Zunesha's `VulkanDevice: Send + Sync`
+# (soundness of `Arc<VulkanDevice>` sharing) which is unpublished — it rides
+# Zunesha PR #9's branch. FLIP TO `version = "0.1"` (≥0.1.1) BEFORE MERGE,
+# once Zunesha 0.1.1 is on crates.io.
+zunesha = { git = "https://github.com/Industrial-Algebra/Zunesha", branch = "feat/device-buffer-override", optional = true }
 
 # Verification (GPU safety properties, obligation bundles)
 # For local development, add: path = "../karpal/karpal-verify"

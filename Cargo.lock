@@ -57,6 +57,7 @@ dependencies = [
  "rand",
  "serial_test",
  "thiserror",
+ "zunesha",
 ]
 
 [[package]]
@@ -588,4 +589,14 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "zunesha"
+version = "0.1.0"
+source = "git+https://github.com/Industrial-Algebra/Zunesha?branch=feat%2Fdevice-buffer-override#6b17ca7dc4f84ed5e06b82c848fb5a1c89a53a6b"
+dependencies = [
+ "ash",
+ "bytemuck",
+ "thiserror",
 ]
