@@ -121,7 +121,6 @@ fn contents_of(raw: *mut c_void) -> *const c_void {
 /// syntax. Converts to pointer syntax and strips unused structs.
 fn naga_msl_fixup(msl: &str) -> String {
     let mut out = String::with_capacity(msl.len());
-    let mut in_buffer_sizes = false;
 
     for line in msl.lines() {
         let trimmed = line.trim();
@@ -136,22 +135,13 @@ fn naga_msl_fixup(msl: &str) -> String {
             continue;
         }
 
-        // Skip `_mslBufferSizes` struct (stateful: skip until closing };)
-        if trimmed == "struct _mslBufferSizes {" {
-            in_buffer_sizes = true;
-            continue;
-        }
-        if in_buffer_sizes {
-            if trimmed == "};" {
-                in_buffer_sizes = false;
-            }
-            continue;
-        }
-
-        // Skip lines containing `_buffer_sizes` (the parameter)
-        if trimmed.contains("_buffer_sizes") {
-            continue;
-        }
+        // NOTE: the `_mslBufferSizes` struct and its `_buffer_sizes`
+        // kernel parameter are KEPT — naga emits them unconditionally
+        // (slot 30, per `sizes_buffer` in `compile`), and kernels using
+        // `arrayLength` dereference them. The dispatch paths bind the
+        // byte-size constant at slot 30 (`bind_buffer_sizes`). Stripping
+        // them used to corrupt any arrayLength kernel's signature (the
+        // macOS CI failure on the first cut of the batched-kernel guard).
 
         // Fix `metal::uint3` → `uint3`
         let line = line.replace("metal::uint3", "uint3");
@@ -264,6 +254,61 @@ fn drop_metal_pulse(raw: *mut std::ffi::c_void) {
                 inner.epoch.end_dispatch();
             }
             let _: () = msg_send![obj(inner.cmd), release];
+        }
+    }
+}
+
+/// Bind the naga `_mslBufferSizes` constant (slot 30 — must match
+/// `sizes_buffer` in `compile`): one byte-size per bound runtime-array
+/// buffer, zero-padded to the max binding count. Kernels translated from
+/// WGSL `arrayLength` dereference this constant to recover buffer bounds.
+///
+/// # Ownership
+///
+/// `newBufferWithBytes` is a `new…` method (+1 retain). The caller must
+/// `release` the returned buffer after `endEncoding` — Metal retains
+/// resources referenced by encoded commands in the command buffer, so the
+/// release is safe even for async dispatches whose command buffers are
+/// still in flight.
+///
+/// Returns `None` if the allocation failed.
+unsafe fn bind_buffer_sizes(
+    dev: *mut std::ffi::c_void,
+    encoder: *mut std::ffi::c_void,
+    buffers: &[&GpuBuffer],
+) -> Option<*mut std::ffi::c_void> {
+    /// Must cover every `@binding` a kernel can declare (the Vulkan twin's
+    /// `MAX_BUFFER_BINDINGS`).
+    const MAX_BINDINGS: usize = 8;
+    const SIZES_SLOT: u64 = 30;
+
+    let mut sizes = [0u32; MAX_BINDINGS];
+    for (i, b) in buffers.iter().enumerate().take(MAX_BINDINGS) {
+        sizes[i] = (b.len * b.element_size) as u32;
+    }
+
+    let buf: *mut std::ffi::c_void = unsafe {
+        msg_send![
+            obj(dev),
+            newBufferWithBytes: sizes.as_ptr() as *const std::ffi::c_void
+            length: std::mem::size_of_val(&sizes) as u64
+            options: 0u64
+        ]
+    };
+    if buf.is_null() {
+        return None;
+    }
+    unsafe {
+        let _: () = msg_send![obj(encoder), setBuffer: buf offset: 0u64 atIndex: SIZES_SLOT];
+    }
+    Some(buf)
+}
+
+/// Release a sizes buffer previously returned by [`bind_buffer_sizes`].
+unsafe fn release_sizes_buffer(buf: *mut std::ffi::c_void) {
+    if !buf.is_null() {
+        unsafe {
+            let _: () = msg_send![obj(buf), release];
         }
     }
 }
@@ -563,6 +608,13 @@ impl GpuBackend for MetalBackend {
                 ];
             }
 
+            // Bind the naga buffer-sizes constant (arrayLength support)
+            let sizes_buf = bind_buffer_sizes(self.device.ptr.as_ptr(), encoder, buffers).ok_or(
+                GpuError::DispatchFailed {
+                    message: "failed to allocate _mslBufferSizes constant".into(),
+                },
+            )?;
+
             // Dispatch
             let _: () = msg_send![
                 obj(encoder),
@@ -572,6 +624,9 @@ impl GpuBackend for MetalBackend {
 
             // Finish
             let _: () = msg_send![obj(encoder), endEncoding];
+            // Encoded resources are retained by the command buffer — the
+            // sizes buffer can go now (objc ownership rule: new → release).
+            release_sizes_buffer(sizes_buf);
 
             self.epoch.begin_dispatch();
 
@@ -627,6 +682,13 @@ impl GpuBackend for MetalBackend {
                 ];
             }
 
+            // Bind the naga buffer-sizes constant (arrayLength support)
+            let sizes_buf = bind_buffer_sizes(self.device.ptr.as_ptr(), encoder, buffers).ok_or(
+                GpuError::DispatchFailed {
+                    message: "failed to allocate _mslBufferSizes constant".into(),
+                },
+            )?;
+
             let _: () = msg_send![
                 obj(encoder),
                 dispatchThreadgroups: (workgroups.0 as u64, workgroups.1 as u64, workgroups.2 as u64)
@@ -634,6 +696,9 @@ impl GpuBackend for MetalBackend {
             ];
 
             let _: () = msg_send![obj(encoder), endEncoding];
+            // Encoded resources are retained by the (async) command buffer
+            // until it completes — release our +1 now.
+            unsafe { release_sizes_buffer(sizes_buf) };
 
             self.epoch.begin_dispatch();
 
@@ -733,6 +798,9 @@ impl GpuBackend for MetalBackend {
                 });
             }
 
+            // Sizes buffers (one per spec) — released after endEncoding.
+            let mut sizes_bufs: Vec<*mut c_void> = Vec::with_capacity(dispatches.len());
+
             for spec in dispatches {
                 // Set pipeline
                 let _: () = msg_send![
@@ -749,6 +817,15 @@ impl GpuBackend for MetalBackend {
                         atIndex: i as u64
                     ];
                 }
+
+                // Bind the naga buffer-sizes constant (arrayLength
+                // support) — one per spec; slot 30 is overwritten per
+                // dispatch, matching the encoder's sequential encoding.
+                let sizes_buf = bind_buffer_sizes(self.device.ptr.as_ptr(), encoder, spec.buffers)
+                    .ok_or(GpuError::DispatchFailed {
+                        message: "failed to allocate _mslBufferSizes constant".into(),
+                    })?;
+                sizes_bufs.push(sizes_buf);
 
                 // Dispatch
                 let _: () = msg_send![
@@ -767,6 +844,11 @@ impl GpuBackend for MetalBackend {
             }
 
             let _: () = msg_send![obj(encoder), endEncoding];
+            // Encoded resources are retained by the command buffer —
+            // release our +1s now.
+            for sb in sizes_bufs {
+                release_sizes_buffer(sb);
+            }
 
             self.epoch.begin_dispatch();
 
