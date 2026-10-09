@@ -42,7 +42,7 @@ design refuses pipelines and verification — those stay Borsalino's.
 | Queue family selection | **Zunesha** | Borsalino reads `queues().compute` (`Queue::raw` + `family_index`) |
 | Memory strategy negotiation, `find_memory_type_index`, `align_up`, `detect_device_local` | **Zunesha** | `MemoryStrategy` is the same enum, lifted from this design — 1:1 |
 | Buffer create/read (strategy-respecting) | **Zunesha** | staging design is identical (same code lineage) |
-| `create_device_buffer` (forced device-local) | **Borsalino, until Phase 2** | Zunesha 0.1.0 lacks the override (§5.1); Borsalino keeps its own raw allocation via `raw_device()` + `memory_properties()` |
+| `create_device_buffer` (GPU-resident profile) | **Borsalino, until Phase 2** | Zunesha 0.1.0's default delegates to `create_buffer`; Borsalino's temp-staging profile is a memory-vs-read-latency tradeoff (§5.1) — kept on `raw_device()` + `memory_properties()` until the profile alignment is an explicit decision |
 | WGSL→SPIR-V (naga), `compile_cached`, disk cache | **Borsalino** | unchanged |
 | Pipeline layout / descriptor sets / shader modules | **Borsalino** | built on `raw_device()` |
 | Command pools, dispatch, `dispatch_many`, fences/`Pulse` | **Borsalino** | built on `raw_device()` + compute queue |
@@ -99,16 +99,27 @@ vulkan = ["dep:ash", "dep:zunesha", "zunesha/vulkan"]
 
 ## 5. Zunesha-side companion work
 
-### 5.1 Gap found by this survey — `create_device_buffer` override (Zunesha PR, patch release)
+### 5.1 Gap found by this survey — `create_device_buffer` placement semantics (Zunesha PR, patch release)
 
-Borsalino overrides `create_device_buffer(_uninit)` to force device-local
-allocation **even under forced `Unified` strategy** (GPU-resident weights on
-discrete hardware). Zunesha 0.1.0's `VulkanDevice` inherits the trait default
-(delegates to `create_buffer` = strategy-respecting), so full delegation
-would regress that behavior. Zunesha PR: override both methods on
-`VulkanDevice` to take the device-local path unconditionally. Until it is
-published, Borsalino keeps its own implementation for those two methods only
-(Phase 1); delegation lands in Phase 2.
+> **Corrected 2026-10-08 after deeper reading** — the first draft of this
+> section overstated the gap. The accurate picture:
+
+Borsalino's `create_device_buffer(_uninit)` override is a *memory-profile*
+optimization, not a forced-placement one: under a device-local strategy it
+allocates device-local with **temp** staging (allocate → upload → free;
+ readback allocates staging on demand), and under forced `Unified` it simply
+takes the host-visible path (diverging from the trait's own "device-local"
+doc wording). Zunesha 0.1.0's trait default also delegates to
+`create_buffer`, and Zunesha's PR #9 now implements the documented contract:
+`create_device_buffer` **forces** device-local + persistent staging
+regardless of strategy.
+
+Consequence for this migration: **delegating `create_device_buffer` in
+Phase 1 would change behavior twice** (forced placement under
+`Unified`, persistent vs temp staging) — so Borsalino keeps its own raw
+implementation until Phase 2 makes the profile alignment an *explicit,
+tested* decision (align to Zunesha's documented contract, or carry the
+write-optimized profile). Zunesha 0.1.0 registry is sufficient for Phase 1.
 
 ### 5.2 Flagged follow-up — blanket `device_wait_idle` in `VulkanDevice::Drop`
 
@@ -167,10 +178,15 @@ collapse and the init-delegation are one change):
 
 ### Phase 2 — finish the collapse (after Zunesha 0.1.1)
 
-Delegate `create_device_buffer(_uninit)` to Zunesha; delete Borsalino's
-remaining allocation code (`find_memory_type_index`, `align_up`,
-`detect_device_local`, device-local allocate paths). Small PR, tests:
-`create_device_buffer` placement test under forced-`Unified` on discrete hw.
+Make the `create_device_buffer` profile alignment an explicit, tested
+decision (§5.1): either delegate to Zunesha's documented contract
+(forced device-local + persistent staging — behavior change under forced
+`Unified`, changelog-noted) or port the temp-staging write-optimized
+profile into Zunesha as a buffer profile parameter. Then delete
+Borsalino's remaining allocation code (`find_memory_type_index`,
+`align_up`, `detect_device_local`, device-local allocate paths). Tests:
+`create_device_buffer` placement + readback under both strategies on
+discrete hardware.
 
 ### Phase 3 — Metal migration (after Zunesha Metal; parallel track)
 
