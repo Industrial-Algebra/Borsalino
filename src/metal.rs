@@ -972,13 +972,23 @@ impl GpuBackend for MetalBackend {
                 // support) — one per spec; slot 30 is overwritten per
                 // dispatch, matching the encoder's sequential encoding.
                 // Ok(None) = spec kernel has no sizes constant; release
-                // handles absence as a no-op.
-                let sizes_buf = bind_buffer_sizes(
+                // handles absence as a no-op. On failure, release every
+                // sizes buffer collected so far before propagating — the
+                // final release loop is bypassed by `?` (review r3 P2).
+                let sizes_buf = match bind_buffer_sizes(
                     self.device.ptr.as_ptr(),
                     encoder,
                     spec.pipeline.raw,
                     spec.buffers,
-                )?;
+                ) {
+                    Ok(sb) => sb,
+                    Err(e) => {
+                        for sb in sizes_bufs.drain(..) {
+                            release_sizes_buffer(sb);
+                        }
+                        return Err(e);
+                    }
+                };
                 sizes_bufs.push(sizes_buf);
 
                 // Dispatch
