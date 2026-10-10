@@ -1584,7 +1584,8 @@ mod tests {
             std::ptr::eq((buf.contents_fn)(buf.raw), SUBSTRATE_BUFFER_TAG),
             "device buffer must be substrate-backed (sentinel tag)"
         );
-        // Substrate drop path (Borsalino's VulkanBufferInner drop is gone).
+        // Substrate drop path (the deleted Borsalino-allocated kind's
+        // drop function must NOT be in use anymore).
         assert!(
             std::ptr::eq(buf.drop_fn as *const (), drop_zunesha_buffer as *const ()),
             "device buffer must use the substrate drop function"
