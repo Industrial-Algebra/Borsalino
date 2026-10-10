@@ -593,8 +593,9 @@ dependencies = [
 
 [[package]]
 name = "zunesha"
-version = "0.1.0"
-source = "git+https://github.com/Industrial-Algebra/Zunesha?branch=feat%2Fdevice-buffer-override#6b3540a1b99b6dec686d386f805e5118a8c56b77"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fe5efd32d94091ddc94257f313dd374927f7369ff2a1f973d336165a84f08787"
 dependencies = [
  "ash",
  "bytemuck",

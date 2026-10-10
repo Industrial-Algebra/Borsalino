@@ -4,6 +4,12 @@ All notable changes to Borsalino are documented in this file.
 
 ## [Unreleased]
 
+### Changed — dependency flip (2026-10-10)
+
+- `zunesha` dependency flipped from the temporary git dep on the
+  `feat/device-buffer-override` branch to `version = "0.1.1"` from
+  crates.io (published today). The staged git-dep exception is closed.
+
 ### Fixed — review round 2 (2026-10-10)
 
 - Allocation-failure leaks on every error path: `create_device_buffer`
