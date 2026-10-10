@@ -189,8 +189,46 @@ impl VulkanBackend {
     }
 
     /// Build the dispatch plumbing on a substrate device.
+    ///
+    /// Failure at any step releases everything created so far (review
+    /// round 2: construction used to leak all prior resources) via the
+    /// armed guard below; success disarms it.
     fn build(z: Arc<zunesha::vulkan::VulkanDevice>) -> Result<Self> {
+        /// Destroys registered resources in reverse creation order when
+        /// dropped while still armed — i.e. on any `?` exit of `build`.
+        struct Cleanup<'a> {
+            fns: Vec<Box<dyn FnOnce() + 'a>>,
+            armed: bool,
+        }
+        impl Drop for Cleanup<'_> {
+            fn drop(&mut self) {
+                if self.armed {
+                    for f in self.fns.drain(..).rev() {
+                        f();
+                    }
+                }
+            }
+        }
         let device = z.raw_device();
+        // Shared by-ref copy for the guard closures (a &Device is Copy;
+        // passing &device inline would move device into the closure).
+        // Declared BEFORE `cleanup` so `device` outlives the guard.
+        let dev = &device;
+        let mut cleanup = Cleanup {
+            fns: Vec::new(),
+            armed: true,
+        };
+
+        // `device` is passed by the caller's tokens: identifiers written
+        // in this macro body resolve at the definition site and would not
+        // see `build`'s locals (macro_rules hygiene).
+        macro_rules! guard {
+            ($dev:expr, $destroy:expr) => {
+                cleanup
+                    .fns
+                    .push(Box::new(move || unsafe { $destroy($dev) }));
+            };
+        }
         let compute = z.queues().compute;
         let queue_family_index = compute.family_index;
         let min_storage_buffer_offset_alignment = z.limits().min_storage_buffer_offset_alignment;
@@ -224,6 +262,8 @@ impl VulkanBackend {
                 .create_descriptor_set_layout(&dsl_info, None)
                 .map_err(|e| GpuError::InitFailed(format!("create descriptor set layout: {e}")))?
         };
+        guard!(dev, |d: &ash::Device| d
+            .destroy_descriptor_set_layout(descriptor_set_layout, None));
 
         // ── Pipeline layout ────────────────────────────────────────
 
@@ -235,6 +275,8 @@ impl VulkanBackend {
                 .create_pipeline_layout(&layout_info, None)
                 .map_err(|e| GpuError::InitFailed(format!("create pipeline layout: {e}")))?
         };
+        guard!(dev, |d: &ash::Device| d
+            .destroy_pipeline_layout(pipeline_layout, None));
 
         // ── Descriptor pool ────────────────────────────────────────
 
@@ -251,6 +293,9 @@ impl VulkanBackend {
                 .create_descriptor_pool(&pool_info, None)
                 .map_err(|e| GpuError::InitFailed(format!("create descriptor pool: {e}")))?
         };
+        // Destroying the pool frees the descriptor sets allocated from it.
+        guard!(dev, |d: &ash::Device| d
+            .destroy_descriptor_pool(descriptor_pool, None));
 
         // ── Pre-allocate descriptor set ───────────────────────────
 
@@ -275,6 +320,8 @@ impl VulkanBackend {
                 .create_command_pool(&cmd_pool_info, None)
                 .map_err(|e| GpuError::InitFailed(format!("create command pool: {e}")))?
         };
+        guard!(dev, |d: &ash::Device| d
+            .destroy_command_pool(command_pool, None));
 
         // ── Transfer command pool ─────────────────────────────────
 
@@ -287,6 +334,8 @@ impl VulkanBackend {
                 .create_command_pool(&transfer_cmd_pool_info, None)
                 .map_err(|e| GpuError::InitFailed(format!("create transfer pool: {e}")))?
         };
+        guard!(dev, |d: &ash::Device| d
+            .destroy_command_pool(transfer_command_pool, None));
 
         // ── Timestamp query pool ─────────────────────────────────
 
@@ -299,12 +348,14 @@ impl VulkanBackend {
                     .create_query_pool(&pool_info, None)
                     .map_err(|e| GpuError::InitFailed(format!("create timestamp pool: {e}")))?
             };
+            guard!(dev, |d: &ash::Device| d.destroy_query_pool(pool, None));
             Some(pool)
         } else {
             None
         };
         let timestamp_period = device_props.limits.timestamp_period;
 
+        cleanup.armed = false;
         Ok(Self {
             z,
             queue_family_index,
@@ -734,41 +785,59 @@ unsafe fn allocate_buffer(
     let mut flags = vk::MemoryPropertyFlags::HOST_VISIBLE
         | vk::MemoryPropertyFlags::HOST_COHERENT
         | vk::MemoryPropertyFlags::HOST_CACHED;
-    let mem_type_index =
-        find_memory_type_index(memory_properties, mem_reqs.memory_type_bits, flags).or_else(
-            |_| {
+    let mem_type_index = {
+        let preferred = find_memory_type_index(memory_properties, mem_reqs.memory_type_bits, flags);
+        match preferred {
+            Ok(idx) => Ok(idx),
+            Err(e) => {
                 flags =
                     vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
-                find_memory_type_index(memory_properties, mem_reqs.memory_type_bits, flags)
-            },
-        )?;
+                find_memory_type_index(memory_properties, mem_reqs.memory_type_bits, flags).map_err(
+                    |_| {
+                        // Review round 2: destroy the buffer created above.
+                        unsafe { device.destroy_buffer(buffer, None) };
+                        e
+                    },
+                )
+            }
+        }
+    }?;
 
     let alloc_info = vk::MemoryAllocateInfo::default()
         .allocation_size(mem_reqs.size)
         .memory_type_index(mem_type_index);
 
-    let memory = unsafe {
-        device
-            .allocate_memory(&alloc_info, None)
-            .map_err(|e| GpuError::BufferCreationFailed {
+    let memory = match unsafe { device.allocate_memory(&alloc_info, None) } {
+        Ok(memory) => memory,
+        Err(e) => {
+            unsafe { device.destroy_buffer(buffer, None) };
+            return Err(GpuError::BufferCreationFailed {
                 message: format!("vkAllocateMemory: {e}"),
-            })?
+            });
+        }
     };
 
-    unsafe {
-        device.bind_buffer_memory(buffer, memory, 0).map_err(|e| {
-            GpuError::BufferCreationFailed {
-                message: format!("vkBindBufferMemory: {e}"),
-            }
-        })?;
+    if let Err(e) = unsafe { device.bind_buffer_memory(buffer, memory, 0) } {
+        unsafe {
+            device.free_memory(memory, None);
+            device.destroy_buffer(buffer, None);
+        }
+        return Err(GpuError::BufferCreationFailed {
+            message: format!("vkBindBufferMemory: {e}"),
+        });
     }
 
-    let mapped = unsafe {
-        device
-            .map_memory(memory, 0, size, vk::MemoryMapFlags::empty())
-            .map_err(|e| GpuError::BufferCreationFailed {
+    let mapped = match unsafe { device.map_memory(memory, 0, size, vk::MemoryMapFlags::empty()) } {
+        Ok(mapped) => mapped,
+        Err(e) => {
+            unsafe {
+                device.free_memory(memory, None);
+                device.destroy_buffer(buffer, None);
+            }
+            return Err(GpuError::BufferCreationFailed {
                 message: format!("vkMapMemory: {e}"),
-            })?
+            });
+        }
     };
 
     Ok((buffer, memory, mapped))
@@ -801,26 +870,34 @@ unsafe fn allocate_device_local_buffer(
         memory_properties,
         mem_reqs.memory_type_bits,
         vk::MemoryPropertyFlags::DEVICE_LOCAL,
-    )?;
+    )
+    .inspect_err(|_| {
+        // Review round 2: destroy the buffer created above.
+        unsafe { device.destroy_buffer(buffer, None) }
+    })?;
 
     let alloc_info = vk::MemoryAllocateInfo::default()
         .allocation_size(mem_reqs.size)
         .memory_type_index(mem_type_index);
 
-    let memory = unsafe {
-        device
-            .allocate_memory(&alloc_info, None)
-            .map_err(|e| GpuError::BufferCreationFailed {
+    let memory = match unsafe { device.allocate_memory(&alloc_info, None) } {
+        Ok(memory) => memory,
+        Err(e) => {
+            unsafe { device.destroy_buffer(buffer, None) };
+            return Err(GpuError::BufferCreationFailed {
                 message: format!("vkAllocateMemory(device-local): {e}"),
-            })?
+            });
+        }
     };
 
-    unsafe {
-        device.bind_buffer_memory(buffer, memory, 0).map_err(|e| {
-            GpuError::BufferCreationFailed {
-                message: format!("vkBindBufferMemory(device-local): {e}"),
-            }
-        })?;
+    if let Err(e) = unsafe { device.bind_buffer_memory(buffer, memory, 0) } {
+        unsafe {
+            device.free_memory(memory, None);
+            device.destroy_buffer(buffer, None);
+        }
+        return Err(GpuError::BufferCreationFailed {
+            message: format!("vkBindBufferMemory(device-local): {e}"),
+        });
     }
 
     Ok((buffer, memory))
@@ -1067,14 +1144,26 @@ impl GpuBackend for VulkanBackend {
             });
         };
 
-        // On discrete GPU: upload via temp staging buffer, then free it
-        let (stg_buf, stg_mem, stg_mapped) = unsafe {
+        // On discrete GPU: upload via temp staging buffer, then free it.
+        // If the staging allocation itself fails, free the device
+        // allocation too — the owning inner does not exist yet (review
+        // round 2: staging-alloc failure leaked the device allocation).
+        let (stg_buf, stg_mem, stg_mapped) = match unsafe {
             allocate_buffer(
                 &self.vk(),
                 &self.memory_properties,
                 aligned_size,
                 vk::BufferUsageFlags::TRANSFER_SRC,
-            )?
+            )
+        } {
+            Ok(alloc) => alloc,
+            Err(e) => {
+                unsafe {
+                    self.vk().destroy_buffer(dev_buf, None);
+                    self.vk().free_memory(dev_mem, None);
+                }
+                return Err(e);
+            }
         };
 
         if byte_len > 0 {
