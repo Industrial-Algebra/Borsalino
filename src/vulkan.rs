@@ -1,14 +1,33 @@
 // Copyright (C) 2026 Industrial Algebra
 // SPDX-License-Identifier: Apache-2.0
 
-//! Vulkan compute backend via ash raw FFI.
+//! Vulkan compute backend via ash raw FFI, on the Zunesha device
+//! substrate.
 //!
 //! # Architecture
 //!
-//! Uses `ash` for raw Vulkan 1.3 bindings — the `objc_msgSend` equivalent
-//! for Vulkan. Shaders are authored in WGSL and translated to SPIR-V via
-//! `naga` at compile time. All dispatch is synchronous: command buffer →
-//! submit → wait_idle.
+//! The Vulkan **instance, physical-device selection, logical device,
+//! queues, and buffer memory** are owned by
+//! [`zunesha::vulkan::VulkanDevice`][zdv] — the shared substrate (Zunesha
+//! ADR 0001/0003). This backend holds it behind an [`Arc`] and builds
+//! Borsalino's own layer on top via the raw escape hatches
+//! (`raw_device`, `queues`, `limits`): pipelines (WGSL → SPIR-V via
+//! `naga`), descriptor sets, command pools, dispatch, timestamps, and the
+//! epoch tracker. All dispatch is synchronous: command buffer → submit →
+//! wait_idle. Every queue submission joins the substrate's protocol
+//! ([`VulkanDevice::with_compute_queue`]) — the compute queue is an
+//! externally synchronized Vulkan object shared with the substrate's
+//! staging transfers.
+//!
+//! # Ownership and lifetime
+//!
+//! `Arc<VulkanDevice>` replaces the former `SharedDevice`/`SharedInstance`
+//! wrappers: buffers, pipelines, and pulses hold clones, so the device is
+//! destroyed only when the **last** holder drops — a `GpuBuffer` or `Pulse`
+//! may outlive the backend (P1 review contract, preserved).
+//! [`VulkanBackend::from_zunesha`] / [`VulkanBackend::into_zunesha`] let a
+//! caller share one device between Borsalino and e.g. Goldenweek (ADR 0001
+//! interop).
 //!
 //! # Pre-allocated resources
 //!
@@ -19,136 +38,69 @@
 //! - 1× `VkDescriptorPool` with N sets
 //! - N× `VkDescriptorSet` (pre-allocated, updated per dispatch)
 //! - 1× `VkCommandPool` with `RESET_COMMAND_BUFFER_BIT`
+//!
+//! [zdv]: https://docs.rs/zunesha
 
 use naga::back::spv;
 use naga::front::wgsl;
 use naga::valid::{Capabilities, ValidationFlags, Validator};
 
-use ash::Entry;
 use ash::vk;
+use zunesha::Device as _;
 
 use std::ffi::CString;
+use std::sync::Arc;
 
 use crate::{
     ComputePipeline, DispatchSpec, GpuBackend, GpuBuffer, GpuError, MemoryStrategy, Pulse, Result,
 };
 
+/// Map Borsalino's public strategy onto the substrate's.
+fn to_zunesha_strategy(s: MemoryStrategy) -> zunesha::MemoryStrategy {
+    match s {
+        MemoryStrategy::Auto => zunesha::MemoryStrategy::Auto,
+        MemoryStrategy::Unified => zunesha::MemoryStrategy::Unified,
+        MemoryStrategy::DeviceLocal => zunesha::MemoryStrategy::DeviceLocal,
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════════
 // VulkanBackend
 // ═══════════════════════════════════════════════════════════════════
 
-/// Vulkan compute backend for Linux and Windows.
+/// Vulkan compute backend for Linux and Windows, built on a
+/// [`zunesha::vulkan::VulkanDevice`].
 ///
-/// Holds a Vulkan instance, logical device, compute queue, and
-/// pre-allocated resources for pipeline layout, descriptor sets,
-/// and command buffers. Created via [`VulkanBackend::init`].
+/// Holds the shared substrate device behind an [`Arc`], the compute queue
+/// it resolved, and Borsalino's pre-allocated dispatch resources (pipeline
+/// layout, descriptor pool/set, command pools, timestamp query pool).
+/// Created via [`VulkanBackend::init`] (own device) or
+/// [`VulkanBackend::from_zunesha`] (share a caller's device).
 ///
 /// # Platform
 ///
 /// Available on Linux and Windows with the `vulkan` feature enabled.
-/// Requires a Vulkan 1.3-capable driver with compute support.
-/// Shared Vulkan instance. `ash::Instance` has no refcount — this wrapper
-/// gives the backend and every shared device joint ownership, so the
-/// instance is destroyed only when the last holder drops (spec: an
-/// instance must outlive the devices created from it).
-struct SharedInstance(std::sync::Arc<InstanceInner>);
-
-struct InstanceInner {
-    instance: ash::Instance,
-    /// Keeps the Vulkan loader alive: dropping [`Entry`] unloads
-    /// libvulkan, after which any instance/device call is a call through
-    /// an unloaded library (SIGSEGV — found at test-teardown on the
-    /// 5080 after destruction moved from the backend's explicit `Drop`
-    /// to Arc-drop time).
-    _entry: std::sync::Arc<Entry>,
-}
-
-impl Drop for InstanceInner {
-    fn drop(&mut self) {
-        unsafe { self.instance.destroy_instance(None) };
-    }
-}
-
-impl Clone for SharedInstance {
-    fn clone(&self) -> Self {
-        Self(std::sync::Arc::clone(&self.0))
-    }
-}
-
-impl std::ops::Deref for SharedInstance {
-    type Target = ash::Instance;
-    fn deref(&self) -> &Self::Target {
-        &self.0.instance
-    }
-}
-
-/// Shared logical device (P1 review finding). `ash::Device::clone()`
-/// copies a handle; it does NOT keep the device alive — a pulse (or
-/// buffer/pipeline inner) dropped after its backend used to call into a
-/// device the backend's `drop` had already destroyed. Holding this
-/// wrapper shares ownership: the device is destroyed only when the LAST
-/// holder drops, and its `Drop` idles the device first as a defensive
-/// backstop for in-flight work.
-struct SharedDevice(std::sync::Arc<DeviceInner>);
-
-struct DeviceInner {
-    device: ash::Device,
-    /// Keeps the instance alive for at least as long as the device.
-    _instance: SharedInstance,
-}
-
-impl Drop for DeviceInner {
-    fn drop(&mut self) {
-        unsafe {
-            // NOTE: no blanket device_wait_idle here. Every pulse path
-            // waits its own fence BEFORE releasing its SharedDevice, and
-            // the backend's drop idles first when something is actually
-            // in flight — so by the time this runs, submissions are
-            // retired. A blanket wait_idle on every last-holder drop
-            // stampedes the driver's internal locks under parallel load
-            // (deadlocked the parallel test suite on the 5080).
-            self.device.destroy_device(None);
-        }
-    }
-}
-
-impl Clone for SharedDevice {
-    fn clone(&self) -> Self {
-        Self(std::sync::Arc::clone(&self.0))
-    }
-}
-
-impl std::ops::Deref for SharedDevice {
-    type Target = ash::Device;
-    fn deref(&self) -> &Self::Target {
-        &self.0.device
-    }
-}
-
+/// Requires a Vulkan-capable driver with compute support.
 pub struct VulkanBackend {
-    /// Vulkan entry (loader). Shared with the instance/device chain so
-    /// the loader outlives every device call.
-    _entry: std::sync::Arc<Entry>,
-    /// Shared Vulkan instance (see [`SharedInstance`]). Redundant with
-    /// the device's own instance reference — kept so the backend's public
-    /// teardown story is explicit.
-    #[allow(dead_code)]
-    instance: SharedInstance,
-    /// Shared logical device (see [`SharedDevice`]).
-    device: SharedDevice,
-    /// Compute queue handle.
-    queue: vk::Queue,
-    /// Queue family index for the compute queue.
+    /// The substrate device, shared with buffers/pipelines/pulses so the
+    /// Vulkan device outlives the backend when they do (P1 review contract;
+    /// replaces the former `SharedDevice`/`SharedInstance` wrappers —
+    /// Zunesha owns the instance/loader lifetime by construction).
+    z: Arc<zunesha::vulkan::VulkanDevice>,
+    /// Queue family index for the compute queue (the raw handle lives in
+    /// the substrate; submissions go through
+    /// [`VulkanDevice::with_compute_queue`]).
     #[allow(dead_code)]
     queue_family_index: u32,
-    /// Minimum storage buffer offset alignment (from device limits).
+    /// Minimum storage buffer offset alignment (from `z.limits()`).
     min_storage_buffer_offset_alignment: vk::DeviceSize,
-    /// Physical device memory properties (for buffer memory type selection).
+    /// Physical device memory properties — kept for Borsalino's own
+    /// `create_device_buffer` allocation path (see the migration plan §5.1:
+    /// delegation is an explicit Phase-2 decision, not a silent swap).
     memory_properties: vk::PhysicalDeviceMemoryProperties,
-    /// Memory strategy: auto-detected or explicitly configured.
-    #[allow(dead_code)]
-    memory_strategy: MemoryStrategy,
-    /// Whether to use device-local memory with staging transfers.
+    /// Whether the substrate negotiated device-local placement (derived
+    /// from `z.buffer_placement()` at construction; used by Borsalino's own
+    /// buffer paths and `read_buffer` staging decisions).
     uses_device_local: bool,
     /// Universal pipeline layout — N storage buffer bindings, shared by all pipelines.
     pipeline_layout: vk::PipelineLayout,
@@ -170,13 +122,257 @@ pub struct VulkanBackend {
     timestamp_period: f32,
     /// Epoch tracker for GC safety — counts in-flight dispatches.
     /// Shared with async `Pulse`s so they cannot outlive it (P1 review
-    /// finding — same defect as the Metal backend, same fix).
-    epoch: std::sync::Arc<crate::epoch::GpuEpochTracker>,
+    /// finding — same defect as the Metal backend, same fix). Stays on
+    /// Borsalino's side until Zunesha wires consumer dispatch accounting
+    /// (ADR 0003's end state; honest intermediate state per the migration
+    /// plan).
+    epoch: Arc<crate::epoch::GpuEpochTracker>,
 }
 
 impl VulkanBackend {
     /// Maximum number of storage buffer bindings per pipeline layout.
     const MAX_BUFFER_BINDINGS: u32 = 8;
+
+    /// The raw logical-device handle — every Borsalino-side Vulkan call
+    /// goes through this (the substrate owns the real object).
+    fn vk(&self) -> ash::Device {
+        self.z.raw_device()
+    }
+
+    /// The `VkBuffer` handle behind a [`GpuBuffer`], whichever kind it is:
+    /// substrate-allocated (`create_buffer` paths, recovered via the
+    /// substrate's raw-buffer escape hatch) or Borsalino-allocated
+    /// (`create_device_buffer` paths, stored in [`VulkanBufferInner`]).
+    ///
+    /// # Safety (caller)
+    ///
+    /// The returned handle is valid while `buf` lives and must only be used
+    /// on this backend's device.
+    fn buffer_handle(&self, buf: &GpuBuffer) -> vk::Buffer {
+        if std::ptr::eq((buf.contents_fn)(buf.raw), SUBSTRATE_BUFFER_TAG) {
+            // Safety: `raw` was produced by `Box::into_raw::<ZuneshaBufferInner>`
+            // and is still valid (buffer not dropped).
+            let inner = unsafe { &*(buf.raw as *const ZuneshaBufferInner) };
+            self.z.raw_buffer(&inner.zbuf)
+        } else {
+            // Safety: `raw` was produced by `Box::into_raw::<VulkanBufferInner>`
+            // and is still valid (buffer not dropped).
+            let inner = unsafe { &*(buf.raw as *const VulkanBufferInner) };
+            inner.buffer
+        }
+    }
+
+    /// Wrap a caller-owned substrate device (ADR 0001 interop: share one
+    /// device between Borsalino compute and e.g. Goldenweek rendering).
+    ///
+    /// The backend holds an `Arc` clone; dropping it tears down only
+    /// Borsalino's dispatch plumbing — the device survives while the
+    /// caller (or any buffer/pipeline/pulse) holds the `Arc`.
+    ///
+    /// # Errors
+    ///
+    /// Fails if Borsalino's dispatch resources (descriptor pool, command
+    /// pools, timestamp pool) cannot be created on the device.
+    pub fn from_zunesha(z: Arc<zunesha::vulkan::VulkanDevice>) -> Result<Self> {
+        Self::build(z)
+    }
+
+    /// Hand the substrate device onward, tearing down Borsalino's dispatch
+    /// plumbing (descriptor sets, command pools, timestamp pool).
+    ///
+    /// The returned `Arc` shares ownership with any buffers/pipelines/pulses
+    /// this backend created — the Vulkan device is destroyed only when the
+    /// **last** holder drops.
+    pub fn into_zunesha(self) -> Arc<zunesha::vulkan::VulkanDevice> {
+        self.z.clone()
+        // `self` drops here: destroys Borsalino's own pools only.
+    }
+
+    /// Build the dispatch plumbing on a substrate device.
+    ///
+    /// Failure at any step releases everything created so far (review
+    /// round 2: construction used to leak all prior resources) via the
+    /// armed guard below; success disarms it.
+    fn build(z: Arc<zunesha::vulkan::VulkanDevice>) -> Result<Self> {
+        /// Destroys registered resources in reverse creation order when
+        /// dropped while still armed — i.e. on any `?` exit of `build`.
+        struct Cleanup<'a> {
+            fns: Vec<Box<dyn FnOnce() + 'a>>,
+            armed: bool,
+        }
+        impl Drop for Cleanup<'_> {
+            fn drop(&mut self) {
+                if self.armed {
+                    for f in self.fns.drain(..).rev() {
+                        f();
+                    }
+                }
+            }
+        }
+        let device = z.raw_device();
+        // Shared by-ref copy for the guard closures (a &Device is Copy;
+        // passing &device inline would move device into the closure).
+        // Declared BEFORE `cleanup` so `device` outlives the guard.
+        let dev = &device;
+        let mut cleanup = Cleanup {
+            fns: Vec::new(),
+            armed: true,
+        };
+
+        // `device` is passed by the caller's tokens: identifiers written
+        // in this macro body resolve at the definition site and would not
+        // see `build`'s locals (macro_rules hygiene).
+        macro_rules! guard {
+            ($dev:expr, $destroy:expr) => {
+                cleanup
+                    .fns
+                    .push(Box::new(move || unsafe { $destroy($dev) }));
+            };
+        }
+        let compute = z.queues().compute;
+        let queue_family_index = compute.family_index;
+        let min_storage_buffer_offset_alignment = z.limits().min_storage_buffer_offset_alignment;
+        let memory_properties = z.memory_properties();
+        let uses_device_local = z.buffer_placement() == zunesha::MemoryPlacement::DeviceLocal;
+
+        // Timestamp support comes from the physical-device limits (the
+        // substrate does not expose these — R5.3 in the Metal requirements
+        // proposes adding `timestamp_period` to `DeviceLimits` later).
+        let device_props = unsafe {
+            z.raw_instance()
+                .get_physical_device_properties(z.physical_device())
+        };
+
+        // ── Descriptor set layout (N storage buffers) ──────────────
+
+        let bindings: Vec<vk::DescriptorSetLayoutBinding> = (0..Self::MAX_BUFFER_BINDINGS)
+            .map(|i| {
+                vk::DescriptorSetLayoutBinding::default()
+                    .binding(i)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .descriptor_count(1)
+                    .stage_flags(vk::ShaderStageFlags::COMPUTE)
+            })
+            .collect();
+
+        let dsl_info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
+
+        let descriptor_set_layout = unsafe {
+            device
+                .create_descriptor_set_layout(&dsl_info, None)
+                .map_err(|e| GpuError::InitFailed(format!("create descriptor set layout: {e}")))?
+        };
+        guard!(dev, |d: &ash::Device| d
+            .destroy_descriptor_set_layout(descriptor_set_layout, None));
+
+        // ── Pipeline layout ────────────────────────────────────────
+
+        let layout_info = vk::PipelineLayoutCreateInfo::default()
+            .set_layouts(std::slice::from_ref(&descriptor_set_layout));
+
+        let pipeline_layout = unsafe {
+            device
+                .create_pipeline_layout(&layout_info, None)
+                .map_err(|e| GpuError::InitFailed(format!("create pipeline layout: {e}")))?
+        };
+        guard!(dev, |d: &ash::Device| d
+            .destroy_pipeline_layout(pipeline_layout, None));
+
+        // ── Descriptor pool ────────────────────────────────────────
+
+        let pool_sizes = [vk::DescriptorPoolSize::default()
+            .ty(vk::DescriptorType::STORAGE_BUFFER)
+            .descriptor_count(Self::MAX_BUFFER_BINDINGS)];
+
+        let pool_info = vk::DescriptorPoolCreateInfo::default()
+            .pool_sizes(&pool_sizes)
+            .max_sets(Self::MAX_BUFFER_BINDINGS);
+
+        let descriptor_pool = unsafe {
+            device
+                .create_descriptor_pool(&pool_info, None)
+                .map_err(|e| GpuError::InitFailed(format!("create descriptor pool: {e}")))?
+        };
+        // Destroying the pool frees the descriptor sets allocated from it.
+        guard!(dev, |d: &ash::Device| d
+            .destroy_descriptor_pool(descriptor_pool, None));
+
+        // ── Pre-allocate descriptor set ───────────────────────────
+
+        let set_info = vk::DescriptorSetAllocateInfo::default()
+            .descriptor_pool(descriptor_pool)
+            .set_layouts(std::slice::from_ref(&descriptor_set_layout));
+
+        let descriptor_set = unsafe {
+            device
+                .allocate_descriptor_sets(&set_info)
+                .map_err(|e| GpuError::InitFailed(format!("allocate descriptor set: {e}")))?
+        }[0];
+
+        // ── Command pool ───────────────────────────────────────────
+
+        let cmd_pool_info = vk::CommandPoolCreateInfo::default()
+            .queue_family_index(queue_family_index)
+            .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
+
+        let command_pool = unsafe {
+            device
+                .create_command_pool(&cmd_pool_info, None)
+                .map_err(|e| GpuError::InitFailed(format!("create command pool: {e}")))?
+        };
+        guard!(dev, |d: &ash::Device| d
+            .destroy_command_pool(command_pool, None));
+
+        // ── Transfer command pool ─────────────────────────────────
+
+        let transfer_cmd_pool_info = vk::CommandPoolCreateInfo::default()
+            .queue_family_index(queue_family_index)
+            .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
+
+        let transfer_command_pool = unsafe {
+            device
+                .create_command_pool(&transfer_cmd_pool_info, None)
+                .map_err(|e| GpuError::InitFailed(format!("create transfer pool: {e}")))?
+        };
+        guard!(dev, |d: &ash::Device| d
+            .destroy_command_pool(transfer_command_pool, None));
+
+        // ── Timestamp query pool ─────────────────────────────────
+
+        let timestamp_pool = if device_props.limits.timestamp_compute_and_graphics == vk::TRUE {
+            let pool_info = vk::QueryPoolCreateInfo::default()
+                .query_type(vk::QueryType::TIMESTAMP)
+                .query_count(1);
+            let pool = unsafe {
+                device
+                    .create_query_pool(&pool_info, None)
+                    .map_err(|e| GpuError::InitFailed(format!("create timestamp pool: {e}")))?
+            };
+            guard!(dev, |d: &ash::Device| d.destroy_query_pool(pool, None));
+            Some(pool)
+        } else {
+            None
+        };
+        let timestamp_period = device_props.limits.timestamp_period;
+
+        cleanup.armed = false;
+        Ok(Self {
+            z,
+            queue_family_index,
+            min_storage_buffer_offset_alignment,
+            memory_properties,
+            uses_device_local,
+            pipeline_layout,
+            descriptor_set_layout,
+            descriptor_pool,
+            descriptor_set,
+            command_pool,
+            transfer_command_pool,
+            timestamp_pool,
+            timestamp_period,
+            epoch: Arc::new(crate::epoch::GpuEpochTracker::new()),
+        })
+    }
 
     /// Create a compute pipeline from pre-compiled SPIR-V.
     fn create_pipeline_from_spv(
@@ -187,7 +383,7 @@ impl VulkanBackend {
         let shader_info = vk::ShaderModuleCreateInfo::default().code(spv_words);
 
         let shader_module = unsafe {
-            self.device
+            self.vk()
                 .create_shader_module(&shader_info, None)
                 .map_err(|e| GpuError::CompileFailed {
                     entry: entry_point.into(),
@@ -210,7 +406,7 @@ impl VulkanBackend {
             .layout(self.pipeline_layout);
 
         let pipelines = unsafe {
-            self.device
+            self.vk()
                 .create_compute_pipelines(
                     vk::PipelineCache::null(),
                     std::slice::from_ref(&pipeline_info),
@@ -223,12 +419,12 @@ impl VulkanBackend {
         };
 
         unsafe {
-            self.device.destroy_shader_module(shader_module, None);
+            self.vk().destroy_shader_module(shader_module, None);
         }
 
         let inner = Box::new(VulkanPipelineInner {
             pipeline: pipelines[0],
-            device: self.device.clone(),
+            device: Arc::clone(&self.z),
         });
 
         Ok(ComputePipeline {
@@ -249,22 +445,22 @@ impl Drop for VulkanBackend {
             // blanket wait_idle on every backend drop stampedes the
             // driver's internal locks under parallel test load).
             if self.epoch.in_flight() > 0 {
-                let _ = self.device.device_wait_idle();
+                let _ = self.vk().device_wait_idle();
             }
             if let Some(pool) = self.timestamp_pool {
-                self.device.destroy_query_pool(pool, None);
+                self.vk().destroy_query_pool(pool, None);
             }
-            self.device
+            self.vk()
                 .destroy_command_pool(self.transfer_command_pool, None);
-            self.device.destroy_command_pool(self.command_pool, None);
-            self.device
+            self.vk().destroy_command_pool(self.command_pool, None);
+            self.vk()
                 .destroy_descriptor_pool(self.descriptor_pool, None);
-            self.device
+            self.vk()
                 .destroy_descriptor_set_layout(self.descriptor_set_layout, None);
-            self.device
+            self.vk()
                 .destroy_pipeline_layout(self.pipeline_layout, None);
-            // Device and instance destruction happen in SharedDevice /
-            // SharedInstance `Drop`, when the last holder (backend or
+            // Device and instance destruction happen in the substrate's
+            // `VulkanDevice::Drop`, when the last `Arc` holder (backend or
             // pulse/buffer/pipeline inner) goes away — not here.
         }
     }
@@ -287,9 +483,9 @@ struct VulkanBufferInner {
     staging_buffer: Option<vk::Buffer>,
     /// Staging buffer memory (None if unified).
     staging_memory: Option<vk::DeviceMemory>,
-    /// Shared logical device — keeps the device alive past backend drop
-    /// (destroy / unmap in `drop`).
-    device: SharedDevice,
+    /// Substrate device share — keeps the Vulkan device alive past
+    /// backend drop (destroy / unmap in `drop`).
+    device: Arc<zunesha::vulkan::VulkanDevice>,
 }
 
 unsafe impl Send for VulkanBufferInner {}
@@ -297,18 +493,31 @@ unsafe impl Sync for VulkanBufferInner {}
 
 impl Drop for VulkanBufferInner {
     fn drop(&mut self) {
+        let device = self.device.raw_device();
         unsafe {
             if let Some(sb) = self.staging_buffer {
-                self.device.destroy_buffer(sb, None);
+                device.destroy_buffer(sb, None);
             }
             if let Some(sm) = self.staging_memory {
-                self.device.free_memory(sm, None);
+                device.free_memory(sm, None);
             }
-            self.device.destroy_buffer(self.buffer, None);
-            self.device.free_memory(self.memory, None);
+            device.destroy_buffer(self.buffer, None);
+            device.free_memory(self.memory, None);
         }
     }
 }
+
+/// Internal state for a substrate-allocated buffer (from
+/// `z.create_buffer` / `create_buffer_uninit`), stored behind the opaque
+/// `GpuBuffer.raw` pointer. The `Arc` keeps the Vulkan device alive past
+/// backend drop; the `zunesha::Buffer` destroys its own resources.
+struct ZuneshaBufferInner {
+    zbuf: zunesha::Buffer,
+    _device: Arc<zunesha::vulkan::VulkanDevice>,
+}
+
+unsafe impl Send for ZuneshaBufferInner {}
+unsafe impl Sync for ZuneshaBufferInner {}
 
 // ═══════════════════════════════════════════════════════════════════
 // Pipeline inner type
@@ -318,9 +527,9 @@ impl Drop for VulkanBufferInner {
 /// `ComputePipeline.raw` pointer.
 struct VulkanPipelineInner {
     pipeline: vk::Pipeline,
-    /// Shared logical device — keeps the device alive past backend drop
-    /// (destroy in `drop`).
-    device: SharedDevice,
+    /// Substrate device share — keeps the Vulkan device alive past backend
+    /// drop (destroy in `drop`).
+    device: Arc<zunesha::vulkan::VulkanDevice>,
 }
 
 /// Drop function stored in [`ComputePipeline`] — destroys the Vulkan pipeline.
@@ -328,7 +537,10 @@ fn drop_vulkan_pipeline(raw: *mut std::ffi::c_void) {
     if !raw.is_null() {
         unsafe {
             let inner = Box::from_raw(raw as *mut VulkanPipelineInner);
-            inner.device.destroy_pipeline(inner.pipeline, None);
+            inner
+                .device
+                .raw_device()
+                .destroy_pipeline(inner.pipeline, None);
         }
     }
 }
@@ -341,11 +553,11 @@ fn drop_vulkan_pipeline(raw: *mut std::ffi::c_void) {
 /// `Pulse.raw` pointer.
 struct VulkanPulseInner {
     fence: vk::Fence,
-    /// Shared logical device — the pulse owns a reference, so
+    /// Substrate device share — the pulse owns a reference, so
     /// wait/drop keep a LIVE device even after the backend is gone
     /// (P1 review finding).
-    device: SharedDevice,
-    epoch: std::sync::Arc<crate::epoch::GpuEpochTracker>,
+    device: Arc<zunesha::vulkan::VulkanDevice>,
+    epoch: Arc<crate::epoch::GpuEpochTracker>,
     /// Tracks whether end_dispatch has been called (prevents double-decrement
     /// when wait() + drop() both fire).
     epoch_completed: std::sync::atomic::AtomicBool,
@@ -355,10 +567,11 @@ fn wait_vulkan_pulse(raw: *mut std::ffi::c_void) {
     if !raw.is_null() {
         let inner = unsafe { &*(raw as *const VulkanPulseInner) };
         unsafe {
-            let _ =
-                inner
-                    .device
-                    .wait_for_fences(std::slice::from_ref(&inner.fence), true, u64::MAX);
+            let _ = inner.device.raw_device().wait_for_fences(
+                std::slice::from_ref(&inner.fence),
+                true,
+                u64::MAX,
+            );
         }
         // Mark this dispatch as complete (balances the begin_dispatch at
         // dispatch_async submit time). Only decrements once even if wait()
@@ -375,13 +588,11 @@ fn wait_vulkan_pulse(raw: *mut std::ffi::c_void) {
 fn drop_vulkan_pulse(raw: *mut std::ffi::c_void) {
     if !raw.is_null() {
         let inner = unsafe { Box::from_raw(raw as *mut VulkanPulseInner) };
+        let device = inner.device.raw_device();
         unsafe {
             // Ensure GPU completes before destroying fence — a fence
             // that is still in use must not be destroyed.
-            let _ =
-                inner
-                    .device
-                    .wait_for_fences(std::slice::from_ref(&inner.fence), true, u64::MAX);
+            let _ = device.wait_for_fences(std::slice::from_ref(&inner.fence), true, u64::MAX);
             // Balance the begin_dispatch from dispatch_async (only if
             // wait() hasn't already done so).
             if !inner
@@ -390,7 +601,7 @@ fn drop_vulkan_pulse(raw: *mut std::ffi::c_void) {
             {
                 inner.epoch.end_dispatch();
             }
-            inner.device.destroy_fence(inner.fence, None);
+            device.destroy_fence(inner.fence, None);
         }
     }
 }
@@ -418,113 +629,29 @@ fn contents_vulkan_buffer(raw: *mut std::ffi::c_void) -> *const std::ffi::c_void
     inner.mapped
 }
 
-// ═══════════════════════════════════════════════════════════════════
-// Initialisation helpers
-// ═══════════════════════════════════════════════════════════════════
-
-/// Negotiate the API version to request from `vkCreateInstance`.
-///
-/// Requesting an API version the driver doesn't support can trigger driver
-/// crashes (SIGSEGV) in some Mesa ICDs — notably lavapipe in older Mesa
-/// versions that only implement Vulkan 1.2 when asked for 1.3. This function
-/// caps the requested version at whatever `vkEnumerateInstanceVersion`
-/// reports as available, avoiding the buggy code path.
-///
-/// # Parameters
-///
-/// - `available`: The result of `vkEnumerateInstanceVersion` (`None` if the
-///   loader only supports Vulkan 1.0, in which case the entry point doesn't
-///   exist).
-///
-/// # Returns
-///
-/// The highest API version we should request, capped at our max of 1.3.
-fn negotiate_api_version(available: Option<u32>) -> u32 {
-    const MAX_DESIRED: u32 = vk::API_VERSION_1_3;
-    match available {
-        None => vk::API_VERSION_1_0, // Vulkan 1.0-only loader
-        Some(v) => v.min(MAX_DESIRED),
-    }
-}
-
-/// Score a device type for preference ordering.
-fn device_type_score(ty: vk::PhysicalDeviceType) -> i32 {
-    match ty {
-        vk::PhysicalDeviceType::DISCRETE_GPU => 100,
-        vk::PhysicalDeviceType::INTEGRATED_GPU => 50,
-        vk::PhysicalDeviceType::VIRTUAL_GPU => 30,
-        vk::PhysicalDeviceType::CPU => 20,
-        _ => 10,
-    }
-}
-
-/// Pick the best physical device with a compute-capable queue family.
-///
-/// Returns `(physical_device, queue_family_index)`, preferring discrete GPUs
-/// over integrated, virtual, or CPU devices.
-unsafe fn pick_physical_device(instance: &ash::Instance) -> Result<(vk::PhysicalDevice, u32)> {
-    let devices = unsafe {
-        instance
-            .enumerate_physical_devices()
-            .map_err(|e| GpuError::InitFailed(format!("vkEnumeratePhysicalDevices: {e}")))?
-    };
-
-    let mut best_score: i32 = -1;
-    let mut best: Option<(vk::PhysicalDevice, u32)> = None;
-
-    for &device in &devices {
-        let props = unsafe { instance.get_physical_device_properties(device) };
-        let queue_families =
-            unsafe { instance.get_physical_device_queue_family_properties(device) };
-
-        // Find a compute-capable queue family
-        let qf_index = queue_families
-            .iter()
-            .position(|qf| qf.queue_flags.contains(vk::QueueFlags::COMPUTE))
-            .map(|i| i as u32);
-
-        let Some(qf_index) = qf_index else {
-            continue;
-        };
-
-        let score = device_type_score(props.device_type);
-        if score > best_score {
-            best_score = score;
-            best = Some((device, qf_index));
+/// Drop function stored in [`GpuBuffer`] — drops the boxed substrate
+/// buffer (it destroys its own Vulkan resources).
+fn drop_zunesha_buffer(raw: *mut std::ffi::c_void) {
+    if !raw.is_null() {
+        unsafe {
+            drop(Box::from_raw(raw as *mut ZuneshaBufferInner));
         }
     }
-
-    best.ok_or_else(|| GpuError::InitFailed("no Vulkan device with compute queue found".into()))
 }
 
-/// Create a logical device and retrieve the compute queue.
-unsafe fn create_device(
-    instance: &ash::Instance,
-    physical_device: vk::PhysicalDevice,
-    queue_family_index: u32,
-) -> Result<(ash::Device, vk::Queue)> {
-    let queue_priority = 1.0f32;
-    let queue_create_info = vk::DeviceQueueCreateInfo::default()
-        .queue_family_index(queue_family_index)
-        .queue_priorities(std::slice::from_ref(&queue_priority));
+/// Contents function for substrate-backed buffers — returns the
+/// [`SUBSTRATE_BUFFER_TAG`] sentinel instead of a mapped pointer (reads go
+/// through the substrate's `read_buffer`, which needs the device — not a
+/// bare pointer). Doubles as the tag `read_buffer` dispatches on: real
+/// Vulkan mappings are page-aligned, so the sentinel can never collide
+/// with a mapped address (unlike fn-pointer comparison, which the compiler
+/// warns may merge distinct functions).
+const SUBSTRATE_BUFFER_TAG: *const std::ffi::c_void =
+    std::ptr::without_provenance::<std::ffi::c_void>(1);
 
-    let device_create_info = vk::DeviceCreateInfo::default()
-        .queue_create_infos(std::slice::from_ref(&queue_create_info));
-
-    let device = unsafe {
-        instance
-            .create_device(physical_device, &device_create_info, None)
-            .map_err(|e| GpuError::InitFailed(format!("vkCreateDevice: {e}")))?
-    };
-
-    let queue = unsafe { device.get_device_queue(queue_family_index, 0) };
-
-    Ok((device, queue))
+fn contents_zunesha_buffer(_raw: *mut std::ffi::c_void) -> *const std::ffi::c_void {
+    SUBSTRATE_BUFFER_TAG
 }
-
-// ═══════════════════════════════════════════════════════════════════
-// Utility helpers
-// ═══════════════════════════════════════════════════════════════════
 
 /// FNV-1a hash (deterministic across runs, used for cache keys).
 fn fnv1a(data: &[u8]) -> u64 {
@@ -603,30 +730,6 @@ unsafe fn one_shot_transfer(
     }
 }
 
-/// Detect whether device-local memory should be used.
-fn detect_device_local(
-    device_type: vk::PhysicalDeviceType,
-    memory_properties: &vk::PhysicalDeviceMemoryProperties,
-) -> bool {
-    if device_type == vk::PhysicalDeviceType::DISCRETE_GPU {
-        return true;
-    }
-    for i in 0..memory_properties.memory_heap_count {
-        if memory_properties.memory_heaps[i as usize]
-            .flags
-            .contains(vk::MemoryHeapFlags::DEVICE_LOCAL)
-            && memory_properties.memory_heaps[i as usize].size > 1024 * 1024 * 1024
-        {
-            return true;
-        }
-    }
-    false
-}
-
-// ═══════════════════════════════════════════════════════════════════
-// Buffer helpers
-// ═══════════════════════════════════════════════════════════════════
-
 /// Round `val` up to the nearest multiple of `alignment`.
 fn align_up(val: vk::DeviceSize, alignment: vk::DeviceSize) -> vk::DeviceSize {
     val.div_ceil(alignment) * alignment
@@ -682,41 +785,59 @@ unsafe fn allocate_buffer(
     let mut flags = vk::MemoryPropertyFlags::HOST_VISIBLE
         | vk::MemoryPropertyFlags::HOST_COHERENT
         | vk::MemoryPropertyFlags::HOST_CACHED;
-    let mem_type_index =
-        find_memory_type_index(memory_properties, mem_reqs.memory_type_bits, flags).or_else(
-            |_| {
+    let mem_type_index = {
+        let preferred = find_memory_type_index(memory_properties, mem_reqs.memory_type_bits, flags);
+        match preferred {
+            Ok(idx) => Ok(idx),
+            Err(e) => {
                 flags =
                     vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
-                find_memory_type_index(memory_properties, mem_reqs.memory_type_bits, flags)
-            },
-        )?;
+                find_memory_type_index(memory_properties, mem_reqs.memory_type_bits, flags).map_err(
+                    |_| {
+                        // Review round 2: destroy the buffer created above.
+                        unsafe { device.destroy_buffer(buffer, None) };
+                        e
+                    },
+                )
+            }
+        }
+    }?;
 
     let alloc_info = vk::MemoryAllocateInfo::default()
         .allocation_size(mem_reqs.size)
         .memory_type_index(mem_type_index);
 
-    let memory = unsafe {
-        device
-            .allocate_memory(&alloc_info, None)
-            .map_err(|e| GpuError::BufferCreationFailed {
+    let memory = match unsafe { device.allocate_memory(&alloc_info, None) } {
+        Ok(memory) => memory,
+        Err(e) => {
+            unsafe { device.destroy_buffer(buffer, None) };
+            return Err(GpuError::BufferCreationFailed {
                 message: format!("vkAllocateMemory: {e}"),
-            })?
+            });
+        }
     };
 
-    unsafe {
-        device.bind_buffer_memory(buffer, memory, 0).map_err(|e| {
-            GpuError::BufferCreationFailed {
-                message: format!("vkBindBufferMemory: {e}"),
-            }
-        })?;
+    if let Err(e) = unsafe { device.bind_buffer_memory(buffer, memory, 0) } {
+        unsafe {
+            device.free_memory(memory, None);
+            device.destroy_buffer(buffer, None);
+        }
+        return Err(GpuError::BufferCreationFailed {
+            message: format!("vkBindBufferMemory: {e}"),
+        });
     }
 
-    let mapped = unsafe {
-        device
-            .map_memory(memory, 0, size, vk::MemoryMapFlags::empty())
-            .map_err(|e| GpuError::BufferCreationFailed {
+    let mapped = match unsafe { device.map_memory(memory, 0, size, vk::MemoryMapFlags::empty()) } {
+        Ok(mapped) => mapped,
+        Err(e) => {
+            unsafe {
+                device.free_memory(memory, None);
+                device.destroy_buffer(buffer, None);
+            }
+            return Err(GpuError::BufferCreationFailed {
                 message: format!("vkMapMemory: {e}"),
-            })?
+            });
+        }
     };
 
     Ok((buffer, memory, mapped))
@@ -749,26 +870,34 @@ unsafe fn allocate_device_local_buffer(
         memory_properties,
         mem_reqs.memory_type_bits,
         vk::MemoryPropertyFlags::DEVICE_LOCAL,
-    )?;
+    )
+    .inspect_err(|_| {
+        // Review round 2: destroy the buffer created above.
+        unsafe { device.destroy_buffer(buffer, None) }
+    })?;
 
     let alloc_info = vk::MemoryAllocateInfo::default()
         .allocation_size(mem_reqs.size)
         .memory_type_index(mem_type_index);
 
-    let memory = unsafe {
-        device
-            .allocate_memory(&alloc_info, None)
-            .map_err(|e| GpuError::BufferCreationFailed {
+    let memory = match unsafe { device.allocate_memory(&alloc_info, None) } {
+        Ok(memory) => memory,
+        Err(e) => {
+            unsafe { device.destroy_buffer(buffer, None) };
+            return Err(GpuError::BufferCreationFailed {
                 message: format!("vkAllocateMemory(device-local): {e}"),
-            })?
+            });
+        }
     };
 
-    unsafe {
-        device.bind_buffer_memory(buffer, memory, 0).map_err(|e| {
-            GpuError::BufferCreationFailed {
-                message: format!("vkBindBufferMemory(device-local): {e}"),
-            }
-        })?;
+    if let Err(e) = unsafe { device.bind_buffer_memory(buffer, memory, 0) } {
+        unsafe {
+            device.free_memory(memory, None);
+            device.destroy_buffer(buffer, None);
+        }
+        return Err(GpuError::BufferCreationFailed {
+            message: format!("vkBindBufferMemory(device-local): {e}"),
+        });
     }
 
     Ok((buffer, memory))
@@ -784,190 +913,9 @@ impl GpuBackend for VulkanBackend {
     }
 
     fn init_with_strategy(strategy: MemoryStrategy) -> Result<Self> {
-        let entry = std::sync::Arc::new(unsafe {
-            Entry::load().map_err(|e| GpuError::InitFailed(format!("{e}")))?
-        });
-
-        // Query the available instance version before requesting one.
-        // Requesting an unsupported version (e.g. 1.3 on lavapipe/Mesa <23.x)
-        // can trigger driver crashes (SIGSEGV) instead of a clean error.
-        // See issue #34.
-        let available_version = unsafe { entry.try_enumerate_instance_version() }
-            .ok()
-            .flatten();
-        let api_version = negotiate_api_version(available_version);
-
-        let app_name = std::ffi::CString::new("borsalino").unwrap();
-        let engine_name = std::ffi::CString::new("borsalino").unwrap();
-
-        let app_info = vk::ApplicationInfo::default()
-            .application_name(&app_name)
-            .engine_name(&engine_name)
-            .api_version(api_version);
-
-        let instance_create_info = vk::InstanceCreateInfo::default().application_info(&app_info);
-
-        let instance = unsafe {
-            entry
-                .create_instance(&instance_create_info, None)
-                .map_err(|e| GpuError::InitFailed(format!("vkCreateInstance: {e}")))?
-        };
-
-        let (physical_device, queue_family_index) = unsafe { pick_physical_device(&instance)? };
-
-        // Query device properties before creating logical device
-        let device_props = unsafe { instance.get_physical_device_properties(physical_device) };
-        let memory_properties =
-            unsafe { instance.get_physical_device_memory_properties(physical_device) };
-        let min_storage_buffer_offset_alignment =
-            device_props.limits.min_storage_buffer_offset_alignment;
-
-        // Auto-detect or use explicit memory strategy
-        let uses_device_local = match strategy {
-            MemoryStrategy::DeviceLocal => true,
-            MemoryStrategy::Unified => false,
-            MemoryStrategy::Auto => {
-                detect_device_local(device_props.device_type, &memory_properties)
-            }
-        };
-
-        let (device, queue) =
-            unsafe { create_device(&instance, physical_device, queue_family_index)? };
-
-        // ── Descriptor set layout (N storage buffers) ──────────────
-
-        let bindings: Vec<vk::DescriptorSetLayoutBinding> = (0..Self::MAX_BUFFER_BINDINGS)
-            .map(|i| {
-                vk::DescriptorSetLayoutBinding::default()
-                    .binding(i)
-                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                    .descriptor_count(1)
-                    .stage_flags(vk::ShaderStageFlags::COMPUTE)
-            })
-            .collect();
-
-        let dsl_info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
-
-        let descriptor_set_layout = unsafe {
-            device
-                .create_descriptor_set_layout(&dsl_info, None)
-                .map_err(|e| GpuError::InitFailed(format!("create descriptor set layout: {e}")))?
-        };
-
-        // ── Pipeline layout ────────────────────────────────────────
-
-        let layout_info = vk::PipelineLayoutCreateInfo::default()
-            .set_layouts(std::slice::from_ref(&descriptor_set_layout));
-
-        let pipeline_layout = unsafe {
-            device
-                .create_pipeline_layout(&layout_info, None)
-                .map_err(|e| GpuError::InitFailed(format!("create pipeline layout: {e}")))?
-        };
-
-        // ── Descriptor pool ────────────────────────────────────────
-
-        let pool_sizes = [vk::DescriptorPoolSize::default()
-            .ty(vk::DescriptorType::STORAGE_BUFFER)
-            .descriptor_count(Self::MAX_BUFFER_BINDINGS)];
-
-        let pool_info = vk::DescriptorPoolCreateInfo::default()
-            .pool_sizes(&pool_sizes)
-            .max_sets(Self::MAX_BUFFER_BINDINGS);
-
-        let descriptor_pool = unsafe {
-            device
-                .create_descriptor_pool(&pool_info, None)
-                .map_err(|e| GpuError::InitFailed(format!("create descriptor pool: {e}")))?
-        };
-
-        // ── Pre-allocate descriptor set ───────────────────────────
-
-        let set_info = vk::DescriptorSetAllocateInfo::default()
-            .descriptor_pool(descriptor_pool)
-            .set_layouts(std::slice::from_ref(&descriptor_set_layout));
-
-        let descriptor_set = unsafe {
-            device
-                .allocate_descriptor_sets(&set_info)
-                .map_err(|e| GpuError::InitFailed(format!("allocate descriptor set: {e}")))?
-        }[0];
-
-        // ── Command pool ───────────────────────────────────────────
-
-        let cmd_pool_info = vk::CommandPoolCreateInfo::default()
-            .queue_family_index(queue_family_index)
-            .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
-
-        let command_pool = unsafe {
-            device
-                .create_command_pool(&cmd_pool_info, None)
-                .map_err(|e| GpuError::InitFailed(format!("create command pool: {e}")))?
-        };
-
-        // ── Transfer command pool ─────────────────────────────────
-
-        let transfer_cmd_pool_info = vk::CommandPoolCreateInfo::default()
-            .queue_family_index(queue_family_index)
-            .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
-
-        let transfer_command_pool = unsafe {
-            device
-                .create_command_pool(&transfer_cmd_pool_info, None)
-                .map_err(|e| GpuError::InitFailed(format!("create transfer pool: {e}")))?
-        };
-
-        // ── Timestamp query pool ─────────────────────────────────
-
-        let timestamp_pool = if device_props.limits.timestamp_compute_and_graphics == vk::TRUE {
-            let pool_info = vk::QueryPoolCreateInfo::default()
-                .query_type(vk::QueryType::TIMESTAMP)
-                .query_count(1);
-            let pool = unsafe {
-                device
-                    .create_query_pool(&pool_info, None)
-                    .map_err(|e| GpuError::InitFailed(format!("create timestamp pool: {e}")))?
-            };
-            Some(pool)
-        } else {
-            None
-        };
-        let timestamp_period = device_props.limits.timestamp_period;
-
-        // Wrap in shared ownership: the pulse and the buffer/pipeline
-        // inner structs hold clones, so the device and instance are
-        // destroyed only when the LAST holder drops (P1 review finding —
-        // a backend dropped before its pulse used to destroy the device
-        // out from under the pulse's wait/drop path).
-        let instance = SharedInstance(std::sync::Arc::new(InstanceInner {
-            instance,
-            _entry: std::sync::Arc::clone(&entry),
-        }));
-        let device = SharedDevice(std::sync::Arc::new(DeviceInner {
-            device,
-            _instance: instance.clone(),
-        }));
-
-        Ok(Self {
-            _entry: entry,
-            instance,
-            device,
-            queue,
-            queue_family_index,
-            min_storage_buffer_offset_alignment,
-            memory_properties,
-            memory_strategy: strategy,
-            uses_device_local,
-            pipeline_layout,
-            descriptor_set_layout,
-            descriptor_pool,
-            descriptor_set,
-            command_pool,
-            transfer_command_pool,
-            timestamp_pool,
-            timestamp_period,
-            epoch: std::sync::Arc::new(crate::epoch::GpuEpochTracker::new()),
-        })
+        let z = zunesha::vulkan::VulkanDevice::init_with_strategy(to_zunesha_strategy(strategy))
+            .map_err(|e| GpuError::InitFailed(format!("zunesha device init: {e}")))?;
+        Self::build(std::sync::Arc::new(z))
     }
 
     fn compile(&self, entry_point: &str, wgsl_source: &str) -> Result<ComputePipeline> {
@@ -999,7 +947,7 @@ impl GpuBackend for VulkanBackend {
         let shader_info = vk::ShaderModuleCreateInfo::default().code(&spv_words);
 
         let shader_module = unsafe {
-            self.device
+            self.vk()
                 .create_shader_module(&shader_info, None)
                 .map_err(|e| GpuError::CompileFailed {
                     entry: entry_point.into(),
@@ -1023,7 +971,7 @@ impl GpuBackend for VulkanBackend {
             .layout(self.pipeline_layout);
 
         let pipelines = unsafe {
-            self.device
+            self.vk()
                 .create_compute_pipelines(
                     vk::PipelineCache::null(),
                     std::slice::from_ref(&pipeline_info),
@@ -1037,13 +985,13 @@ impl GpuBackend for VulkanBackend {
 
         // Step 6: Destroy the shader module (pipeline owns the compiled code)
         unsafe {
-            self.device.destroy_shader_module(shader_module, None);
+            self.vk().destroy_shader_module(shader_module, None);
         }
 
         // Step 7: Wrap in opaque handle
         let inner = Box::new(VulkanPipelineInner {
             pipeline: pipelines[0],
-            device: self.device.clone(),
+            device: Arc::clone(&self.z),
         });
 
         Ok(ComputePipeline {
@@ -1102,159 +1050,40 @@ impl GpuBackend for VulkanBackend {
     }
 
     fn create_buffer<T: bytemuck::Pod>(&self, data: &[T]) -> Result<GpuBuffer> {
-        let element_size = std::mem::size_of::<T>();
-        let byte_len = std::mem::size_of_val(data) as vk::DeviceSize;
-
-        let aligned_size = if byte_len == 0 {
-            self.min_storage_buffer_offset_alignment
-        } else {
-            align_up(byte_len, self.min_storage_buffer_offset_alignment)
-        };
-
-        let usage = vk::BufferUsageFlags::STORAGE_BUFFER
-            | vk::BufferUsageFlags::TRANSFER_SRC
-            | vk::BufferUsageFlags::TRANSFER_DST;
-
-        let (mapped, buffer, memory, staging_buffer, staging_memory) = if self.uses_device_local {
-            // Allocate device-local buffer + staging buffer
-            let (dev_buf, dev_mem) = unsafe {
-                allocate_device_local_buffer(
-                    &self.device,
-                    &self.memory_properties,
-                    aligned_size,
-                    usage,
-                )?
-            };
-
-            // Allocate staging buffer (host-visible)
-            let (stg_buf, stg_mem, stg_mapped) = unsafe {
-                allocate_buffer(
-                    &self.device,
-                    &self.memory_properties,
-                    aligned_size,
-                    vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST,
-                )?
-            };
-
-            // Copy data to staging, then staging → device
-            if byte_len > 0 {
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        data.as_ptr() as *const std::ffi::c_void,
-                        stg_mapped,
-                        byte_len as usize,
-                    );
-                }
-                unsafe {
-                    one_shot_transfer(
-                        &self.device,
-                        self.transfer_command_pool,
-                        self.queue,
-                        |cmd| {
-                            let copy = vk::BufferCopy::default().size(aligned_size);
-                            self.device.cmd_copy_buffer(
-                                cmd,
-                                stg_buf,
-                                dev_buf,
-                                std::slice::from_ref(&copy),
-                            );
-                        },
-                    )?;
-                }
-            }
-
-            (stg_mapped, dev_buf, dev_mem, Some(stg_buf), Some(stg_mem))
-        } else {
-            // Unified memory: single host-visible buffer
-            let (buf, mem, mapped) = unsafe {
-                allocate_buffer(&self.device, &self.memory_properties, aligned_size, usage)?
-            };
-            if byte_len > 0 {
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        data.as_ptr() as *const std::ffi::c_void,
-                        mapped,
-                        byte_len as usize,
-                    );
-                }
-            }
-            (mapped, buf, mem, None, None)
-        };
-
-        let inner = Box::new(VulkanBufferInner {
-            buffer,
-            memory,
-            _size: aligned_size,
-            mapped,
-            staging_buffer,
-            staging_memory,
-            device: self.device.clone(),
-        });
-
+        let zbuf = self
+            .z
+            .create_buffer(data)
+            .map_err(|e| GpuError::BufferCreationFailed {
+                message: format!("zunesha create_buffer: {e}"),
+            })?;
         Ok(GpuBuffer {
-            raw: Box::into_raw(inner) as *mut std::ffi::c_void,
+            raw: Box::into_raw(Box::new(ZuneshaBufferInner {
+                zbuf,
+                _device: Arc::clone(&self.z),
+            })) as *mut std::ffi::c_void,
             len: data.len(),
-            element_size,
-            drop_fn: drop_vulkan_buffer,
-            contents_fn: contents_vulkan_buffer,
+            element_size: std::mem::size_of::<T>(),
+            drop_fn: drop_zunesha_buffer,
+            contents_fn: contents_zunesha_buffer,
         })
     }
 
     fn create_buffer_uninit<T: bytemuck::Pod>(&self, len: usize) -> Result<GpuBuffer> {
-        let element_size = std::mem::size_of::<T>();
-        let byte_len = (len * element_size) as vk::DeviceSize;
-
-        let aligned_size = if byte_len == 0 {
-            self.min_storage_buffer_offset_alignment
-        } else {
-            align_up(byte_len, self.min_storage_buffer_offset_alignment)
-        };
-
-        let usage = vk::BufferUsageFlags::STORAGE_BUFFER
-            | vk::BufferUsageFlags::TRANSFER_SRC
-            | vk::BufferUsageFlags::TRANSFER_DST;
-
-        let (mapped, buffer, memory, staging_buffer, staging_memory) = if self.uses_device_local {
-            let (dev_buf, dev_mem) = unsafe {
-                allocate_device_local_buffer(
-                    &self.device,
-                    &self.memory_properties,
-                    aligned_size,
-                    usage,
-                )?
-            };
-            let (stg_buf, stg_mem, stg_mapped) = unsafe {
-                allocate_buffer(
-                    &self.device,
-                    &self.memory_properties,
-                    aligned_size,
-                    vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST,
-                )?
-            };
-            (stg_mapped, dev_buf, dev_mem, Some(stg_buf), Some(stg_mem))
-        } else {
-            let (buf, mem, mapped) = unsafe {
-                allocate_buffer(&self.device, &self.memory_properties, aligned_size, usage)?
-            };
-            (mapped, buf, mem, None, None)
-        };
-
-        let inner = Box::new(VulkanBufferInner {
-            buffer,
-            memory,
-            _size: aligned_size,
-            mapped,
-            staging_buffer,
-            staging_memory,
-            device: self.device.clone(),
-        });
-
+        let zbuf =
+            self.z
+                .create_buffer_uninit::<T>(len)
+                .map_err(|e| GpuError::BufferCreationFailed {
+                    message: format!("zunesha create_buffer_uninit: {e}"),
+                })?;
         Ok(GpuBuffer {
-            raw: Box::into_raw(inner) as *mut std::ffi::c_void,
+            raw: Box::into_raw(Box::new(ZuneshaBufferInner {
+                zbuf,
+                _device: Arc::clone(&self.z),
+            })) as *mut std::ffi::c_void,
             len,
-            element_size,
-            drop_fn: drop_vulkan_buffer,
-            contents_fn: contents_vulkan_buffer,
+            element_size: std::mem::size_of::<T>(),
+            drop_fn: drop_zunesha_buffer,
+            contents_fn: contents_zunesha_buffer,
         })
     }
 
@@ -1276,7 +1105,7 @@ impl GpuBackend for VulkanBackend {
         let (dev_buf, dev_mem) = if self.uses_device_local {
             unsafe {
                 allocate_device_local_buffer(
-                    &self.device,
+                    &self.vk(),
                     &self.memory_properties,
                     aligned_size,
                     usage,
@@ -1284,7 +1113,7 @@ impl GpuBackend for VulkanBackend {
             }
         } else {
             let (buf, mem, mapped) = unsafe {
-                allocate_buffer(&self.device, &self.memory_properties, aligned_size, usage)?
+                allocate_buffer(&self.vk(), &self.memory_properties, aligned_size, usage)?
             };
             // Upload data directly (unified memory)
             if byte_len > 0 {
@@ -1303,7 +1132,7 @@ impl GpuBackend for VulkanBackend {
                 mapped,
                 staging_buffer: None,
                 staging_memory: None,
-                device: self.device.clone(),
+                device: Arc::clone(&self.z),
             });
 
             return Ok(GpuBuffer {
@@ -1315,14 +1144,26 @@ impl GpuBackend for VulkanBackend {
             });
         };
 
-        // On discrete GPU: upload via temp staging buffer, then free it
-        let (stg_buf, stg_mem, stg_mapped) = unsafe {
+        // On discrete GPU: upload via temp staging buffer, then free it.
+        // If the staging allocation itself fails, free the device
+        // allocation too — the owning inner does not exist yet (review
+        // round 2: staging-alloc failure leaked the device allocation).
+        let (stg_buf, stg_mem, stg_mapped) = match unsafe {
             allocate_buffer(
-                &self.device,
+                &self.vk(),
                 &self.memory_properties,
                 aligned_size,
                 vk::BufferUsageFlags::TRANSFER_SRC,
-            )?
+            )
+        } {
+            Ok(alloc) => alloc,
+            Err(e) => {
+                unsafe {
+                    self.vk().destroy_buffer(dev_buf, None);
+                    self.vk().free_memory(dev_mem, None);
+                }
+                return Err(e);
+            }
         };
 
         if byte_len > 0 {
@@ -1333,28 +1174,35 @@ impl GpuBackend for VulkanBackend {
                     byte_len as usize,
                 );
             }
-            unsafe {
-                one_shot_transfer(
-                    &self.device,
-                    self.transfer_command_pool,
-                    self.queue,
-                    |cmd| {
-                        let copy = vk::BufferCopy::default().size(aligned_size);
-                        self.device.cmd_copy_buffer(
-                            cmd,
-                            stg_buf,
-                            dev_buf,
-                            std::slice::from_ref(&copy),
-                        );
-                    },
-                )?;
+            // Join the substrate's submission protocol (externally
+            // synchronized queue/pool — see VulkanDevice::with_compute_queue).
+            // On failure, free BOTH allocations before propagating — the
+            // owning inner does not exist yet (review round 1: staging leak).
+            if (self.z.with_compute_queue(|queue| unsafe {
+                one_shot_transfer(&self.vk(), self.transfer_command_pool, queue, |cmd| {
+                    let copy = vk::BufferCopy::default().size(aligned_size);
+                    self.vk()
+                        .cmd_copy_buffer(cmd, stg_buf, dev_buf, std::slice::from_ref(&copy));
+                })
+            }))
+            .is_err()
+            {
+                unsafe {
+                    self.vk().destroy_buffer(stg_buf, None);
+                    self.vk().free_memory(stg_mem, None);
+                    self.vk().destroy_buffer(dev_buf, None);
+                    self.vk().free_memory(dev_mem, None);
+                }
+                return Err(GpuError::DispatchFailed {
+                    message: "device buffer staging upload failed".into(),
+                });
             }
         }
 
         // Free temporary staging buffer
         unsafe {
-            self.device.destroy_buffer(stg_buf, None);
-            self.device.free_memory(stg_mem, None);
+            self.vk().destroy_buffer(stg_buf, None);
+            self.vk().free_memory(stg_mem, None);
         }
 
         let inner = Box::new(VulkanBufferInner {
@@ -1364,7 +1212,7 @@ impl GpuBackend for VulkanBackend {
             mapped: std::ptr::null_mut(),
             staging_buffer: None,
             staging_memory: None,
-            device: self.device.clone(),
+            device: Arc::clone(&self.z),
         });
 
         Ok(GpuBuffer {
@@ -1393,7 +1241,7 @@ impl GpuBackend for VulkanBackend {
         let (buf, mem) = if self.uses_device_local {
             unsafe {
                 allocate_device_local_buffer(
-                    &self.device,
+                    &self.vk(),
                     &self.memory_properties,
                     aligned_size,
                     usage,
@@ -1401,7 +1249,7 @@ impl GpuBackend for VulkanBackend {
             }
         } else {
             let (buf, mem, mapped) = unsafe {
-                allocate_buffer(&self.device, &self.memory_properties, aligned_size, usage)?
+                allocate_buffer(&self.vk(), &self.memory_properties, aligned_size, usage)?
             };
             let inner = Box::new(VulkanBufferInner {
                 buffer: buf,
@@ -1410,7 +1258,7 @@ impl GpuBackend for VulkanBackend {
                 mapped,
                 staging_buffer: None,
                 staging_memory: None,
-                device: self.device.clone(),
+                device: Arc::clone(&self.z),
             });
             return Ok(GpuBuffer {
                 raw: Box::into_raw(inner) as *mut std::ffi::c_void,
@@ -1428,7 +1276,7 @@ impl GpuBackend for VulkanBackend {
             mapped: std::ptr::null_mut(),
             staging_buffer: None,
             staging_memory: None,
-            device: self.device.clone(),
+            device: Arc::clone(&self.z),
         });
 
         Ok(GpuBuffer {
@@ -1474,7 +1322,7 @@ impl GpuBackend for VulkanBackend {
             .command_buffer_count(1);
 
         let cmd = unsafe {
-            self.device
+            self.vk()
                 .allocate_command_buffers(&alloc_info)
                 .map_err(|e| GpuError::DispatchFailed {
                     message: format!("vkAllocateCommandBuffers: {e}"),
@@ -1487,7 +1335,7 @@ impl GpuBackend for VulkanBackend {
             .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
 
         unsafe {
-            self.device
+            self.vk()
                 .begin_command_buffer(cmd, &begin_info)
                 .map_err(|e| GpuError::DispatchFailed {
                     message: format!("vkBeginCommandBuffer: {e}"),
@@ -1498,7 +1346,7 @@ impl GpuBackend for VulkanBackend {
 
         unsafe {
             let vk_pipeline = (*(pipeline.raw as *const VulkanPipelineInner)).pipeline;
-            self.device
+            self.vk()
                 .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, vk_pipeline);
         }
 
@@ -1509,10 +1357,9 @@ impl GpuBackend for VulkanBackend {
 
         // Keep buffer_infos alive on the heap — the writes reference them
         for buf in buffers.iter() {
-            let inner = unsafe { &*(buf.raw as *const VulkanBufferInner) };
             buffer_infos.push(
                 vk::DescriptorBufferInfo::default()
-                    .buffer(inner.buffer)
+                    .buffer(self.buffer_handle(buf))
                     .offset(0)
                     .range(vk::WHOLE_SIZE),
             );
@@ -1530,11 +1377,11 @@ impl GpuBackend for VulkanBackend {
         }
 
         unsafe {
-            self.device.update_descriptor_sets(&writes, &[]);
+            self.vk().update_descriptor_sets(&writes, &[]);
         }
 
         unsafe {
-            self.device.cmd_bind_descriptor_sets(
+            self.vk().cmd_bind_descriptor_sets(
                 cmd,
                 vk::PipelineBindPoint::COMPUTE,
                 self.pipeline_layout,
@@ -1547,7 +1394,7 @@ impl GpuBackend for VulkanBackend {
         // ── Dispatch ──────────────────────────────────────────────
 
         unsafe {
-            self.device
+            self.vk()
                 .cmd_dispatch(cmd, workgroups.0, workgroups.1, workgroups.2);
         }
 
@@ -1558,7 +1405,7 @@ impl GpuBackend for VulkanBackend {
             .dst_access_mask(vk::AccessFlags::HOST_READ);
 
         unsafe {
-            self.device.cmd_pipeline_barrier(
+            self.vk().cmd_pipeline_barrier(
                 cmd,
                 vk::PipelineStageFlags::COMPUTE_SHADER,
                 vk::PipelineStageFlags::HOST,
@@ -1572,7 +1419,7 @@ impl GpuBackend for VulkanBackend {
         // ── End command buffer ────────────────────────────────────
 
         unsafe {
-            self.device
+            self.vk()
                 .end_command_buffer(cmd)
                 .map_err(|e| GpuError::DispatchFailed {
                     message: format!("vkEndCommandBuffer: {e}"),
@@ -1585,26 +1432,30 @@ impl GpuBackend for VulkanBackend {
 
         self.epoch.begin_dispatch();
 
-        unsafe {
-            self.device
-                .queue_submit(self.queue, &[submit_info], vk::Fence::null())
+        // Join the substrate's submission protocol: the compute queue is
+        // externally synchronized — submit AND the immediate wait run inside
+        // `with_compute_queue` so concurrent substrate/consumer submissions
+        // serialize (review round 1 P1).
+        self.z.with_compute_queue(|queue| unsafe {
+            self.vk()
+                .queue_submit(queue, &[submit_info], vk::Fence::null())
                 .map_err(|e| GpuError::DispatchFailed {
                     message: format!("vkQueueSubmit: {e}"),
                 })?;
 
-            self.device
-                .queue_wait_idle(self.queue)
+            self.vk()
+                .queue_wait_idle(queue)
                 .map_err(|e| GpuError::DispatchFailed {
                     message: format!("vkQueueWaitIdle: {e}"),
-                })?;
-        }
+                })
+        })?;
 
         self.epoch.end_dispatch();
 
         // ── Cleanup ───────────────────────────────────────────────
 
         unsafe {
-            self.device
+            self.vk()
                 .free_command_buffers(self.command_pool, std::slice::from_ref(&cmd));
         }
 
@@ -1624,7 +1475,7 @@ impl GpuBackend for VulkanBackend {
             .command_buffer_count(1);
 
         let cmd = unsafe {
-            self.device
+            self.vk()
                 .allocate_command_buffers(&alloc_info)
                 .map_err(|e| GpuError::DispatchFailed {
                     message: format!("vkAllocateCommandBuffers: {e}"),
@@ -1637,7 +1488,7 @@ impl GpuBackend for VulkanBackend {
             .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
 
         unsafe {
-            self.device
+            self.vk()
                 .begin_command_buffer(cmd, &begin_info)
                 .map_err(|e| GpuError::DispatchFailed {
                     message: format!("vkBeginCommandBuffer: {e}"),
@@ -1660,7 +1511,7 @@ impl GpuBackend for VulkanBackend {
             // Bind pipeline
             unsafe {
                 let vk_pipeline = (*(spec.pipeline.raw as *const VulkanPipelineInner)).pipeline;
-                self.device
+                self.vk()
                     .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, vk_pipeline);
             }
 
@@ -1669,10 +1520,9 @@ impl GpuBackend for VulkanBackend {
             let mut writes: Vec<vk::WriteDescriptorSet> = Vec::with_capacity(nbuffers);
 
             for buf in spec.buffers.iter() {
-                let inner = unsafe { &*(buf.raw as *const VulkanBufferInner) };
                 buffer_infos.push(
                     vk::DescriptorBufferInfo::default()
-                        .buffer(inner.buffer)
+                        .buffer(self.buffer_handle(buf))
                         .offset(0)
                         .range(vk::WHOLE_SIZE),
                 );
@@ -1690,8 +1540,8 @@ impl GpuBackend for VulkanBackend {
             }
 
             unsafe {
-                self.device.update_descriptor_sets(&writes, &[]);
-                self.device.cmd_bind_descriptor_sets(
+                self.vk().update_descriptor_sets(&writes, &[]);
+                self.vk().cmd_bind_descriptor_sets(
                     cmd,
                     vk::PipelineBindPoint::COMPUTE,
                     self.pipeline_layout,
@@ -1700,7 +1550,7 @@ impl GpuBackend for VulkanBackend {
                     &[],
                 );
 
-                self.device.cmd_dispatch(
+                self.vk().cmd_dispatch(
                     cmd,
                     spec.workgroups.0,
                     spec.workgroups.1,
@@ -1716,7 +1566,7 @@ impl GpuBackend for VulkanBackend {
             .dst_access_mask(vk::AccessFlags::HOST_READ);
 
         unsafe {
-            self.device.cmd_pipeline_barrier(
+            self.vk().cmd_pipeline_barrier(
                 cmd,
                 vk::PipelineStageFlags::COMPUTE_SHADER,
                 vk::PipelineStageFlags::HOST,
@@ -1730,7 +1580,7 @@ impl GpuBackend for VulkanBackend {
         // ── End, submit, wait ───────────────────────────────────
 
         unsafe {
-            self.device
+            self.vk()
                 .end_command_buffer(cmd)
                 .map_err(|e| GpuError::DispatchFailed {
                     message: format!("vkEndCommandBuffer: {e}"),
@@ -1741,26 +1591,30 @@ impl GpuBackend for VulkanBackend {
 
         self.epoch.begin_dispatch();
 
-        unsafe {
-            self.device
-                .queue_submit(self.queue, &[submit_info], vk::Fence::null())
+        // Join the substrate's submission protocol: the compute queue is
+        // externally synchronized — submit AND the immediate wait run inside
+        // `with_compute_queue` so concurrent substrate/consumer submissions
+        // serialize (review round 1 P1).
+        self.z.with_compute_queue(|queue| unsafe {
+            self.vk()
+                .queue_submit(queue, &[submit_info], vk::Fence::null())
                 .map_err(|e| GpuError::DispatchFailed {
                     message: format!("vkQueueSubmit: {e}"),
                 })?;
 
-            self.device
-                .queue_wait_idle(self.queue)
+            self.vk()
+                .queue_wait_idle(queue)
                 .map_err(|e| GpuError::DispatchFailed {
                     message: format!("vkQueueWaitIdle: {e}"),
-                })?;
-        }
+                })
+        })?;
 
         self.epoch.end_dispatch();
 
         // ── Cleanup ─────────────────────────────────────────────
 
         unsafe {
-            self.device
+            self.vk()
                 .free_command_buffers(self.command_pool, std::slice::from_ref(&cmd));
         }
 
@@ -1789,7 +1643,7 @@ impl GpuBackend for VulkanBackend {
             .command_buffer_count(1);
 
         let cmd = unsafe {
-            self.device
+            self.vk()
                 .allocate_command_buffers(&alloc_info)
                 .map_err(|e| GpuError::DispatchFailed {
                     message: format!("vkAllocateCommandBuffers: {e}"),
@@ -1800,7 +1654,7 @@ impl GpuBackend for VulkanBackend {
             .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
 
         unsafe {
-            self.device
+            self.vk()
                 .begin_command_buffer(cmd, &begin_info)
                 .map_err(|e| GpuError::DispatchFailed {
                     message: format!("vkBeginCommandBuffer: {e}"),
@@ -1810,7 +1664,7 @@ impl GpuBackend for VulkanBackend {
         // Bind pipeline
         unsafe {
             let vk_pipeline = (*(pipeline.raw as *const VulkanPipelineInner)).pipeline;
-            self.device
+            self.vk()
                 .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, vk_pipeline);
         }
 
@@ -1818,10 +1672,9 @@ impl GpuBackend for VulkanBackend {
         let mut buffer_infos = Vec::with_capacity(nbuffers);
         let mut writes = Vec::with_capacity(nbuffers);
         for buf in buffers.iter() {
-            let inner = unsafe { &*(buf.raw as *const VulkanBufferInner) };
             buffer_infos.push(
                 vk::DescriptorBufferInfo::default()
-                    .buffer(inner.buffer)
+                    .buffer(self.buffer_handle(buf))
                     .offset(0)
                     .range(vk::WHOLE_SIZE),
             );
@@ -1838,8 +1691,8 @@ impl GpuBackend for VulkanBackend {
         }
 
         unsafe {
-            self.device.update_descriptor_sets(&writes, &[]);
-            self.device.cmd_bind_descriptor_sets(
+            self.vk().update_descriptor_sets(&writes, &[]);
+            self.vk().cmd_bind_descriptor_sets(
                 cmd,
                 vk::PipelineBindPoint::COMPUTE,
                 self.pipeline_layout,
@@ -1847,14 +1700,14 @@ impl GpuBackend for VulkanBackend {
                 std::slice::from_ref(&self.descriptor_set),
                 &[],
             );
-            self.device
+            self.vk()
                 .cmd_dispatch(cmd, workgroups.0, workgroups.1, workgroups.2);
 
             // Barrier: shader write → host read (applied when waited)
             let barrier = vk::MemoryBarrier::default()
                 .src_access_mask(vk::AccessFlags::SHADER_WRITE)
                 .dst_access_mask(vk::AccessFlags::HOST_READ);
-            self.device.cmd_pipeline_barrier(
+            self.vk().cmd_pipeline_barrier(
                 cmd,
                 vk::PipelineStageFlags::COMPUTE_SHADER,
                 vk::PipelineStageFlags::HOST,
@@ -1864,7 +1717,7 @@ impl GpuBackend for VulkanBackend {
                 &[],
             );
 
-            self.device
+            self.vk()
                 .end_command_buffer(cmd)
                 .map_err(|e| GpuError::DispatchFailed {
                     message: format!("vkEndCommandBuffer: {e}"),
@@ -1874,7 +1727,7 @@ impl GpuBackend for VulkanBackend {
         // Create fence for async completion signal
         let fence_info = vk::FenceCreateInfo::default();
         let fence = unsafe {
-            self.device
+            self.vk()
                 .create_fence(&fence_info, None)
                 .map_err(|e| GpuError::DispatchFailed {
                     message: format!("vkCreateFence: {e}"),
@@ -1885,23 +1738,25 @@ impl GpuBackend for VulkanBackend {
 
         self.epoch.begin_dispatch();
 
-        unsafe {
-            self.device
-                .queue_submit(self.queue, &[submit_info], fence)
+        // Submit inside the substrate's submission protocol; the fence (not
+        // the queue) tracks completion, so Pulse waits need no lock.
+        self.z.with_compute_queue(|queue| unsafe {
+            self.vk()
+                .queue_submit(queue, &[submit_info], fence)
                 .map_err(|e| GpuError::DispatchFailed {
                     message: format!("vkQueueSubmit: {e}"),
-                })?;
-        }
+                })
+        })?;
 
         // Free command buffer (work is submitted, fence tracks completion)
         unsafe {
-            self.device
+            self.vk()
                 .free_command_buffers(self.command_pool, std::slice::from_ref(&cmd));
         }
 
         let inner = Box::new(VulkanPulseInner {
             fence,
-            device: self.device.clone(),
+            device: Arc::clone(&self.z),
             epoch: std::sync::Arc::clone(&self.epoch),
             epoch_completed: std::sync::atomic::AtomicBool::new(false),
         });
@@ -1914,78 +1769,86 @@ impl GpuBackend for VulkanBackend {
     }
 
     fn read_buffer<T: bytemuck::Pod>(&self, buffer: &GpuBuffer) -> Result<Vec<T>> {
+        // Two buffer kinds live behind `GpuBuffer`: substrate-allocated
+        // (create_buffer paths — tagged via the contents sentinel) and
+        // Borsalino-allocated (create_device_buffer paths). Dispatch on
+        // the sentinel, then run the kind's read path.
+        if std::ptr::eq((buffer.contents_fn)(buffer.raw), SUBSTRATE_BUFFER_TAG) {
+            // Safety: `raw` was produced by `Box::into_raw::<ZuneshaBufferInner>`
+            // and is still valid (buffer not dropped).
+            let inner = unsafe { &*(buffer.raw as *const ZuneshaBufferInner) };
+            return self
+                .z
+                .read_buffer(&inner.zbuf)
+                .map_err(|e| GpuError::BufferReadFailed {
+                    message: format!("zunesha read_buffer: {e}"),
+                });
+        }
+
+        // Safety: `raw` was produced by `Box::into_raw::<VulkanBufferInner>`
+        // (Borsalino's own allocation path) and is still valid.
         let inner = unsafe { &*(buffer.raw as *const VulkanBufferInner) };
 
-        if self.uses_device_local {
-            // Device-local with persistent staging (from create_buffer)
-            if inner.staging_buffer.is_some() {
-                if let (Some(stg_buf), Some(_stg_mem)) =
-                    (inner.staging_buffer, inner.staging_memory)
-                {
-                    unsafe {
-                        one_shot_transfer(
-                            &self.device,
-                            self.transfer_command_pool,
-                            self.queue,
-                            |cmd| {
-                                let copy = vk::BufferCopy::default().size(inner._size);
-                                self.device.cmd_copy_buffer(
-                                    cmd,
-                                    inner.buffer,
-                                    stg_buf,
-                                    std::slice::from_ref(&copy),
-                                );
-                            },
-                        )?;
-                    }
-                }
-            } else if inner.mapped.is_null() {
-                // Device-local without staging (from create_device_buffer).
-                // Allocate temp staging, copy, read, free.
-                let (stg_buf, stg_mem, stg_mapped) = unsafe {
-                    allocate_buffer(
-                        &self.device,
-                        &self.memory_properties,
-                        inner._size,
-                        vk::BufferUsageFlags::TRANSFER_DST,
-                    )?
-                };
+        // Borsalino-allocated buffers come only from the
+        // `create_device_buffer` paths: device-local without staging
+        // (mapped null — read via temp staging), or host-visible under a
+        // unified placement (mapped, read directly). The old
+        // persistent-staging shape belonged to `create_buffer`, which now
+        // delegates to the substrate.
+        if self.uses_device_local && inner.mapped.is_null() {
+            // Device-local without staging: allocate temp staging, copy,
+            // read, free.
+            let (stg_buf, stg_mem, stg_mapped) = unsafe {
+                allocate_buffer(
+                    &self.vk(),
+                    &self.memory_properties,
+                    inner._size,
+                    vk::BufferUsageFlags::TRANSFER_DST,
+                )?
+            };
+            // Join the substrate's submission protocol; on transfer failure
+            // free the staging allocation before propagating (review round
+            // 1: the `?` used to leak it).
+            if (self.z.with_compute_queue(|queue| unsafe {
+                one_shot_transfer(&self.vk(), self.transfer_command_pool, queue, |cmd| {
+                    let copy = vk::BufferCopy::default().size(inner._size);
+                    self.vk().cmd_copy_buffer(
+                        cmd,
+                        inner.buffer,
+                        stg_buf,
+                        std::slice::from_ref(&copy),
+                    );
+                })
+            }))
+            .is_err()
+            {
                 unsafe {
-                    one_shot_transfer(
-                        &self.device,
-                        self.transfer_command_pool,
-                        self.queue,
-                        |cmd| {
-                            let copy = vk::BufferCopy::default().size(inner._size);
-                            self.device.cmd_copy_buffer(
-                                cmd,
-                                inner.buffer,
-                                stg_buf,
-                                std::slice::from_ref(&copy),
-                            );
-                        },
-                    )?;
+                    self.vk().destroy_buffer(stg_buf, None);
+                    self.vk().free_memory(stg_mem, None);
                 }
-
-                let contents = stg_mapped as *const T;
-                if contents.is_null() {
-                    unsafe {
-                        self.device.destroy_buffer(stg_buf, None);
-                        self.device.free_memory(stg_mem, None);
-                    }
-                    return Err(GpuError::BufferReadFailed {
-                        message: "staging buffer map failed".into(),
-                    });
-                }
-                let slice = unsafe { std::slice::from_raw_parts(contents, buffer.len) };
-                let result = slice.to_vec();
-
-                unsafe {
-                    self.device.destroy_buffer(stg_buf, None);
-                    self.device.free_memory(stg_mem, None);
-                }
-                return Ok(result);
+                return Err(GpuError::BufferReadFailed {
+                    message: "staging transfer failed".into(),
+                });
             }
+
+            let contents = stg_mapped as *const T;
+            if contents.is_null() {
+                unsafe {
+                    self.vk().destroy_buffer(stg_buf, None);
+                    self.vk().free_memory(stg_mem, None);
+                }
+                return Err(GpuError::BufferReadFailed {
+                    message: "staging buffer map failed".into(),
+                });
+            }
+            let slice = unsafe { std::slice::from_raw_parts(contents, buffer.len) };
+            let result = slice.to_vec();
+
+            unsafe {
+                self.vk().destroy_buffer(stg_buf, None);
+                self.vk().free_memory(stg_mem, None);
+            }
+            return Ok(result);
         }
 
         let contents = (buffer.contents_fn)(buffer.raw) as *const T;
@@ -2012,38 +1875,40 @@ impl GpuBackend for VulkanBackend {
                 .command_buffer_count(1);
 
             let cmd = self
-                .device
+                .vk()
                 .allocate_command_buffers(&alloc_info)
                 .map_err(|e| GpuError::Internal(format!("timestamp alloc: {e}")))?[0];
 
             let begin_info = vk::CommandBufferBeginInfo::default()
                 .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-            self.device
+            self.vk()
                 .begin_command_buffer(cmd, &begin_info)
                 .map_err(|e| GpuError::Internal(format!("timestamp begin: {e}")))?;
 
             // Reset query pool before use
-            self.device.reset_query_pool(pool, 0, 1);
+            self.vk().reset_query_pool(pool, 0, 1);
 
             // Write GPU timestamp
-            self.device
+            self.vk()
                 .cmd_write_timestamp(cmd, vk::PipelineStageFlags::ALL_COMMANDS, pool, 0);
 
-            self.device
+            self.vk()
                 .end_command_buffer(cmd)
                 .map_err(|e| GpuError::Internal(format!("timestamp end: {e}")))?;
 
             let submit_info = vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&cmd));
-            self.device
-                .queue_submit(self.queue, &[submit_info], vk::Fence::null())
-                .map_err(|e| GpuError::Internal(format!("timestamp submit: {e}")))?;
-            self.device
-                .queue_wait_idle(self.queue)
-                .map_err(|e| GpuError::Internal(format!("timestamp wait: {e}")))?;
+            self.z.with_compute_queue(|queue| {
+                self.vk()
+                    .queue_submit(queue, &[submit_info], vk::Fence::null())
+                    .map_err(|e| GpuError::Internal(format!("timestamp submit: {e}")))?;
+                self.vk()
+                    .queue_wait_idle(queue)
+                    .map_err(|e| GpuError::Internal(format!("timestamp wait: {e}")))
+            })?;
 
             // Read back timestamp
             let mut ts_data = [0u64];
-            self.device
+            self.vk()
                 .get_query_pool_results(
                     pool,
                     0,
@@ -2052,7 +1917,7 @@ impl GpuBackend for VulkanBackend {
                 )
                 .map_err(|e| GpuError::Internal(format!("timestamp read: {e}")))?;
 
-            self.device
+            self.vk()
                 .free_command_buffers(self.command_pool, std::slice::from_ref(&cmd));
 
             // Convert ticks to nanoseconds
@@ -2069,44 +1934,75 @@ impl GpuBackend for VulkanBackend {
 mod tests {
     use super::*;
 
-    // ── API version negotiation (issue #34: SIGSEGV under Mesa ICDs) ───
+    // ── Substrate integration ─────────────────────────────────────
 
+    /// `init()` builds on a substrate device; the returned backend hands
+    /// that same device back via `into_zunesha` (still usable after the
+    /// backend's plumbing is torn down).
     #[test]
-    fn negotiate_version_caps_at_driver_max() {
-        // lavapipe (Mesa <23.x) supports 1.2; requesting 1.3 crashes it.
-        // We must request 1.2 instead.
-        let available = Some(vk::API_VERSION_1_2);
-        assert_eq!(negotiate_api_version(available), vk::API_VERSION_1_2);
+    #[serial_test::serial]
+    fn into_zunesha_returns_live_device_after_backend_drop() {
+        let z = match VulkanBackend::init() {
+            Ok(b) => b.into_zunesha(),
+            Err(e) => {
+                eprintln!("skipping: no Vulkan device ({e})");
+                return;
+            }
+        };
+        // The backend is dropped — its descriptor/command pools are gone,
+        // but the substrate device must still allocate and read buffers.
+        let buf = z.create_buffer(&[1.0f32, 2.0, 3.0]).unwrap();
+        let back: Vec<f32> = z.read_buffer(&buf).unwrap();
+        assert_eq!(back, vec![1.0, 2.0, 3.0]);
     }
 
+    /// ADR 0001 interop: an externally-created substrate device wrapped via
+    /// `from_zunesha` carries full Borsalino compute (compile → dispatch →
+    /// read), and the external holder can keep using the device after the
+    /// backend is dropped (the Arc share outlives the plumbing).
     #[test]
-    fn negotiate_version_caps_at_our_max() {
-        // A future driver supports 1.4; we cap at 1.3 (our max tested).
-        let future = vk::make_api_version(0, 1, 4, 0);
-        assert_eq!(negotiate_api_version(Some(future)), vk::API_VERSION_1_3);
-    }
+    #[serial_test::serial]
+    fn from_zunesha_shares_device_with_external_holder() {
+        let z = std::sync::Arc::new(match zunesha::vulkan::VulkanDevice::init() {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("skipping: no Vulkan device ({e})");
+                return;
+            }
+        });
+        let backend = match VulkanBackend::from_zunesha(std::sync::Arc::clone(&z)) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skipping: plumbing build failed ({e})");
+                return;
+            }
+        };
 
-    #[test]
-    fn negotiate_version_full_1_3_when_supported() {
-        // RTX / modern Mesa supports 1.3; we take full advantage.
-        assert_eq!(
-            negotiate_api_version(Some(vk::API_VERSION_1_3)),
-            vk::API_VERSION_1_3
-        );
-    }
+        let wgsl = r#"
+            @group(0) @binding(0) var<storage, read> input: array<f32>;
+            @group(0) @binding(1) var<storage, read_write> output: array<f32>;
 
-    #[test]
-    fn negotiate_version_falls_back_to_1_0() {
-        // Vulkan 1.0-only loader (no vkEnumerateInstanceVersion).
-        assert_eq!(negotiate_api_version(None), vk::API_VERSION_1_0);
-    }
+            @compute @workgroup_size(256)
+            fn add_one(@builtin(global_invocation_id) gid: vec3<u32>) {
+                let i = gid.x;
+                if (i >= 4u) { return; }
+                output[i] = input[i] + 1.0;
+            }
+        "#;
+        let pipeline = backend.compile("add_one", wgsl).unwrap();
+        let input = backend.create_buffer(&[1.0f32, 2.0, 3.0, 4.0]).unwrap();
+        let output = backend.create_buffer_uninit::<f32>(4).unwrap();
+        backend
+            .dispatch(&pipeline, &[&input, &output], (1, 1, 1))
+            .unwrap();
+        let result: Vec<f32> = backend.read_buffer(&output).unwrap();
+        assert_eq!(result, vec![2.0, 3.0, 4.0, 5.0]);
 
-    #[test]
-    fn negotiate_version_1_1() {
-        assert_eq!(
-            negotiate_api_version(Some(vk::API_VERSION_1_1)),
-            vk::API_VERSION_1_1
-        );
+        drop(backend);
+        // The external holder's Arc keeps the device alive post-drop.
+        let buf = z.create_buffer(&[9.0f32]).unwrap();
+        let back: Vec<f32> = z.read_buffer(&buf).unwrap();
+        assert_eq!(back, vec![9.0]);
     }
 
     #[test]
