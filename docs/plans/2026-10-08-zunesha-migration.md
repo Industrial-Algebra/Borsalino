@@ -171,9 +171,13 @@ collapse and the init-delegation are one change):
 2. Field collapse in `VulkanBackend`: `_entry`, `instance`, `device`,
    `queue`, `queue_family_index`, `min_storage_buffer_offset_alignment`,
    `memory_properties`, `memory_strategy`, `uses_device_local` →
-   `z: Arc<zunesha::vulkan::VulkanDevice>` + cached `queue: vk::Queue`,
-   `queue_family_index: u32`, `min_storage_buffer_offset_alignment`,
-   timestamp fields (all derived from `z` at construction).
+   `z: Arc<zunesha::vulkan::VulkanDevice>` + `queue_family_index: u32`,
+   `min_storage_buffer_offset_alignment`, `memory_properties`,
+   `uses_device_local`, timestamp fields (derived from `z` at
+   construction). **No cached queue** — the queue handle lives in the
+   substrate; every submission runs inside
+   `z.with_compute_queue(|queue| …)` (the externally-synchronized
+   queue/pool protocol; added during review round 1).
 3. `SharedDevice`/`SharedInstance`/`InstanceInner`/`DeviceInner` **deleted**;
    inners switch to `Arc<VulkanDevice>`.
 4. `create_buffer` / `create_buffer_uninit` / `read_buffer` delegate to the
