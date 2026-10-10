@@ -41,7 +41,8 @@ design refuses pipelines and verification — those stay Borsalino's.
 |---|---|---|
 | Instance/entry/physical-device selection + scoring | **Zunesha** | `pick_physical_device`, `device_type_score`, `negotiate_api_version`, `create_device` deleted from `src/vulkan.rs` |
 | Queue family selection | **Zunesha** | Borsalino reads `queues().compute` (`Queue::raw` + `family_index`) |
-| Memory strategy negotiation, `find_memory_type_index`, `align_up`, `detect_device_local` | **Zunesha** | `MemoryStrategy` is the same enum, lifted from this design — 1:1 |
+| Memory strategy negotiation, `detect_device_local` | **Zunesha** | `MemoryStrategy` is the same enum, lifted from this design — 1:1 |
+| `find_memory_type_index`, `align_up` | **Borsalino, until Phase 2** | retained for `create_device_buffer`'s own allocation path (§5.1); deleted with it |
 | Buffer create/read (strategy-respecting) | **Zunesha** | staging design is identical (same code lineage) |
 | `create_device_buffer` (GPU-resident profile) | **Borsalino, until Phase 2** | Zunesha 0.1.0's default delegates to `create_buffer`; Borsalino's temp-staging profile is a memory-vs-read-latency tradeoff (§5.1) — kept on `raw_device()` + `memory_properties()` until the profile alignment is an explicit decision |
 | WGSL→SPIR-V (naga), `compile_cached`, disk cache | **Borsalino** | unchanged |
@@ -90,10 +91,16 @@ vulkan = ["dep:ash", "dep:zunesha", "zunesha/vulkan"]
 
 - `ash` stays a direct dependency — Borsalino's pipeline/dispatch plumbing
   calls it directly on Zunesha's raw handles.
-- **No path dependencies, even in development**: Borsalino CI (GitHub-hosted
-  Linux + self-hosted macOS) cannot see `../Zunesha`; a path dep makes CI
-  red. Develop against the registry version; Zunesha gaps that block
-  delegation are fixed by publishing Zunesha patch releases first.
+- **No path dependencies** — Borsalino CI (GitHub-hosted Linux + self-hosted
+  macOS) cannot see `../Zunesha`; a path dep makes CI red.
+- **Exception taken in Phase 1 (review-noted):** the swap needs Zunesha's
+  `VulkanDevice: Send + Sync` (soundness of the `Arc` sharing — §3), which
+  was unpublished at Phase-1 time. The dependency is temporarily a **git
+  dep on Zunesha PR #9's branch** (public repo, CI-fetchable), with the
+  merge-order contract: **Zunesha #9 merged → 0.1.1 published → flip to
+  `version = "0.1"` → merge Borsalino Phase 1.** Registry 0.1.0 alone is
+  sufficient only for the buffer/read delegation, NOT for the `Arc`
+  ownership soundness.
 - `MemoryStrategy` re-export: keep Borsalino's own enum as the public type
   (semver-stable for consumers) and convert at the boundary — the mapping is
   1:1 (`Auto`/`Unified`/`DeviceLocal`).
@@ -120,7 +127,9 @@ Phase 1 would change behavior twice** (forced placement under
 `Unified`, persistent vs temp staging) — so Borsalino keeps its own raw
 implementation until Phase 2 makes the profile alignment an *explicit,
 tested* decision (align to Zunesha's documented contract, or carry the
-write-optimized profile). Zunesha 0.1.0 registry is sufficient for Phase 1.
+write-optimized profile). Zunesha 0.1.0 suffices for the buffer/read
+delegation; the Phase-1 git-dep exception (§4) exists for the `Send + Sync`
+soundness, not for this gap.
 
 ### 5.2 Flagged follow-up — blanket `device_wait_idle` in `VulkanDevice::Drop`
 
