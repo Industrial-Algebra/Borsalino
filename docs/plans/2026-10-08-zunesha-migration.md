@@ -42,7 +42,7 @@ design refuses pipelines and verification — those stay Borsalino's.
 | Instance/entry/physical-device selection + scoring | **Zunesha** | `pick_physical_device`, `device_type_score`, `negotiate_api_version`, `create_device` deleted from `src/vulkan.rs` |
 | Queue family selection | **Zunesha** | Borsalino reads `queues().compute` (`Queue::raw` + `family_index`) |
 | Memory strategy negotiation, `detect_device_local` | **Zunesha** | `MemoryStrategy` is the same enum, lifted from this design — 1:1 |
-| `find_memory_type_index`, `align_up` | **Borsalino, until Phase 2** | retained for `create_device_buffer`'s own allocation path (§5.1); deleted with it |
+| `find_memory_type_index`, `align_up` | *(was: Borsalino until Phase 2)* | **deleted in Phase 2** — `create_device_buffer` delegates to Zunesha (§5.1 resolved) |
 | Buffer create/read (strategy-respecting) | **Zunesha** | staging design is identical (same code lineage) |
 | `create_device_buffer` (GPU-resident profile) | **Borsalino, until Phase 2** | Zunesha 0.1.0's default delegates to `create_buffer`; Borsalino's temp-staging profile is a memory-vs-read-latency tradeoff (§5.1) — kept on `raw_device()` + `memory_properties()` until the profile alignment is an explicit decision |
 | WGSL→SPIR-V (naga), `compile_cached`, disk cache | **Borsalino** | unchanged |
@@ -107,7 +107,7 @@ vulkan = ["dep:ash", "dep:zunesha", "zunesha/vulkan"]
 
 ## 5. Zunesha-side companion work
 
-### 5.1 Gap found by this survey — `create_device_buffer` placement semantics (Zunesha PR, patch release)
+### 5.1 Resolved — `create_device_buffer` placement semantics (Phase 2, aligned 2026-10-10)
 
 > **Corrected 2026-10-08 after deeper reading** — the first draft of this
 > section overstated the gap. The accurate picture:
@@ -192,17 +192,21 @@ collapse and the init-delegation are one change):
    numerical_check + examples) passes unchanged on the 5080 — the trait
    surface did not move, so no caller changes.
 
-### Phase 2 — finish the collapse (after Zunesha 0.1.1)
+### Phase 2 — finish the collapse ✅ DONE (2026-10-10, feat/phase2-buffer-delegation)
 
-Make the `create_device_buffer` profile alignment an explicit, tested
-decision (§5.1): either delegate to Zunesha's documented contract
-(forced device-local + persistent staging — behavior change under forced
-`Unified`, changelog-noted) or port the temp-staging write-optimized
-profile into Zunesha as a buffer profile parameter. Then delete
-Borsalino's remaining allocation code (`find_memory_type_index`,
-`align_up`, `detect_device_local`, device-local allocate paths). Tests:
-`create_device_buffer` placement + readback under both strategies on
-discrete hardware.
+Decision taken (operator, 2026-10-10): **align to Zunesha's documented
+contract** — `create_device_buffer(_uninit)` and `read_buffer` delegate to
+the substrate (forced device-local + persistent staging, including under
+forced `Unified` on discrete hardware). Borsalino's remaining allocation
+code is deleted (`find_memory_type_index`, `align_up`, both allocate
+paths, `one_shot_transfer`, `VulkanBufferInner`, the transfer command
+pool, and the `memory_properties` / `uses_device_local` /
+`min_storage_buffer_offset_alignment` fields). Pinned by delegation tests
+(substrate tag + drop identity) and round-trips under both strategies;
+see §5.1 for the changelog-noted behavior changes. The temp-staging
+write-optimized profile remains recoverable later via an additive
+Zunesha buffer-profile API if the persistent-staging memory cost ever
+bites.
 
 ### Phase 3 — Metal migration (after Zunesha Metal; parallel track)
 
