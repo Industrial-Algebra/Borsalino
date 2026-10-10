@@ -131,15 +131,17 @@ write-optimized profile). Zunesha 0.1.0 suffices for the buffer/read
 delegation; the Phase-1 git-dep exception (§4) exists for the `Send + Sync`
 soundness, not for this gap.
 
-### 5.2 Flagged follow-up — blanket `device_wait_idle` in `VulkanDevice::Drop`
+### 5.2 Resolved — blanket `device_wait_idle` in `VulkanDevice::Drop` (fixed in the companion PR)
 
-Zunesha's `Drop` calls `device_wait_idle()` unconditionally; Borsalino moved
-away from blanket waits because they stampede driver-internal locks under
-parallel load (deadlocked the parallel test suite on the 5080). With Borsalino's
-epoch-gated backend drop and pulse fence waits, the Zunesha wait at final
-release is redundant — but it should be gated (or documented as
-consumer-contract) when Zunesha wires its tracker (candidate ADR 0004
-territory). Not a blocker; tracked in Zunesha's critique/ROADMAP.
+Zunesha's `Drop` *originally* called `device_wait_idle()` unconditionally — the
+behavior that stamped driver-internal locks under parallel load on the 5080
+(Borsalino had moved away from blanket waits for that reason). The companion
+branch (Zunesha PR #9, review round 1) now **gates the final-drop wait on
+`epoch.in_flight() > 0`**, matching Borsalino's discipline: today the tracker
+is never incremented in Zunesha 0.1, so the wait is a no-op and the consumer
+contract is "submissions retired before the last handle drops"; full
+consumer-side dispatch accounting (the backstop that re-arms the wait) is
+ADR 0004 territory. Borsalino's own backend drop remains epoch-gated.
 
 ### 5.3 Optional nicety — `timestamp_period` in `DeviceLimits`
 
