@@ -370,7 +370,7 @@ unsafe fn bind_buffer_sizes(
     encoder: *mut std::ffi::c_void,
     pipeline_raw: *mut std::ffi::c_void,
     buffers: &[&GpuBuffer],
-) -> Option<*mut std::ffi::c_void> {
+) -> std::result::Result<Option<*mut std::ffi::c_void>, GpuError> {
     const SIZES_SLOT: u64 = 30;
 
     // Safety: `pipeline_raw` was produced by `Box::into_raw::<MetalPipelineInner>`
@@ -378,7 +378,9 @@ unsafe fn bind_buffer_sizes(
     let inner = unsafe { &*(pipeline_raw as *const MetalPipelineInner) };
     let layout: &[u32] = inner.sizes_bindings.as_slice();
     if layout.is_empty() {
-        return None;
+        // Successful absence: this kernel has no runtime-array globals, so
+        // naga emitted no sizes constant and there is nothing to bind.
+        return Ok(None);
     }
 
     // One byte size per layout entry, in declaration order. Unbound
@@ -397,24 +399,29 @@ unsafe fn bind_buffer_sizes(
         msg_send![
             obj(dev),
             newBufferWithBytes: sizes.as_ptr() as *const std::ffi::c_void
-            length: std::mem::size_of_val(&sizes) as u64
+            length: (sizes.len() * std::mem::size_of::<u32>()) as u64
             options: 0u64
         ]
     };
     if buf.is_null() {
-        return None;
+        return Err(GpuError::DispatchFailed {
+            message: "failed to allocate _mslBufferSizes constant".into(),
+        });
     }
     unsafe {
         let _: () = msg_send![obj(encoder), setBuffer: buf offset: 0u64 atIndex: SIZES_SLOT];
     }
-    Some(buf)
+    Ok(Some(buf))
 }
 
 /// Release a sizes buffer previously returned by [`bind_buffer_sizes`].
-unsafe fn release_sizes_buffer(buf: *mut std::ffi::c_void) {
-    if !buf.is_null() {
-        unsafe {
-            let _: () = msg_send![obj(buf), release];
+/// `None` (kernel without a sizes constant) releases nothing.
+unsafe fn release_sizes_buffer(buf: Option<*mut std::ffi::c_void>) {
+    if let Some(buf) = buf {
+        if !buf.is_null() {
+            unsafe {
+                let _: () = msg_send![obj(buf), release];
+            }
         }
     }
 }
@@ -747,13 +754,11 @@ impl GpuBackend for MetalBackend {
                 ];
             }
 
-            // Bind the naga buffer-sizes constant (arrayLength support)
+            // Bind the naga buffer-sizes constant (arrayLength support).
+            // Ok(None) = kernel has no sizes constant; only allocation
+            // failure is an error here.
             let sizes_buf =
-                bind_buffer_sizes(self.device.ptr.as_ptr(), encoder, pipeline.raw, buffers).ok_or(
-                    GpuError::DispatchFailed {
-                        message: "failed to allocate _mslBufferSizes constant".into(),
-                    },
-                )?;
+                bind_buffer_sizes(self.device.ptr.as_ptr(), encoder, pipeline.raw, buffers)?;
 
             // Dispatch
             let _: () = msg_send![
@@ -823,13 +828,11 @@ impl GpuBackend for MetalBackend {
                 ];
             }
 
-            // Bind the naga buffer-sizes constant (arrayLength support)
+            // Bind the naga buffer-sizes constant (arrayLength support).
+            // Ok(None) = kernel has no sizes constant; only allocation
+            // failure is an error here.
             let sizes_buf =
-                bind_buffer_sizes(self.device.ptr.as_ptr(), encoder, pipeline.raw, buffers).ok_or(
-                    GpuError::DispatchFailed {
-                        message: "failed to allocate _mslBufferSizes constant".into(),
-                    },
-                )?;
+                bind_buffer_sizes(self.device.ptr.as_ptr(), encoder, pipeline.raw, buffers)?;
 
             let _: () = msg_send![
                 obj(encoder),
@@ -946,7 +949,7 @@ impl GpuBackend for MetalBackend {
             }
 
             // Sizes buffers (one per spec) — released after endEncoding.
-            let mut sizes_bufs: Vec<*mut c_void> = Vec::with_capacity(dispatches.len());
+            let mut sizes_bufs: Vec<Option<*mut c_void>> = Vec::with_capacity(dispatches.len());
 
             for spec in dispatches {
                 // Set pipeline
@@ -968,15 +971,14 @@ impl GpuBackend for MetalBackend {
                 // Bind the naga buffer-sizes constant (arrayLength
                 // support) — one per spec; slot 30 is overwritten per
                 // dispatch, matching the encoder's sequential encoding.
+                // Ok(None) = spec kernel has no sizes constant; release
+                // handles absence as a no-op.
                 let sizes_buf = bind_buffer_sizes(
                     self.device.ptr.as_ptr(),
                     encoder,
                     spec.pipeline.raw,
                     spec.buffers,
-                )
-                .ok_or(GpuError::DispatchFailed {
-                    message: "failed to allocate _mslBufferSizes constant".into(),
-                })?;
+                )?;
                 sizes_bufs.push(sizes_buf);
 
                 // Dispatch
