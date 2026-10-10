@@ -57,6 +57,7 @@ dependencies = [
  "rand",
  "serial_test",
  "thiserror",
+ "zunesha",
 ]
 
 [[package]]
@@ -588,4 +589,15 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "zunesha"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fe5efd32d94091ddc94257f313dd374927f7369ff2a1f973d336165a84f08787"
+dependencies = [
+ "ash",
+ "bytemuck",
+ "thiserror",
 ]

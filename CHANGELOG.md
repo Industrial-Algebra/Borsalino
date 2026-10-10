@@ -2,6 +2,72 @@
 
 All notable changes to Borsalino are documented in this file.
 
+## [Unreleased]
+
+### Changed — dependency flip (2026-10-10)
+
+- `zunesha` dependency flipped from the temporary git dep on the
+  `feat/device-buffer-override` branch to `version = "0.1.1"` from
+  crates.io (published today). The staged git-dep exception is closed.
+
+### Fixed — review round 2 (2026-10-10)
+
+- Allocation-failure leaks on every error path: `create_device_buffer`
+  frees the device allocation when the staging allocation itself fails;
+  `allocate_buffer`/`allocate_device_local_buffer` destroy partial
+  state (buffer, then memory) when memory-type lookup, `vkAllocateMemory`,
+  `vkBindBufferMemory`, or `vkMapMemory` fails; `build` releases all
+  dispatch resources (layouts, pools, timestamp pool) via an armed RAII
+  guard when any construction step fails.
+
+### Fixed — review round 1 (2026-10-09)
+
+- **P1 (soundness):** every queue submission now joins the substrate's
+  protocol — `zunesha::vulkan::VulkanDevice::with_compute_queue` — because
+  the compute queue is an externally synchronized Vulkan object shared
+  with the substrate's staging transfers (two `from_zunesha` backends, or
+  a backend plus a substrate buffer creation, could previously race
+  `vkQueueSubmit` from safe code). Applies to dispatch, dispatch_many,
+  dispatch_async (submit only — fence waits need no lock), timestamps,
+  and both one-shot transfer paths. The `queue` field is gone; the
+  handle lives in the substrate.
+- Readback/upload staging allocations are freed before propagating
+  transfer errors (`create_device_buffer` upload frees staging AND the
+  device allocation; `read_buffer` frees its temp staging) — previously
+  inherited-from-develop leaks on the error paths.
+
+### Changed — Zunesha device substrate, Vulkan backend (Phase 1 of the
+### staged migration)
+
+- The Vulkan backend now owns its device through
+  `Arc<zunesha::vulkan::VulkanDevice>` instead of building its own
+  instance/physical/logical device: instance creation, physical-device
+  selection and scoring, queue-family selection, API-version negotiation,
+  memory-strategy detection, and strategy-respecting buffer
+  allocation/readback all delegate to the substrate (ADR 0001/0003).
+  The former `SharedDevice`/`SharedInstance` wrappers collapse onto the
+  `Arc` — buffers, pipelines, and pulses still outlive the backend (P1
+  review contract preserved; the device dies with the last holder).
+- New: `VulkanBackend::from_zunesha(Arc<VulkanDevice>)` and
+  `VulkanBackend::into_zunesha()` — share one substrate device between
+  Borsalino compute and e.g. Goldenweek rendering (ADR 0001 interop).
+- `create_buffer`/`create_buffer_uninit`/`read_buffer` delegate to the
+  substrate (`zunesha::Device`); the returned `GpuBuffer` wraps a
+  `zunesha::Buffer`.
+- `create_device_buffer(_uninit)` keeps Borsalino's own temp-staging
+  allocation profile (migration plan §5.1 — delegation is an explicit
+  Phase-2 decision, not a silent swap).
+- Epoch tracking stays on Borsalino's side until Zunesha wires consumer
+  dispatch accounting (ADR 0003 end state; honest intermediate).
+- Net −214 lines; WGSL→SPIR-V compilation, dispatch, dispatch_many,
+  dispatch_async, timestamps, and the verification layer are unchanged.
+
+### Dependencies
+
+- `zunesha` (Vulkan substrate; requires ≥0.1.1 for `VulkanDevice:
+  Send + Sync` — temporarily a git dep on the Zunesha PR branch until
+  0.1.1 publishes). `borsalino/vulkan` now forwards to `zunesha/vulkan`.
+
 ## [0.7.0] — 2026-10-03
 
 ### Fixed — review findings (2026-10-01)
