@@ -4,6 +4,16 @@ All notable changes to Borsalino are documented in this file.
 
 ## [Unreleased]
 
+### Fixed — review round 2 (2026-10-10)
+
+- Allocation-failure leaks on every error path: `create_device_buffer`
+  frees the device allocation when the staging allocation itself fails;
+  `allocate_buffer`/`allocate_device_local_buffer` destroy partial
+  state (buffer, then memory) when memory-type lookup, `vkAllocateMemory`,
+  `vkBindBufferMemory`, or `vkMapMemory` fails; `build` releases all
+  dispatch resources (layouts, pools, timestamp pool) via an armed RAII
+  guard when any construction step fails.
+
 ### Fixed — review round 1 (2026-10-09)
 
 - **P1 (soundness):** every queue submission now joins the substrate's
