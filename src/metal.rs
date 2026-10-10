@@ -90,10 +90,33 @@ impl Drop for MetalQueue {
     }
 }
 
+/// Internal state for a Metal compute pipeline, stored behind the opaque
+/// `ComputePipeline.raw` pointer: the owned `MTLComputePipelineState` and
+/// the naga buffer-sizes layout (see [`sizes_buffer_bindings`]).
+struct MetalPipelineInner {
+    /// Owned (+1 from `newComputePipelineState…`) pipeline state.
+    pipeline: *mut c_void,
+    /// Binding numbers of runtime-sized-array globals, in module
+    /// declaration order — the field order of naga's synthesized
+    /// `_mslBufferSizes` constant. Empty for kernels without runtime
+    /// arrays (naga emits no sizes constant for those).
+    sizes_bindings: Vec<u32>,
+}
+
+/// The owned `MTLComputePipelineState` behind a [`ComputePipeline`].
+fn mtl_pipeline(raw: *mut c_void) -> *mut c_void {
+    debug_assert!(!raw.is_null());
+    // Safety: `raw` was produced by `Box::into_raw::<MetalPipelineInner>`
+    // and remains valid while the pipeline is alive.
+    unsafe { (*(raw as *const MetalPipelineInner)).pipeline }
+}
+
 fn drop_pipeline(raw: *mut c_void) {
     if !raw.is_null() {
         unsafe {
-            let _: () = msg_send![obj(raw), release];
+            // Safety: reclaim the box, release the owned state, drop layout.
+            let inner = Box::from_raw(raw as *mut MetalPipelineInner);
+            let _: () = msg_send![obj(inner.pipeline), release];
         }
     }
 }
@@ -119,9 +142,75 @@ fn contents_of(raw: *mut c_void) -> *const c_void {
 /// Naga emits `device type_N const&` / `device type_N&` (references to
 /// fixed-size arrays), but Metal 3's pipeline creation crashes with this
 /// syntax. Converts to pointer syntax and strips unused structs.
+/// First-line marker embedded in cached MSL carrying the buffer-sizes
+/// layout (`// borsalino:sizes 0,1,2` — binding numbers in module
+/// declaration order). Compilation caches without it are pre-header and
+/// treated as misses.
+const SIZES_HEADER_PREFIX: &str = "// borsalino:sizes ";
+
+fn make_sizes_header(sizes_bindings: &[u32]) -> String {
+    let list = sizes_bindings
+        .iter()
+        .map(|b| b.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("{SIZES_HEADER_PREFIX}{list}")
+}
+
+/// Split a cached MSL into `(sizes_bindings, body)`. Returns `None` when
+/// the header is absent or malformed (cache miss).
+fn split_sizes_header(cached: &str) -> Option<(Vec<u32>, &str)> {
+    let first_line_end = cached.find('\n')?;
+    let (first, rest) = cached.split_at(first_line_end);
+    let rest = &rest[1..]; // drop the newline
+    let list = first.strip_prefix(SIZES_HEADER_PREFIX)?;
+    if list.is_empty() {
+        return Some((Vec::new(), rest));
+    }
+    let bindings = list
+        .split(',')
+        .map(|n| n.trim().parse::<u32>().ok())
+        .collect::<Option<Vec<u32>>>()?;
+    Some((bindings, rest))
+}
+
+/// Binding numbers of module globals carrying runtime-sized arrays, in
+/// **module declaration order** — this is the field order of naga's
+/// synthesized `struct _mslBufferSizes` (one `uint sizeN;` per such
+/// global; `N` is the module-global index, and the fields are laid out in
+/// module order — verified against naga 27's writer). Kernels translated
+/// from WGSL `arrayLength` dereference that constant, so dispatch must
+/// bind one **byte** size per entry, in THIS order, at the sizes slot.
+///
+/// Mirrors naga's `needs_array_length`: a global qualifies when its type
+/// is a dynamic-sized array, or a struct whose LAST member is one (the
+/// storage-buffer block shape).
+fn sizes_buffer_bindings(module: &naga::Module) -> Vec<u32> {
+    module
+        .global_variables
+        .iter()
+        .filter(|(_, var)| match module.types[var.ty].inner {
+            naga::TypeInner::Array {
+                size: naga::ArraySize::Dynamic,
+                ..
+            } => true,
+            naga::TypeInner::Struct { ref members, .. } => members.last().is_some_and(|m| {
+                matches!(
+                    module.types[m.ty].inner,
+                    naga::TypeInner::Array {
+                        size: naga::ArraySize::Dynamic,
+                        ..
+                    }
+                )
+            }),
+            _ => false,
+        })
+        .filter_map(|(_, var)| var.binding.map(|b| b.binding))
+        .collect()
+}
+
 fn naga_msl_fixup(msl: &str) -> String {
     let mut out = String::with_capacity(msl.len());
-    let mut in_buffer_sizes = false;
 
     for line in msl.lines() {
         let trimmed = line.trim();
@@ -136,22 +225,13 @@ fn naga_msl_fixup(msl: &str) -> String {
             continue;
         }
 
-        // Skip `_mslBufferSizes` struct (stateful: skip until closing };)
-        if trimmed == "struct _mslBufferSizes {" {
-            in_buffer_sizes = true;
-            continue;
-        }
-        if in_buffer_sizes {
-            if trimmed == "};" {
-                in_buffer_sizes = false;
-            }
-            continue;
-        }
-
-        // Skip lines containing `_buffer_sizes` (the parameter)
-        if trimmed.contains("_buffer_sizes") {
-            continue;
-        }
+        // NOTE: the `_mslBufferSizes` struct and its `_buffer_sizes`
+        // kernel parameter are KEPT — naga emits them unconditionally
+        // (slot 30, per `sizes_buffer` in `compile`), and kernels using
+        // `arrayLength` dereference them. The dispatch paths bind the
+        // byte-size constant at slot 30 (`bind_buffer_sizes`). Stripping
+        // them used to corrupt any arrayLength kernel's signature (the
+        // macOS CI failure on the first cut of the batched-kernel guard).
 
         // Fix `metal::uint3` → `uint3`
         let line = line.replace("metal::uint3", "uint3");
@@ -268,6 +348,84 @@ fn drop_metal_pulse(raw: *mut std::ffi::c_void) {
     }
 }
 
+/// Bind the naga `_mslBufferSizes` constant (slot 30 — must match
+/// `sizes_buffer` in `compile`): one byte size per runtime-array global,
+/// in the pipeline's **module declaration order** (the struct's field
+/// order — naga 27 assigns `uint sizeN` per runtime-array global by
+/// module-global index; review round 1 P1: binding order ≠ field order,
+/// and the old fixed `[u32; 8]` truncated wider layouts).
+///
+/// Returns `None` (binding nothing) when the pipeline has no runtime-array
+/// globals — naga emits no sizes constant for those kernels.
+///
+/// # Ownership
+///
+/// `newBufferWithBytes` is a `new…` method (+1 retain). The caller must
+/// `release` the returned buffer after `endEncoding` — Metal retains
+/// resources referenced by encoded commands in the command buffer, so the
+/// release is safe even for async dispatches whose command buffers are
+/// still in flight.
+unsafe fn bind_buffer_sizes(
+    dev: *mut std::ffi::c_void,
+    encoder: *mut std::ffi::c_void,
+    pipeline_raw: *mut std::ffi::c_void,
+    buffers: &[&GpuBuffer],
+) -> std::result::Result<Option<*mut std::ffi::c_void>, GpuError> {
+    const SIZES_SLOT: u64 = 30;
+
+    // Safety: `pipeline_raw` was produced by `Box::into_raw::<MetalPipelineInner>`
+    // and remains valid while the pipeline is alive.
+    let inner = unsafe { &*(pipeline_raw as *const MetalPipelineInner) };
+    let layout: &[u32] = inner.sizes_bindings.as_slice();
+    if layout.is_empty() {
+        // Successful absence: this kernel has no runtime-array globals, so
+        // naga emitted no sizes constant and there is nothing to bind.
+        return Ok(None);
+    }
+
+    // One byte size per layout entry, in declaration order. Unbound
+    // bindings contribute 0 (the kernel cannot validly use them).
+    let sizes: Vec<u32> = layout
+        .iter()
+        .map(|&binding| {
+            buffers
+                .get(binding as usize)
+                .map(|g| (g.len * g.element_size) as u32)
+                .unwrap_or(0)
+        })
+        .collect();
+
+    let buf: *mut std::ffi::c_void = unsafe {
+        msg_send![
+            obj(dev),
+            newBufferWithBytes: sizes.as_ptr() as *const std::ffi::c_void
+            length: (sizes.len() * std::mem::size_of::<u32>()) as u64
+            options: 0u64
+        ]
+    };
+    if buf.is_null() {
+        return Err(GpuError::DispatchFailed {
+            message: "failed to allocate _mslBufferSizes constant".into(),
+        });
+    }
+    unsafe {
+        let _: () = msg_send![obj(encoder), setBuffer: buf offset: 0u64 atIndex: SIZES_SLOT];
+    }
+    Ok(Some(buf))
+}
+
+/// Release a sizes buffer previously returned by [`bind_buffer_sizes`].
+/// `None` (kernel without a sizes constant) releases nothing.
+unsafe fn release_sizes_buffer(buf: Option<*mut std::ffi::c_void>) {
+    if let Some(buf) = buf {
+        if !buf.is_null() {
+            unsafe {
+                let _: () = msg_send![obj(buf), release];
+            }
+        }
+    }
+}
+
 impl GpuBackend for MetalBackend {
     fn init() -> Result<Self> {
         let device_ptr = unsafe { MTLCreateSystemDefaultDevice() };
@@ -363,8 +521,37 @@ impl GpuBackend for MetalBackend {
                     message: format!("MSL emission failed: {e}"),
                 })?;
 
+        // The naga buffer-sizes layout must be captured before MSL
+        // emission (it is a property of the module, and the dispatch
+        // paths bind per-pipeline layout entries — see
+        // `sizes_buffer_bindings`).
+        let sizes_bindings = sizes_buffer_bindings(&module);
+
         // Fix naga MSL for Metal 3 compatibility
         msl_source = naga_msl_fixup(&msl_source);
+
+        // Best-effort disk cache (completes compile_cached's design — the
+        // MSL carries the sizes header so the layout round-trips).
+        {
+            let dir = std::env::var("XDG_CACHE_HOME")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|_| {
+                    std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
+                        .join(".cache")
+                })
+                .join("borsalino");
+            let _ = std::fs::create_dir_all(&dir);
+            let mut hash: u64 = 0xcbf29ce484222325;
+            for &b in wgsl_source.as_bytes() {
+                hash ^= b as u64;
+                hash = hash.wrapping_mul(0x100000001b3);
+            }
+            let path = dir.join(format!("{entry_point}_{hash:016x}.msl"));
+            let _ = std::fs::write(
+                &path,
+                format!("{}\n{}", make_sizes_header(&sizes_bindings), msl_source),
+            );
+        }
 
         let dev = self.device.ptr.as_ptr();
 
@@ -447,7 +634,10 @@ impl GpuBackend for MetalBackend {
             let _: () = msg_send![obj(library), release];
 
             Ok(ComputePipeline {
-                raw: pipeline,
+                raw: Box::into_raw(Box::new(MetalPipelineInner {
+                    pipeline,
+                    sizes_bindings,
+                })) as *mut c_void,
                 drop_fn: drop_pipeline,
             })
         }
@@ -551,7 +741,8 @@ impl GpuBackend for MetalBackend {
             }
 
             // Set pipeline
-            let _: () = msg_send![obj(encoder), setComputePipelineState: pipeline.raw];
+            let _: () =
+                msg_send![obj(encoder), setComputePipelineState: mtl_pipeline(pipeline.raw)];
 
             // Bind user buffers
             for (i, buf) in buffers.iter().enumerate() {
@@ -563,6 +754,12 @@ impl GpuBackend for MetalBackend {
                 ];
             }
 
+            // Bind the naga buffer-sizes constant (arrayLength support).
+            // Ok(None) = kernel has no sizes constant; only allocation
+            // failure is an error here.
+            let sizes_buf =
+                bind_buffer_sizes(self.device.ptr.as_ptr(), encoder, pipeline.raw, buffers)?;
+
             // Dispatch
             let _: () = msg_send![
                 obj(encoder),
@@ -572,6 +769,9 @@ impl GpuBackend for MetalBackend {
 
             // Finish
             let _: () = msg_send![obj(encoder), endEncoding];
+            // Encoded resources are retained by the command buffer — the
+            // sizes buffer can go now (objc ownership rule: new → release).
+            release_sizes_buffer(sizes_buf);
 
             self.epoch.begin_dispatch();
 
@@ -616,7 +816,8 @@ impl GpuBackend for MetalBackend {
                 });
             }
 
-            let _: () = msg_send![obj(encoder), setComputePipelineState: pipeline.raw];
+            let _: () =
+                msg_send![obj(encoder), setComputePipelineState: mtl_pipeline(pipeline.raw)];
 
             for (i, buf) in buffers.iter().enumerate() {
                 let _: () = msg_send![
@@ -627,6 +828,12 @@ impl GpuBackend for MetalBackend {
                 ];
             }
 
+            // Bind the naga buffer-sizes constant (arrayLength support).
+            // Ok(None) = kernel has no sizes constant; only allocation
+            // failure is an error here.
+            let sizes_buf =
+                bind_buffer_sizes(self.device.ptr.as_ptr(), encoder, pipeline.raw, buffers)?;
+
             let _: () = msg_send![
                 obj(encoder),
                 dispatchThreadgroups: (workgroups.0 as u64, workgroups.1 as u64, workgroups.2 as u64)
@@ -634,6 +841,9 @@ impl GpuBackend for MetalBackend {
             ];
 
             let _: () = msg_send![obj(encoder), endEncoding];
+            // Encoded resources are retained by the (async) command buffer
+            // until it completes — release our +1 now.
+            unsafe { release_sizes_buffer(sizes_buf) };
 
             self.epoch.begin_dispatch();
 
@@ -698,8 +908,13 @@ impl GpuBackend for MetalBackend {
         let cache_path = cache_dir.join(format!("{entry_point}_{hash:016x}.msl"));
 
         if let Ok(cached_msl) = std::fs::read_to_string(&cache_path) {
-            if !cached_msl.is_empty() {
-                return self.compile_msl(entry_point, &cached_msl);
+            // The first line must carry the sizes header (see
+            // `SIZES_HEADER_PREFIX`) — caches without it predate
+            // arrayLength support and are treated as misses.
+            if let Some((sizes_bindings, body)) = split_sizes_header(&cached_msl) {
+                if !body.is_empty() {
+                    return self.compile_msl(entry_point, body, sizes_bindings);
+                }
             }
         }
 
@@ -733,11 +948,14 @@ impl GpuBackend for MetalBackend {
                 });
             }
 
+            // Sizes buffers (one per spec) — released after endEncoding.
+            let mut sizes_bufs: Vec<Option<*mut c_void>> = Vec::with_capacity(dispatches.len());
+
             for spec in dispatches {
                 // Set pipeline
                 let _: () = msg_send![
                     obj(encoder),
-                    setComputePipelineState: spec.pipeline.raw
+                    setComputePipelineState: mtl_pipeline(spec.pipeline.raw)
                 ];
 
                 // Bind buffers
@@ -749,6 +967,29 @@ impl GpuBackend for MetalBackend {
                         atIndex: i as u64
                     ];
                 }
+
+                // Bind the naga buffer-sizes constant (arrayLength
+                // support) — one per spec; slot 30 is overwritten per
+                // dispatch, matching the encoder's sequential encoding.
+                // Ok(None) = spec kernel has no sizes constant; release
+                // handles absence as a no-op. On failure, release every
+                // sizes buffer collected so far before propagating — the
+                // final release loop is bypassed by `?` (review r3 P2).
+                let sizes_buf = match bind_buffer_sizes(
+                    self.device.ptr.as_ptr(),
+                    encoder,
+                    spec.pipeline.raw,
+                    spec.buffers,
+                ) {
+                    Ok(sb) => sb,
+                    Err(e) => {
+                        for sb in sizes_bufs.drain(..) {
+                            release_sizes_buffer(sb);
+                        }
+                        return Err(e);
+                    }
+                };
+                sizes_bufs.push(sizes_buf);
 
                 // Dispatch
                 let _: () = msg_send![
@@ -767,6 +1008,11 @@ impl GpuBackend for MetalBackend {
             }
 
             let _: () = msg_send![obj(encoder), endEncoding];
+            // Encoded resources are retained by the command buffer —
+            // release our +1s now.
+            for sb in sizes_bufs {
+                release_sizes_buffer(sb);
+            }
 
             self.epoch.begin_dispatch();
 
@@ -795,7 +1041,12 @@ impl GpuBackend for MetalBackend {
 
 impl MetalBackend {
     /// Compile pre-generated MSL directly (skips naga).
-    fn compile_msl(&self, entry_point: &str, msl_source: &str) -> Result<ComputePipeline> {
+    fn compile_msl(
+        &self,
+        entry_point: &str,
+        msl_source: &str,
+        sizes_bindings: Vec<u32>,
+    ) -> Result<ComputePipeline> {
         let dev = self.device.ptr.as_ptr();
 
         unsafe {
@@ -872,7 +1123,10 @@ impl MetalBackend {
             let _: () = msg_send![obj(library), release];
 
             Ok(ComputePipeline {
-                raw: pipeline,
+                raw: Box::into_raw(Box::new(MetalPipelineInner {
+                    pipeline,
+                    sizes_bindings,
+                })) as *mut c_void,
                 drop_fn: drop_pipeline,
             })
         }
@@ -882,6 +1136,65 @@ impl MetalBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── CPU-only: naga buffer-sizes layout (review round 1, P1) ─────────
+
+    /// The sizes constant's field order is MODULE DECLARATION ORDER, not
+    /// binding order — a kernel declaring binding 1 before binding 0 must
+    /// produce layout `[1, 0]`, or dispatch binds the wrong byte sizes and
+    /// arrayLength guards mis-guard.
+    #[test]
+    fn sizes_bindings_follow_declaration_order_not_binding_order() {
+        let wgsl = r#"
+@group(0) @binding(1) var<storage, read> second: array<f32>;
+@group(0) @binding(0) var<storage, read_write> first: array<f32>;
+
+@compute @workgroup_size(4)
+fn k(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if (gid.x >= arrayLength(&first)) { return; }
+    first[gid.x] = second[gid.x];
+}
+"#;
+        let module = naga::front::wgsl::parse_str(wgsl).unwrap();
+        assert_eq!(sizes_buffer_bindings(&module), vec![1, 0]);
+    }
+
+    /// Struct-typed storage blocks (last member = dynamic array) qualify
+    /// too, and fixed-size arrays do not.
+    #[test]
+    fn sizes_bindings_cover_struct_blocks_and_skip_fixed_arrays() {
+        let wgsl = r#"
+struct Block { prefix: u32, tail: array<f32>, };
+struct Fixed { data: array<f32, 4>, };
+
+@group(0) @binding(0) var<storage, read_write> block: Block;
+@group(0) @binding(1) var<storage, read> fixed: Fixed;
+@group(0) @binding(2) var<storage, read> plain: array<f32>;
+
+@compute @workgroup_size(4)
+fn k(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if (gid.x >= arrayLength(&plain)) { return; }
+    block.tail[gid.x] = plain[gid.x] + fixed.data[gid.x % 4u];
+}
+"#;
+        let module = naga::front::wgsl::parse_str(wgsl).unwrap();
+        // block (struct with dynamic tail) and plain qualify; fixed does not.
+        assert_eq!(sizes_buffer_bindings(&module), vec![0, 2]);
+    }
+
+    /// The cached-MSL sizes header round-trips exactly, and caches without
+    /// it are treated as misses (pre-header caches predate the layout).
+    #[test]
+    fn sizes_header_round_trips() {
+        for layout in [Vec::new(), vec![0u32], vec![1, 0], vec![3, 1, 0, 2]] {
+            let body = "// language: metal1.0\nkernel void k() {}\n";
+            let cached = format!("{}\n{}", make_sizes_header(&layout), body);
+            let (parsed, rest) = split_sizes_header(&cached).unwrap();
+            assert_eq!(parsed, layout);
+            assert_eq!(rest, body);
+        }
+        assert!(split_sizes_header("// language: metal1.0\nno header").is_none());
+    }
 
     /// Acquire a device for tests: skip politely on machines without one,
     /// but FAIL hard when `BORSALINO_REQUIRE_METAL` is set — the dedicated

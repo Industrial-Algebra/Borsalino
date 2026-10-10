@@ -157,6 +157,13 @@ fn gp(@builtin(global_invocation_id) gid: vec3<u32>) {
 @compute @workgroup_size(256)
 fn gp_batched(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx = gid.x;
+    // Tail guard: a `div_ceil` dispatch over a batch that is not a
+    // multiple of 8 (256 threads / 32 blades) leaves tail invocations
+    // whose flat index runs past `out_batch` — naga's bounds-check policy
+    // is Unchecked for SPIR-V/MSL output, so the store would be silent
+    // out-of-bounds corruption (same guard the backend test kernels
+    // carry since the Metal review finding).
+    if (idx >= arrayLength(&out_batch)) { return; }
     let mv = idx / 32u;
     let blade = idx % 32u;
     let base = mv * 32u;
@@ -909,5 +916,117 @@ mod tests {
         };
         // Not divisible AND within limits — should fail on divisibility
         assert!(config.verify_with_limits(65535).is_err());
+    }
+
+    // ── GPU kernel tests (real hardware; skip gracefully when headless) ──
+
+    /// Sign of the geometric product of basis blades `i`, `j` in Cl(n,0):
+    /// `(-1)^s` where `s` counts bit pairs (a, b), a set in `i`, b set in
+    /// `j`, a > b. Self-contained twin of `numerical_check::blade_product_sign`
+    /// so this test runs without the `verify` feature.
+    fn blade_sign(i: usize, j: usize) -> f32 {
+        let mut swaps = 0u32;
+        let mut remaining = i;
+        while remaining != 0 {
+            let a = remaining.trailing_zeros();
+            remaining &= remaining - 1;
+            swaps += (j & ((1usize << a) - 1)).count_ones();
+        }
+        if swaps % 2 == 0 { 1.0 } else { -1.0 }
+    }
+
+    /// CPU reference for `kernels::GEOMETRIC_PRODUCT_BATCHED` on one
+    /// multivector pair — scatter form, matching the repo's reference
+    /// style in `numerical_check.rs` (contribution of a[i]·b[j] lands on
+    /// blade `i ^ j` with the independently-computed sign).
+    fn cpu_gp(a: &[f32], b: &[f32]) -> Vec<f32> {
+        let mut out = vec![0.0f32; a.len().min(b.len())];
+        for (i, &ai) in a.iter().enumerate() {
+            if ai == 0.0 {
+                continue;
+            }
+            for (j, &bj) in b.iter().enumerate() {
+                if bj == 0.0 {
+                    continue;
+                }
+                let blade = i ^ j;
+                out[blade] += blade_sign(i, j) * ai * bj;
+            }
+        }
+        out
+    }
+
+    /// `GEOMETRIC_PRODUCT_BATCHED` with a batch that is NOT a multiple of
+    /// 8 (256 threads / 32 blades) — the `div_ceil` dispatch leaves tail
+    /// invocations whose flat index runs past `out_batch`. The kernel's
+    /// early-out guard must clip exactly those tails: every multivector
+    /// still computes the exact geometric product (the guard must not
+    /// over-clip), and no out-of-bounds store occurs (the guard must
+    /// exist — naga's bounds-check policy is Unchecked for SPIR-V/MSL
+    /// output, so the OOB store would be silent memory corruption).
+    #[test]
+    #[serial_test::serial]
+    fn gp_batched_non_multiple_of_8_batch() {
+        use crate::kernels::GEOMETRIC_PRODUCT_BATCHED;
+
+        let gpu = match crate::init() {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skipping: no GPU backend ({e})");
+                return;
+            }
+        };
+
+        const BLADES: usize = 32;
+        let batch: usize = 13; // 13 multivectors: 416 threads → 2 workgroups
+        // → 96 tail threads past the buffer end
+        let flat = batch * BLADES;
+
+        // Sign table: table[i][j][k] nonzero only at k = i ^ j.
+        let mut sign_table = vec![0.0f32; BLADES * BLADES * BLADES];
+        for i in 0..BLADES {
+            for j in 0..BLADES {
+                sign_table[i * BLADES * BLADES + j * BLADES + (i ^ j)] = blade_sign(i, j);
+            }
+        }
+
+        // Deterministic binary {0,1} inputs — the exact-match protocol's
+        // requirement: with ±1/0 sign terms, every partial sum is an exact
+        // integer in f32, so CPU and GPU accumulation orders cannot differ
+        // in rounding (FMA contraction included).
+        let a_batch: Vec<f32> = (0..flat).map(|i| ((i % 5) < 2) as u32 as f32).collect();
+        let b_batch: Vec<f32> = (0..flat).map(|i| ((i % 7) < 3) as u32 as f32).collect();
+
+        let pipeline = gpu
+            .compile("gp_batched", GEOMETRIC_PRODUCT_BATCHED)
+            .unwrap();
+        let buf_sign = gpu.create_buffer(&sign_table).unwrap();
+        let buf_a = gpu.create_buffer(&a_batch).unwrap();
+        let buf_b = gpu.create_buffer(&b_batch).unwrap();
+        let buf_out = gpu.create_buffer_uninit::<f32>(flat).unwrap();
+
+        // The example's dispatch shape: div_ceil(flat / 256) workgroups.
+        let wgs = (flat as u32).div_ceil(256);
+        gpu.dispatch(
+            &pipeline,
+            &[&buf_sign, &buf_a, &buf_b, &buf_out],
+            (wgs, 1, 1),
+        )
+        .unwrap();
+
+        let result: Vec<f32> = gpu.read_buffer(&buf_out).unwrap();
+        assert_eq!(result.len(), flat);
+
+        for mv in 0..batch {
+            let base = mv * BLADES;
+            let expected = cpu_gp(&a_batch[base..base + BLADES], &b_batch[base..base + BLADES]);
+            for k in 0..BLADES {
+                assert_eq!(
+                    result[base + k],
+                    expected[k],
+                    "multivector {mv} blade {k} — guard over-clipped or wrong result"
+                );
+            }
+        }
     }
 }
