@@ -594,7 +594,7 @@ dependencies = [
 [[package]]
 name = "zunesha"
 version = "0.1.0"
-source = "git+https://github.com/Industrial-Algebra/Zunesha?branch=feat%2Fdevice-buffer-override#6b17ca7dc4f84ed5e06b82c848fb5a1c89a53a6b"
+source = "git+https://github.com/Industrial-Algebra/Zunesha?branch=feat%2Fdevice-buffer-override#6b3540a1b99b6dec686d386f805e5118a8c56b77"
 dependencies = [
  "ash",
  "bytemuck",

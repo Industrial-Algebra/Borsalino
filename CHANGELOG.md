@@ -4,6 +4,22 @@ All notable changes to Borsalino are documented in this file.
 
 ## [Unreleased]
 
+### Fixed — review round 1 (2026-10-09)
+
+- **P1 (soundness):** every queue submission now joins the substrate's
+  protocol — `zunesha::vulkan::VulkanDevice::with_compute_queue` — because
+  the compute queue is an externally synchronized Vulkan object shared
+  with the substrate's staging transfers (two `from_zunesha` backends, or
+  a backend plus a substrate buffer creation, could previously race
+  `vkQueueSubmit` from safe code). Applies to dispatch, dispatch_many,
+  dispatch_async (submit only — fence waits need no lock), timestamps,
+  and both one-shot transfer paths. The `queue` field is gone; the
+  handle lives in the substrate.
+- Readback/upload staging allocations are freed before propagating
+  transfer errors (`create_device_buffer` upload frees staging AND the
+  device allocation; `read_buffer` frees its temp staging) — previously
+  inherited-from-develop leaks on the error paths.
+
 ### Changed — Zunesha device substrate, Vulkan backend (Phase 1 of the
 ### staged migration)
 

@@ -14,7 +14,10 @@
 //! (`raw_device`, `queues`, `limits`): pipelines (WGSL → SPIR-V via
 //! `naga`), descriptor sets, command pools, dispatch, timestamps, and the
 //! epoch tracker. All dispatch is synchronous: command buffer → submit →
-//! wait_idle.
+//! wait_idle. Every queue submission joins the substrate's protocol
+//! ([`VulkanDevice::with_compute_queue`]) — the compute queue is an
+//! externally synchronized Vulkan object shared with the substrate's
+//! staging transfers.
 //!
 //! # Ownership and lifetime
 //!
@@ -43,7 +46,6 @@ use naga::front::wgsl;
 use naga::valid::{Capabilities, ValidationFlags, Validator};
 
 use ash::vk;
-use ash::vk::Handle as _;
 use zunesha::Device as _;
 
 use std::ffi::CString;
@@ -85,9 +87,9 @@ pub struct VulkanBackend {
     /// replaces the former `SharedDevice`/`SharedInstance` wrappers —
     /// Zunesha owns the instance/loader lifetime by construction).
     z: Arc<zunesha::vulkan::VulkanDevice>,
-    /// Compute queue handle (from `z.queues().compute`).
-    queue: vk::Queue,
-    /// Queue family index for the compute queue.
+    /// Queue family index for the compute queue (the raw handle lives in
+    /// the substrate; submissions go through
+    /// [`VulkanDevice::with_compute_queue`]).
     #[allow(dead_code)]
     queue_family_index: u32,
     /// Minimum storage buffer offset alignment (from `z.limits()`).
@@ -190,7 +192,6 @@ impl VulkanBackend {
     fn build(z: Arc<zunesha::vulkan::VulkanDevice>) -> Result<Self> {
         let device = z.raw_device();
         let compute = z.queues().compute;
-        let queue = vk::Queue::from_raw(compute.raw as u64);
         let queue_family_index = compute.family_index;
         let min_storage_buffer_offset_alignment = z.limits().min_storage_buffer_offset_alignment;
         let memory_properties = z.memory_properties();
@@ -306,7 +307,6 @@ impl VulkanBackend {
 
         Ok(Self {
             z,
-            queue,
             queue_family_index,
             min_storage_buffer_offset_alignment,
             memory_properties,
@@ -1085,12 +1085,28 @@ impl GpuBackend for VulkanBackend {
                     byte_len as usize,
                 );
             }
-            unsafe {
-                one_shot_transfer(&self.vk(), self.transfer_command_pool, self.queue, |cmd| {
+            // Join the substrate's submission protocol (externally
+            // synchronized queue/pool — see VulkanDevice::with_compute_queue).
+            // On failure, free BOTH allocations before propagating — the
+            // owning inner does not exist yet (review round 1: staging leak).
+            if (self.z.with_compute_queue(|queue| unsafe {
+                one_shot_transfer(&self.vk(), self.transfer_command_pool, queue, |cmd| {
                     let copy = vk::BufferCopy::default().size(aligned_size);
                     self.vk()
                         .cmd_copy_buffer(cmd, stg_buf, dev_buf, std::slice::from_ref(&copy));
-                })?;
+                })
+            }))
+            .is_err()
+            {
+                unsafe {
+                    self.vk().destroy_buffer(stg_buf, None);
+                    self.vk().free_memory(stg_mem, None);
+                    self.vk().destroy_buffer(dev_buf, None);
+                    self.vk().free_memory(dev_mem, None);
+                }
+                return Err(GpuError::DispatchFailed {
+                    message: "device buffer staging upload failed".into(),
+                });
             }
         }
 
@@ -1327,19 +1343,23 @@ impl GpuBackend for VulkanBackend {
 
         self.epoch.begin_dispatch();
 
-        unsafe {
+        // Join the substrate's submission protocol: the compute queue is
+        // externally synchronized — submit AND the immediate wait run inside
+        // `with_compute_queue` so concurrent substrate/consumer submissions
+        // serialize (review round 1 P1).
+        self.z.with_compute_queue(|queue| unsafe {
             self.vk()
-                .queue_submit(self.queue, &[submit_info], vk::Fence::null())
+                .queue_submit(queue, &[submit_info], vk::Fence::null())
                 .map_err(|e| GpuError::DispatchFailed {
                     message: format!("vkQueueSubmit: {e}"),
                 })?;
 
             self.vk()
-                .queue_wait_idle(self.queue)
+                .queue_wait_idle(queue)
                 .map_err(|e| GpuError::DispatchFailed {
                     message: format!("vkQueueWaitIdle: {e}"),
-                })?;
-        }
+                })
+        })?;
 
         self.epoch.end_dispatch();
 
@@ -1482,19 +1502,23 @@ impl GpuBackend for VulkanBackend {
 
         self.epoch.begin_dispatch();
 
-        unsafe {
+        // Join the substrate's submission protocol: the compute queue is
+        // externally synchronized — submit AND the immediate wait run inside
+        // `with_compute_queue` so concurrent substrate/consumer submissions
+        // serialize (review round 1 P1).
+        self.z.with_compute_queue(|queue| unsafe {
             self.vk()
-                .queue_submit(self.queue, &[submit_info], vk::Fence::null())
+                .queue_submit(queue, &[submit_info], vk::Fence::null())
                 .map_err(|e| GpuError::DispatchFailed {
                     message: format!("vkQueueSubmit: {e}"),
                 })?;
 
             self.vk()
-                .queue_wait_idle(self.queue)
+                .queue_wait_idle(queue)
                 .map_err(|e| GpuError::DispatchFailed {
                     message: format!("vkQueueWaitIdle: {e}"),
-                })?;
-        }
+                })
+        })?;
 
         self.epoch.end_dispatch();
 
@@ -1625,13 +1649,15 @@ impl GpuBackend for VulkanBackend {
 
         self.epoch.begin_dispatch();
 
-        unsafe {
+        // Submit inside the substrate's submission protocol; the fence (not
+        // the queue) tracks completion, so Pulse waits need no lock.
+        self.z.with_compute_queue(|queue| unsafe {
             self.vk()
-                .queue_submit(self.queue, &[submit_info], fence)
+                .queue_submit(queue, &[submit_info], fence)
                 .map_err(|e| GpuError::DispatchFailed {
                     message: format!("vkQueueSubmit: {e}"),
-                })?;
-        }
+                })
+        })?;
 
         // Free command buffer (work is submitted, fence tracks completion)
         unsafe {
@@ -1691,8 +1717,11 @@ impl GpuBackend for VulkanBackend {
                     vk::BufferUsageFlags::TRANSFER_DST,
                 )?
             };
-            unsafe {
-                one_shot_transfer(&self.vk(), self.transfer_command_pool, self.queue, |cmd| {
+            // Join the substrate's submission protocol; on transfer failure
+            // free the staging allocation before propagating (review round
+            // 1: the `?` used to leak it).
+            if (self.z.with_compute_queue(|queue| unsafe {
+                one_shot_transfer(&self.vk(), self.transfer_command_pool, queue, |cmd| {
                     let copy = vk::BufferCopy::default().size(inner._size);
                     self.vk().cmd_copy_buffer(
                         cmd,
@@ -1700,7 +1729,17 @@ impl GpuBackend for VulkanBackend {
                         stg_buf,
                         std::slice::from_ref(&copy),
                     );
-                })?;
+                })
+            }))
+            .is_err()
+            {
+                unsafe {
+                    self.vk().destroy_buffer(stg_buf, None);
+                    self.vk().free_memory(stg_mem, None);
+                }
+                return Err(GpuError::BufferReadFailed {
+                    message: "staging transfer failed".into(),
+                });
             }
 
             let contents = stg_mapped as *const T;
@@ -1769,12 +1808,14 @@ impl GpuBackend for VulkanBackend {
                 .map_err(|e| GpuError::Internal(format!("timestamp end: {e}")))?;
 
             let submit_info = vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&cmd));
-            self.vk()
-                .queue_submit(self.queue, &[submit_info], vk::Fence::null())
-                .map_err(|e| GpuError::Internal(format!("timestamp submit: {e}")))?;
-            self.vk()
-                .queue_wait_idle(self.queue)
-                .map_err(|e| GpuError::Internal(format!("timestamp wait: {e}")))?;
+            self.z.with_compute_queue(|queue| {
+                self.vk()
+                    .queue_submit(queue, &[submit_info], vk::Fence::null())
+                    .map_err(|e| GpuError::Internal(format!("timestamp submit: {e}")))?;
+                self.vk()
+                    .queue_wait_idle(queue)
+                    .map_err(|e| GpuError::Internal(format!("timestamp wait: {e}")))
+            })?;
 
             // Read back timestamp
             let mut ts_data = [0u64];
