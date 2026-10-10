@@ -126,10 +126,9 @@ impl VulkanBackend {
         self.z.raw_device()
     }
 
-    /// The `VkBuffer` handle behind a [`GpuBuffer`], whichever kind it is:
-    /// substrate-allocated (`create_buffer` paths, recovered via the
-    /// substrate's raw-buffer escape hatch) or Borsalino-allocated
-    /// (`create_device_buffer` paths, stored in [`VulkanBufferInner`]).
+    /// The `VkBuffer` handle behind a [`GpuBuffer`] — recovered via the
+    /// substrate's raw-buffer escape hatch. Since Phase 2 every buffer is
+    /// substrate-backed (all four create paths delegate).
     ///
     /// # Safety (caller)
     ///
@@ -544,10 +543,11 @@ fn drop_zunesha_buffer(raw: *mut std::ffi::c_void) {
 /// Contents function for substrate-backed buffers — returns the
 /// [`SUBSTRATE_BUFFER_TAG`] sentinel instead of a mapped pointer (reads go
 /// through the substrate's `read_buffer`, which needs the device — not a
-/// bare pointer). Doubles as the tag `read_buffer` dispatches on: real
-/// Vulkan mappings are page-aligned, so the sentinel can never collide
-/// with a mapped address (unlike fn-pointer comparison, which the compiler
-/// warns may merge distinct functions).
+/// bare pointer). Real Vulkan mappings are page-aligned, so the sentinel
+/// can never collide with a mapped address. Phase 2 removed the last
+/// runtime dispatch on this tag (every buffer is substrate-backed now);
+/// it survives as the public `contents()` value for substrate buffers
+/// and as the delegation marker the Phase-2 tests assert.
 const SUBSTRATE_BUFFER_TAG: *const std::ffi::c_void =
     std::ptr::without_provenance::<std::ffi::c_void>(1);
 
@@ -1620,7 +1620,11 @@ mod tests {
     /// Under forced `Unified` on discrete hardware the delegated contract
     /// forces device-local + persistent staging (the documented trait
     /// contract — Borsalino's old host-visible divergence is gone).
-    /// Pinned by round-trip: upload and readback must stay exact.
+    /// Placement itself is the substrate's contract and is tested there
+    /// (Zunesha: `device_buffer_forces_device_local_under_unified_strategy`)
+    /// — per-buffer placement is not observable through Borsalino's public
+    /// surface, so here we pin the delegation identity under the forced
+    /// strategy (the only honest observable) plus the round-trip.
     #[test]
     #[serial_test::serial]
     fn device_buffer_roundtrips_under_forced_unified() {
@@ -1633,8 +1637,36 @@ mod tests {
         };
         let data: Vec<f32> = (0..1024).map(|i| i as f32 * 0.25).collect();
         let buf = backend.create_device_buffer(&data).unwrap();
+        assert!(
+            std::ptr::eq((buf.contents_fn)(buf.raw), SUBSTRATE_BUFFER_TAG),
+            "delegation holds under forced Unified (placement forced by substrate)"
+        );
         let back: Vec<f32> = backend.read_buffer(&buf).unwrap();
         assert_eq!(back, data);
+    }
+
+    /// Phase 2 behavior change (changelog-noted): mixed-size reads are
+    /// byte-based. `read_buffer::<u8>` returns one element per byte of the
+    /// buffer's storage (the substrate's `len` is a byte length), where
+    /// Borsalino's old path returned the element count captured at
+    /// creation. Reading 2 × u32 as u8 now yields 8 elements (was 2).
+    #[test]
+    #[serial_test::serial]
+    fn device_buffer_mixed_size_reads_are_byte_based() {
+        let backend = match VulkanBackend::init() {
+            Ok(b) => b,
+            Err(_) => {
+                eprintln!("skipping: no Vulkan device");
+                return;
+            }
+        };
+        let data = [0x3f80_0000u32, 0x4000_0000]; // 1.0f32, 2.0f32
+        let buf = backend.create_device_buffer(&data).unwrap();
+        assert_eq!(buf.len, 2, "GpuBuffer.len stays the element count");
+        let bytes: Vec<u8> = backend.read_buffer(&buf).unwrap();
+        assert_eq!(bytes.len(), 8, "byte-based: 2 u32 = 8 u8 elements");
+        let words: Vec<u32> = bytemuck::cast_slice(&bytes).to_vec();
+        assert_eq!(words, data.to_vec(), "byte view reassembles exactly");
     }
 
     /// Large device buffer through the staging path (upload + readback

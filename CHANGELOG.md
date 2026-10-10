@@ -18,6 +18,16 @@ All notable changes to Borsalino are documented in this file.
 - `contents()` on `create_device_buffer` buffers now returns the
   substrate sentinel tag instead of null — reads go through `read_buffer`
   either way (unchanged since Phase 1 for `create_buffer` buffers).
+- **Mixed-size reads are byte-based** (review r1): `read_buffer::<u8>` on a
+  buffer created from two `u32`s returns 8 elements (was 2 — the old path
+  returned the creation-time element count). `GpuBuffer.len` remains the
+  creation-time element count; the read length derives from the substrate's
+  byte length.
+- Error surface reclassified (review r1): buffer-creation failures surface
+  as `BufferCreationFailed` wrapping the substrate's message
+  (`zunesha create_device_buffer: …`), and device-buffer read failures as
+  `BufferReadFailed` from the substrate's locked read path — the
+  Borsalino-specific staging error messages are gone with the staging code.
 
 ### Changed — dependency flip (2026-10-10)
 
