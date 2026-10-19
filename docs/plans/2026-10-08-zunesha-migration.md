@@ -208,13 +208,30 @@ write-optimized profile remains recoverable later via an additive
 Zunesha buffer-profile API if the persistent-staging memory cost ever
 bites.
 
-### Phase 3 — Metal migration (after Zunesha Metal; parallel track)
+### Phase 3 — Metal migration — **Resolved (delegated, 2026-10-18)**
 
-Mirror Phase 1 for `MetalBackend` per the
+Executed per the
 [Metal backend requirements doc](https://github.com/Industrial-Algebra/Zunesha/blob/develop/docs/plans/2026-10-08-metal-backend-requirements.md)
-(Zunesha repo). Requires Zunesha to expose `raw_device()` (MTLDevice),
-`raw_buffer()` (MTLBuffer), and queue escape hatches. Until then Metal is
-untouched.
+against Zunesha's merged Metal backend (Zunesha PR #13; ships as Zunesha
+0.2.0):
+
+- `MetalBackend` holds `Arc<zunesha::metal::MetalDevice>` — the substrate
+  owns MTLDevice, MTLCommandQueue, and every MTLBuffer. Borsalino's
+  `MetalDevice`/`MetalQueue` ownership structs, `MTLCreateSystemDefaultDevice`
+  extern, and its own buffer-allocation paths are deleted.
+- Raw surfaces used (R4): `raw_device()` (compile), `command_queue()`
+  (dispatch encoding), `raw_buffer()` (dispatch-time binding). Nothing
+  else crosses the seam.
+- All four buffer constructors delegate; `read_buffer` delegates (Private
+  storage requires the substrate's staging-blit read — the old raw
+  `contents()` read was only correct for Shared buffers).
+- Zunesha R1 improvement inherited and pinned:
+  `MemoryStrategy::DeviceLocal` now maps to Private + staging instead of
+  being silently ignored.
+- Consumer half kept: naga WGSL→MSL, `_mslBufferSizes` ABI, pipeline
+  compilation/caching, dispatch encoding, epoch accounting.
+- TEMP: git dep on Zunesha `develop` until 0.2.0 publishes; flip to
+  `version = "0.2"` at the 0.8.0 cut (mirrors Phase 1's git→version flip).
 
 ### Phase 4 — release
 

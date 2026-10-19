@@ -4,6 +4,25 @@ All notable changes to Borsalino are documented in this file.
 
 ## [Unreleased]
 
+### Changed — Phase 3: Metal delegation to the Zunesha substrate (2026-10-18)
+
+- `MetalBackend` now builds on `zunesha::metal::MetalDevice` (git dep on
+  `develop` until Zunesha 0.2.0 publishes): the substrate owns the
+  MTLDevice, MTLCommandQueue, and every MTLBuffer — Borsalino's
+  device/queue ownership structs and buffer-allocation paths are deleted.
+- All buffer constructors delegate; `read_buffer` delegates to the
+  substrate (Private storage needs the staging-blit read — a raw
+  `contents()` read would return stale staging bytes).
+- `MemoryStrategy::DeviceLocal` is no longer silently ignored on Metal:
+  it maps to Private storage + staging (Zunesha R1), pinned by
+  `device_local_strategy_buffers_roundtrip`.
+- Delegation anchors: `create_device_buffer(_uninit)_delegates_to_substrate`,
+  `device_buffer_roundtrips_under_forced_unified` (mirror the Phase-2
+  Vulkan anchors; macOS CI).
+- Metal-path lints now held to the standard gates
+  (`unsafe_op_in_unsafe_fn` in `nsstring_read`, an unnecessary nested
+  `unsafe`, an MSL-options initializer, a redundant cast).
+
 ### Changed — Phase 2: buffer delegation to the substrate (2026-10-10)
 
 - Bump `zunesha` to `0.1.2` — picks up the substrate's seven-round
