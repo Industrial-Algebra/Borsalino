@@ -56,8 +56,13 @@
 //! | `metal`    | macOS          | ✅ Active  |
 //! | `vulkan`   | Linux, Windows | ✅ Active  |
 //!
-//! The Metal backend requires no external dependencies beyond naga —
-//! it calls the Metal framework directly via `objc_msgSend`.
+//! Both backends build on the [`zunesha`] substrate, which owns the
+//! device, queues, and buffers (allocation, placement strategy, staging
+//! transfers, teardown); the backends keep the consumer half — shader
+//! compilation, dispatch encoding, and dispatch accounting. The Metal
+//! backend calls the Metal framework directly via `objc_msgSend` for its
+//! consumer-half objects only (pipelines and the naga buffer-sizes
+//! constants).
 //! The Vulkan backend uses `ash` for raw Vulkan FFI.
 //!
 //! ## Safety

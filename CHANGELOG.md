@@ -19,6 +19,11 @@ All notable changes to Borsalino are documented in this file.
 - Delegation anchors: `create_device_buffer(_uninit)_delegates_to_substrate`,
   `device_buffer_roundtrips_under_forced_unified` (mirror the Phase-2
   Vulkan anchors; macOS CI).
+- Review r1 coverage: Private buffers pin the FRESH device→staging blit
+  (kernel-write/readback, double-dispatch against cached-blit staleness),
+  the DeviceLocal strategy path round-trips kernel outputs with a
+  substrate-level placement assertion, and unified strategy asserts
+  HostVisible placement.
 - Metal-path lints now held to the standard gates
   (`unsafe_op_in_unsafe_fn` in `nsstring_read`, an unnecessary nested
   `unsafe`, an MSL-options initializer, a redundant cast).

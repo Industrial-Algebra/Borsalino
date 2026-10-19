@@ -22,6 +22,16 @@
 //!
 //! Uses the `objc` crate for `msg_send!` dispatch on ARM64.
 //!
+//! ## Borsalino-owned Metal objects
+//!
+//! Two classes remain this backend's to manage (explicitly NOT the
+//! substrate's): the `MTLComputePipelineState` products (owned +1 from
+//! `new…`, released in `drop_pipeline`) and the transient
+//! `_mslBufferSizes` constants (owned +1 from `newBufferWithBytes` in
+//! `bind_buffer_sizes`, released after `endEncoding` — Metal retains
+//! resources referenced by encoded commands, so the early release is
+//! safe even for in-flight async command buffers).
+//!
 //! [zdm]: https://docs.rs/zunesha
 
 use std::ffi::c_void;
@@ -1442,6 +1452,120 @@ fn k(@builtin(global_invocation_id) gid: vec3<u32>) {
         );
         let back: Vec<f32> = backend.read_buffer(&buf).unwrap();
         assert_eq!(back, data);
+    }
+
+    /// Review r1 P2: Private buffers (create_device_buffer products)
+    /// must read back through a FRESH device→staging blit — a stale-
+    /// staging read would return the pre-kernel bytes. Writes via a real
+    /// kernel dispatch, so the read path is exercised end-to-end.
+    #[test]
+    #[serial_test::serial]
+    fn private_buffer_kernel_write_reads_back_fresh() {
+        let Some(backend) = test_device() else { return };
+        let wgsl = r#"
+            @group(0) @binding(0) var<storage, read> input: array<f32>;
+            @group(0) @binding(1) var<storage, read_write> output: array<f32>;
+            @compute @workgroup_size(256)
+            fn add_one(@builtin(global_invocation_id) gid: vec3<u32>) {
+                let i = gid.x;
+                if (i >= 8u) { return; }
+                output[i] = input[i] + 1.0;
+            }
+        "#;
+        let pipeline = backend.compile("add_one", wgsl).unwrap();
+        let data = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        let input = backend.create_device_buffer(&data).unwrap();
+        let output = backend.create_device_buffer_uninit::<f32>(8).unwrap();
+
+        // Negotiated placement is observable at the substrate level only
+        // (device-level `buffer_placement`); per-buffer storage mode is
+        // the substrate's contract. On unified Apple Silicon the strategy
+        // placement is HostVisible — but `create_device_buffer` forces
+        // Private regardless (Zunesha R3).
+        backend
+            .dispatch(&pipeline, &[&input, &output], (1, 1, 1))
+            .unwrap();
+
+        // The fresh-blit pin: these must be the KERNEL's outputs, not the
+        // pre-dispatch staging contents (the original `data`/zeros).
+        let result: Vec<f32> = backend.read_buffer(&output).unwrap();
+        assert_eq!(result, vec![2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0]);
+        // And a second dispatch must read the SECOND blit (not a cached
+        // first): feed output back through the kernel.
+        backend
+            .dispatch(&pipeline, &[&output, &output], (1, 1, 1))
+            .unwrap();
+        let result2: Vec<f32> = backend.read_buffer(&output).unwrap();
+        assert_eq!(result2, vec![3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0]);
+    }
+
+    /// Review r1 P2: the `DeviceLocal` strategy path (Private +
+    /// staging) must also round-trip kernel outputs — distinct from the
+    /// forced-Private `create_device_buffer` path above, this exercises
+    /// the strategy-negotiated allocation feeding dispatch + blit read.
+    #[test]
+    #[serial_test::serial]
+    fn device_local_strategy_kernel_write_reads_back() {
+        let backend = match MetalBackend::init_with_strategy(MemoryStrategy::DeviceLocal) {
+            Ok(b) => Some(b),
+            Err(e) => {
+                assert!(
+                    std::env::var("BORSALINO_REQUIRE_METAL").is_err(),
+                    "BORSALINO_REQUIRE_METAL is set but Metal init failed: {e}"
+                );
+                eprintln!("skipping: no Metal device ({e})");
+                None
+            }
+        };
+        let Some(backend) = backend else { return };
+        // Placement assertion at the observable (substrate) level.
+        assert!(matches!(
+            backend.z.buffer_placement(),
+            zunesha::MemoryPlacement::DeviceLocal
+        ));
+
+        let wgsl = r#"
+            @group(0) @binding(0) var<storage, read> input: array<f32>;
+            @group(0) @binding(1) var<storage, read_write> output: array<f32>;
+            @compute @workgroup_size(256)
+            fn add_one(@builtin(global_invocation_id) gid: vec3<u32>) {
+                let i = gid.x;
+                if (i >= 4u) { return; }
+                output[i] = input[i] * 2.0;
+            }
+        "#;
+        let pipeline = backend.compile("add_one", wgsl).unwrap();
+        let input = backend.create_buffer(&[10.0f32, 20.0, 30.0, 40.0]).unwrap();
+        let output = backend.create_buffer_uninit::<f32>(4).unwrap();
+        backend
+            .dispatch(&pipeline, &[&input, &output], (1, 1, 1))
+            .unwrap();
+        let result: Vec<f32> = backend.read_buffer(&output).unwrap();
+        assert_eq!(result, vec![20.0, 40.0, 60.0, 80.0]);
+    }
+
+    /// Review r1 P2, Shared side: the unified strategy's buffers are
+    /// Shared storage — placement observable as HostVisible, and kernel
+    /// outputs read back directly.
+    #[test]
+    #[serial_test::serial]
+    fn unified_strategy_placement_is_host_visible() {
+        let backend = match MetalBackend::init_with_strategy(MemoryStrategy::Unified) {
+            Ok(b) => Some(b),
+            Err(e) => {
+                assert!(
+                    std::env::var("BORSALINO_REQUIRE_METAL").is_err(),
+                    "BORSALINO_REQUIRE_METAL is set but Metal init failed: {e}"
+                );
+                eprintln!("skipping: no Metal device ({e})");
+                None
+            }
+        };
+        let Some(backend) = backend else { return };
+        assert!(matches!(
+            backend.z.buffer_placement(),
+            zunesha::MemoryPlacement::HostVisible
+        ));
     }
 
     /// Regression (P2 review finding): batch dispatch through
