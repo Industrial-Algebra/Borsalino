@@ -318,8 +318,10 @@ struct MetalZuneshaBufferInner {
     _device: std::sync::Arc<zunesha::metal::MetalDevice>,
 }
 
-unsafe impl Send for MetalZuneshaBufferInner {}
-unsafe impl Sync for MetalZuneshaBufferInner {}
+// Send/Sync: auto-derived — zunesha::Buffer is Send + Sync (upstream
+// unsafe impls over its raw handles) and Arc<MetalDevice> likewise
+// (review r2 P3: the redundant local impls are gone; safety lives in
+// Zunesha's documented invariants).
 
 impl MetalBackend {
     /// The substrate MTLBuffer behind a [`GpuBuffer`] for dispatch-time
