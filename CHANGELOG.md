@@ -4,6 +4,31 @@ All notable changes to Borsalino are documented in this file.
 
 ## [Unreleased]
 
+### Changed — Phase 2: buffer delegation to the substrate (2026-10-10)
+
+- `create_device_buffer(_uninit)` now delegates to Zunesha's documented
+  contract: **forced device-local + persistent staging**, including under
+  forced `Unified` on discrete hardware (Borsalino's previous
+  host-visible divergence and temp-staging profile are gone). Every
+  device-local buffer holds a persistent host-visible staging twin;
+  readback runs through the substrate's locked transfer path.
+- `read_buffer` is a pure delegation; Borsalino's own Vulkan allocation
+  code is deleted (`find_memory_type_index`, `align_up`, both allocate
+  paths, `one_shot_transfer`, the transfer command pool).
+- `contents()` on `create_device_buffer` buffers now returns the
+  substrate sentinel tag instead of null — reads go through `read_buffer`
+  either way (unchanged since Phase 1 for `create_buffer` buffers).
+- **Mixed-size reads are byte-based** (review r1): `read_buffer::<u8>` on a
+  buffer created from two `u32`s returns 8 elements (was 2 — the old path
+  returned the creation-time element count). `GpuBuffer.len` remains the
+  creation-time element count; the read length derives from the substrate's
+  byte length.
+- Error surface reclassified (review r1): buffer-creation failures surface
+  as `BufferCreationFailed` wrapping the substrate's message
+  (`zunesha create_device_buffer: …`), and device-buffer read failures as
+  `BufferReadFailed` from the substrate's locked read path — the
+  Borsalino-specific staging error messages are gone with the staging code.
+
 ### Changed — dependency flip (2026-10-10)
 
 - `zunesha` dependency flipped from the temporary git dep on the
