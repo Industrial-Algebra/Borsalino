@@ -6,6 +6,12 @@ All notable changes to Borsalino are documented in this file.
 
 ### Changed — Phase 2: buffer delegation to the substrate (2026-10-10)
 
+- Bump `zunesha` to `0.1.2` — picks up the substrate's seven-round
+  submission-protocol soundness pass (allocation-failure cleanup,
+  quiesce-or-leak teardown, per-protocol reentrancy incl. the fix for
+  the pre-existing nested-entry deadlock), which Phase 2's delegated
+  paths now exercise directly.
+
 - `create_device_buffer(_uninit)` now delegates to Zunesha's documented
   contract: **forced device-local + persistent staging**, including under
   forced `Unified` on discrete hardware (Borsalino's previous
