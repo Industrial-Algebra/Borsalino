@@ -30,6 +30,20 @@ pub enum TensorError {
         shape: Vec<u32>,
     },
 
+    /// A layout's byte footprint does not fit in a `u64`.
+    ///
+    /// The element count can fit while `element count × dtype size` does
+    /// not (e.g. `[u32::MAX, u32::MAX]` f32 is 73,786,976,260,478,468,100
+    /// bytes). Saturating the product would make the layout accept a byte
+    /// length it cannot represent, so construction rejects it instead.
+    #[error("shape {shape:?} of {dtype} has a byte footprint that overflows u64")]
+    ByteLenOverflow {
+        /// The offending dimensions.
+        shape: Vec<u32>,
+        /// The dtype that pushed the footprint past `u64`.
+        dtype: Dtype,
+    },
+
     /// A layout's strides are not the canonical row-major strides.
     ///
     /// T0 binds row-major, contiguous, unpadded buffers only (handover
@@ -178,6 +192,23 @@ pub enum TensorError {
         end: u64,
         /// The size of the data section it must fit in.
         available: u64,
+    },
+
+    /// Two manifest entries claim intersecting byte spans.
+    ///
+    /// Entries are distinct parameters: aliasing a byte range would make two
+    /// "different" tensors the same memory, which is never what a checkpoint
+    /// means (weight tying is expressed by naming one entry twice).
+    #[error("`{first}` and `{second}` overlap in {offset}..{end}")]
+    OverlappingEntries {
+        /// The entry with the lower byte offset.
+        first: String,
+        /// The entry that starts inside it.
+        second: String,
+        /// Start of the intersection.
+        offset: u64,
+        /// Exclusive end of the intersection.
+        end: u64,
     },
 
     /// The manifest entry count does not match the op's declared ports.

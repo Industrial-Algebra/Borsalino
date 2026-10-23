@@ -215,7 +215,11 @@ fn manifest_entries_must_not_overlap() {
     ]);
     assert!(matches!(
         validate_manifest(&straddling, 12),
-        Err(TensorError::OverlappingEntries { offset: 4, end: 8, .. })
+        Err(TensorError::OverlappingEntries {
+            offset: 4,
+            end: 8,
+            ..
+        })
     ));
 
     // Adjacent spans do not overlap, and a zero-length entry aliases nothing.
@@ -245,8 +249,25 @@ fn manifest_byte_footprints_that_overflow_u64_are_rejected() {
             ..
         })
     ));
+
+    // The binder rejects it too — through the same footprint check, once the
+    // arity gate has passed (two entries for matmul's two ports).
+    let paired = manifest(vec![
+        ManifestEntry {
+            name: "a.weight".to_string(),
+            shape: vec![u32::MAX, u32::MAX],
+            byte_offset: 0,
+            byte_len: u64::MAX,
+        },
+        ManifestEntry {
+            name: "b.weight".to_string(),
+            shape: vec![u32::MAX, u32::MAX],
+            byte_offset: 0,
+            byte_len: u64::MAX,
+        },
+    ]);
     assert!(matches!(
-        bind_to_op::<MatMul>(&m, u64::MAX),
+        bind_to_op::<MatMul>(&paired, u64::MAX),
         Err(TensorError::ByteLenOverflow { .. })
     ));
 }

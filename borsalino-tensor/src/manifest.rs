@@ -76,11 +76,17 @@ fn dtype_from_manifest(dtype: ManifestDtype) -> Dtype {
 /// 1. the manifest's dtype is the f32 contract dtype,
 /// 2. the determinism pin names the same dtype as the manifest itself (a pin
 ///    that disagrees cannot be honoured),
-/// 3. the entry's shape is representable and its `byte_len` is exactly
+/// 3. the entry's shape is representable, its byte footprint fits in a `u64`
+///    (no saturating arithmetic: `[u32::MAX, u32::MAX]` f32 needs
+///    73,786,976,260,478,468,100 bytes), and its `byte_len` is exactly
 ///    `element count × dtype size` — a manifest may not under- or
 ///    over-declare a tensor's footprint,
 /// 4. the entry's `byte_offset..byte_offset + byte_len` span fits inside the
-///    `available`-byte data section.
+///    `available`-byte data section,
+/// 5. no two entries' spans intersect. Entries name distinct parameters, so
+///    aliasing a byte range would make two tensors the same memory; a
+///    checkpoint that means to tie weights names one entry twice. Zero-length
+///    entries (a zero dimension) cover nothing and never conflict.
 ///
 /// Layout is checked by construction: [`ManifestLayout`] has one variant
 /// (row-major contiguous), which is the only layout T0 binds.
@@ -88,8 +94,9 @@ fn dtype_from_manifest(dtype: ManifestDtype) -> Dtype {
 /// # Errors
 ///
 /// [`TensorError::NonContractDtype`], [`TensorError::DeterminismDtypeMismatch`],
-/// [`TensorError::ShapeOverflow`], [`TensorError::ByteLenMismatch`], or
-/// [`TensorError::OutOfBounds`].
+/// [`TensorError::ShapeOverflow`], [`TensorError::ByteLenOverflow`],
+/// [`TensorError::ByteLenMismatch`], [`TensorError::OutOfBounds`], or
+/// [`TensorError::OverlappingEntries`].
 pub fn validate_manifest(manifest: &TensorManifest, available: u64) -> Result<(), TensorError> {
     let dtype = dtype_from_manifest(manifest.dtype);
     require_contract(dtype)?;
@@ -107,9 +114,12 @@ pub fn validate_manifest(manifest: &TensorManifest, available: u64) -> Result<()
     let FastPathPolicy::Forbidden = manifest.determinism.fast_paths;
     let ManifestLayout::RowMajorContiguous = manifest.layout;
 
-    for entry in &manifest.entries {
+    // (end offset, start offset, entry index), for the overlap sweep below.
+    let mut spans: Vec<(u64, u64, usize)> = Vec::with_capacity(manifest.entries.len());
+
+    for (index, entry) in manifest.entries.iter().enumerate() {
         let shape = Shape::new(&entry.shape)?;
-        let layout = TensorLayout::row_major(dtype, shape);
+        let layout = TensorLayout::row_major(dtype, shape)?;
         layout.check_byte_len_named(&entry.name, entry.byte_len)?;
 
         let end = entry
@@ -129,6 +139,46 @@ pub fn validate_manifest(manifest: &TensorManifest, available: u64) -> Result<()
                 end,
                 available,
             });
+        }
+
+        // Zero-length entries cover no bytes, so they never conflict.
+        if entry.byte_len > 0 {
+            spans.push((entry.byte_offset, end, index));
+        }
+    }
+
+    check_no_overlap(&manifest.entries, &mut spans)?;
+
+    Ok(())
+}
+
+/// Reject intersecting byte spans.
+///
+/// Sorts the non-empty spans by offset and sweeps them, remembering the
+/// furthest end seen so far: a span that starts before it intersects the
+/// entry that reached it. Adjacent spans (`0..4`, `4..8`) do not intersect.
+fn check_no_overlap(
+    entries: &[ManifestEntry],
+    spans: &mut [(u64, u64, usize)],
+) -> Result<(), TensorError> {
+    spans.sort_unstable();
+
+    let mut furthest: Option<(u64, usize)> = None;
+    for &(start, end, index) in spans.iter() {
+        if let Some((reached, reached_index)) = furthest {
+            if start < reached {
+                return Err(TensorError::OverlappingEntries {
+                    first: entries[reached_index].name.clone(),
+                    second: entries[index].name.clone(),
+                    offset: start,
+                    end: end.min(reached),
+                });
+            }
+            if end > reached {
+                furthest = Some((end, index));
+            }
+        } else {
+            furthest = Some((end, index));
         }
     }
 
@@ -170,9 +220,10 @@ pub fn bind_to_op<O: TensorOp>(
     let mut bindings = Vec::with_capacity(manifest.entries.len());
     let mut layouts = Vec::with_capacity(manifest.entries.len());
     for entry in &manifest.entries {
-        // Shapes and byte lengths were validated above; this cannot fail.
+        // Shapes and byte lengths were validated above; the footprint cannot
+        // overflow here, and the byte length is already pinned.
         let shape = Shape::new(&entry.shape)?;
-        let layout = TensorLayout::row_major(dtype, shape);
+        let layout = TensorLayout::row_major(dtype, shape)?;
         layouts.push(layout.clone());
         bindings.push(ManifestBinding {
             name: entry.name.clone(),

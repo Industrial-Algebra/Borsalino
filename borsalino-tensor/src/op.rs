@@ -245,26 +245,42 @@ pub trait TensorOp {
     /// [`TensorError::ArityMismatch`], [`TensorError::DtypeMismatch`], or
     /// whatever the op's [`ShapeRule`] rejects.
     fn check_inputs(inputs: &[TensorLayout]) -> Result<(), TensorError> {
-        if inputs.len() != Self::INPUTS.len() {
-            return Err(TensorError::ArityMismatch {
-                op: Self::NAME,
-                expected: Self::INPUTS.len(),
-                got: inputs.len(),
+        check_ports::<Self>(inputs)
+    }
+}
+
+/// The shared operand gate: arity, per-port dtype, then the op's shape rule.
+///
+/// [`TensorOp::check_inputs`] delegates here so an op that overrides it (to
+/// enforce an extra policy, as [`Cast`](crate::ops::l0::Cast) does) runs
+/// exactly the same checks as every other op instead of re-implementing them.
+///
+/// # Errors
+///
+/// [`TensorError::ArityMismatch`], [`TensorError::DtypeMismatch`], or
+/// whatever the op's [`ShapeRule`] rejects.
+pub(crate) fn check_ports<O: TensorOp + ?Sized>(
+    inputs: &[TensorLayout],
+) -> Result<(), TensorError> {
+    if inputs.len() != O::INPUTS.len() {
+        return Err(TensorError::ArityMismatch {
+            op: O::NAME,
+            expected: O::INPUTS.len(),
+            got: inputs.len(),
+        });
+    }
+    for (port, (spec, layout)) in O::INPUTS.iter().zip(inputs).enumerate() {
+        if layout.dtype() != spec.dtype {
+            return Err(TensorError::DtypeMismatch {
+                op: O::NAME,
+                port,
+                expected: spec.dtype,
+                got: layout.dtype(),
             });
         }
-        for (port, (spec, layout)) in Self::INPUTS.iter().zip(inputs).enumerate() {
-            if layout.dtype() != spec.dtype {
-                return Err(TensorError::DtypeMismatch {
-                    op: Self::NAME,
-                    port,
-                    expected: spec.dtype,
-                    got: layout.dtype(),
-                });
-            }
-        }
-        let shapes: Vec<&Shape> = inputs.iter().map(TensorLayout::shape).collect();
-        Self::SHAPE_RULE.infer(Self::NAME, &shapes).map(|_| ())
     }
+    let shapes: Vec<&Shape> = inputs.iter().map(TensorLayout::shape).collect();
+    O::SHAPE_RULE.infer(O::NAME, &shapes).map(|_| ())
 }
 
 /// The dimension at `axis`, counting from the trailing end, or `1` when the

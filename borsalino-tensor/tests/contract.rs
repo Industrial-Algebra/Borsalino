@@ -872,5 +872,11 @@ fn error_taxonomy_is_exhaustive() {
     );
 
     // Errors render with the op name, not a bare "invalid argument".
-    assert!(cases[2].to_string().contains("add"));
+    // Located by variant, not by index: the taxonomy grows, and a positional
+    // assertion would silently start checking a different error.
+    let arity = cases
+        .iter()
+        .find(|error| matches!(error, TensorError::ArityMismatch { .. }))
+        .expect("the taxonomy covers ArityMismatch");
+    assert!(arity.to_string().contains("add"));
 }

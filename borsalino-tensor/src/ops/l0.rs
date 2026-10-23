@@ -7,15 +7,15 @@
 //! order, no atomics. A T2 kernel for an L0 op must reproduce that — which
 //! is what makes them the cheap half of the determinism gate.
 //!
-//! Every op here requires row-major contiguous operands
-//! ([`TensorLayout`](crate::layout::TensorLayout)) and f32 data ports,
-//! except [`Cast`], which carries its dtype in its own type, and
-//! [`Gather`]'s index port, which is `u32`.
+//! Every op here requires row-major contiguous operands ([`TensorLayout`])
+//! and f32 data ports, except [`Cast`], which carries its dtype in its own
+//! type, and [`Gather`]'s index port, which is `u32`.
 
 use core::marker::PhantomData;
 
 use crate::dtype::{CastContract, DtypeMarker};
 use crate::error::TensorError;
+use crate::layout::TensorLayout;
 use crate::op::{DeterminismClass, OpLevel, PortSpec, ShapeRule, TensorOp};
 
 /// Elementwise copy — identity on shape, strides, and dtype.
@@ -71,6 +71,17 @@ impl<From: DtypeMarker, To: DtypeMarker> TensorOp for Cast<From, To> {
     const OUTPUT: PortSpec = PortSpec::data(To::DTYPE);
     const DETERMINISM: DeterminismClass = DeterminismClass::BitExact;
     const SHAPE_RULE: ShapeRule = ShapeRule::Identity;
+
+    /// The dtype policy is part of the input gate, not a separate question.
+    ///
+    /// A pair that [`Cast::contract`] refuses (`f32 -> f32`, `f16 -> bf16`, an
+    /// index target) has no defined conversion, so its ports must not
+    /// validate either: the contract and the gate answer with one voice, for
+    /// this op and for every dtype pair in the marker set.
+    fn check_inputs(inputs: &[TensorLayout]) -> Result<(), TensorError> {
+        Self::contract()?;
+        crate::op::check_ports::<Self>(inputs)
+    }
 }
 
 /// Elementwise addition with NumPy broadcasting.

@@ -32,17 +32,27 @@ pub struct Shape {
 impl Shape {
     /// Build a shape from row-major dimensions.
     ///
+    /// A zero dimension short-circuits the product: a shape that holds no
+    /// elements holds them in every ordering, so `[MAX, MAX, MAX, 0]` and
+    /// `[0, MAX, MAX, MAX]` both have a count of zero (and neither may be
+    /// reported as an overflow just because the fold met the large dimensions
+    /// first).
+    ///
     /// # Errors
     ///
-    /// [`TensorError::ShapeOverflow`] when the dimensions' product exceeds
-    /// `u64::MAX`.
+    /// [`TensorError::ShapeOverflow`] when the product of the non-zero
+    /// dimensions exceeds `u64::MAX`.
     pub fn new(dims: &[u32]) -> Result<Self, TensorError> {
-        let element_count = dims
-            .iter()
-            .try_fold(1u64, |acc, &dim| acc.checked_mul(u64::from(dim)));
-        let element_count = element_count.ok_or_else(|| TensorError::ShapeOverflow {
-            shape: dims.to_vec(),
-        })?;
+        let element_count = if dims.contains(&0) {
+            0
+        } else {
+            let product = dims
+                .iter()
+                .try_fold(1u64, |acc, &dim| acc.checked_mul(u64::from(dim)));
+            product.ok_or_else(|| TensorError::ShapeOverflow {
+                shape: dims.to_vec(),
+            })?
+        };
         Ok(Self {
             dims: dims.to_vec(),
             element_count,
@@ -136,14 +146,15 @@ pub struct TensorLayout {
 
 impl TensorLayout {
     /// The canonical row-major layout for a shape.
-    #[must_use]
-    pub fn row_major(dtype: Dtype, shape: Shape) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// [`TensorError::ByteLenOverflow`] when `element count × dtype size`
+    /// exceeds `u64::MAX`. The footprint is checked here, once, so
+    /// [`byte_len`](Self::byte_len) is exact for the layout's whole life.
+    pub fn row_major(dtype: Dtype, shape: Shape) -> Result<Self, TensorError> {
         let strides = shape.row_major_strides();
-        Self {
-            dtype,
-            shape,
-            strides,
-        }
+        Self::checked(dtype, shape, strides)
     }
 
     /// An explicit layout, checked to be row-major contiguous.
@@ -151,8 +162,9 @@ impl TensorLayout {
     /// # Errors
     ///
     /// [`TensorError::RankMismatch`] when the stride count disagrees with
-    /// the rank, and [`TensorError::NonContiguous`] when the strides are not
-    /// the canonical ones for the shape.
+    /// the rank, [`TensorError::NonContiguous`] when the strides are not the
+    /// canonical ones for the shape, and [`TensorError::ByteLenOverflow`]
+    /// when the footprint does not fit in a `u64`.
     pub fn new(dtype: Dtype, shape: Shape, strides: Strides) -> Result<Self, TensorError> {
         if strides.rank() != shape.rank() {
             return Err(TensorError::RankMismatch {
@@ -168,6 +180,18 @@ impl TensorLayout {
                 strides: strides.as_slice().to_vec(),
             });
         }
+        Self::checked(dtype, shape, strides)
+    }
+
+    /// The shared tail of both constructors: enforce the byte footprint.
+    fn checked(dtype: Dtype, shape: Shape, strides: Strides) -> Result<Self, TensorError> {
+        shape
+            .element_count()
+            .checked_mul(dtype.size_bytes())
+            .ok_or_else(|| TensorError::ByteLenOverflow {
+                shape: shape.dims().to_vec(),
+                dtype,
+            })?;
         Ok(Self {
             dtype,
             shape,
@@ -207,14 +231,11 @@ impl TensorLayout {
 
     /// The layout's byte footprint, `element_count * dtype size`.
     ///
-    /// Saturating for the same reason as
-    /// [`Shape::row_major_strides`]: a shape whose byte footprint exceeds
-    /// `u64::MAX` cannot be bound, and
-    /// [`check_byte_len`](Self::check_byte_len) rejects every real length
-    /// against it.
+    /// Exact, never saturated: construction rejects a footprint that does
+    /// not fit in a `u64` ([`TensorError::ByteLenOverflow`]).
     #[must_use]
     pub fn byte_len(&self) -> u64 {
-        self.element_count().saturating_mul(self.dtype.size_bytes())
+        self.element_count() * self.dtype.size_bytes()
     }
 
     /// A human-readable label, used in error payloads.

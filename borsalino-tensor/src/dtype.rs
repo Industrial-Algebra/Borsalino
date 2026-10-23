@@ -75,12 +75,82 @@ impl Dtype {
     pub const fn is_index(self) -> bool {
         matches!(self, Dtype::U32)
     }
+
+    /// The finite bounds of a floating dtype, as exact `f64` values.
+    ///
+    /// `None` for [`Dtype::U32`]: an index dtype is not a rounding target,
+    /// so "maximum finite" has no meaning for it.
+    ///
+    /// The bounds are exact (every value is representable in `f64`), because
+    /// each is either a value of a narrower float or the midpoint of two of
+    /// them.
+    #[must_use]
+    pub fn float_bounds(self) -> Option<FloatBounds> {
+        let bounds = match self {
+            Dtype::F32 => FloatBounds {
+                max_finite: f64::from(f32::MAX),
+                overflow_threshold: (f64::from(f32::MAX) + pow2(128)) / 2.0,
+                min_subnormal: pow2(-149),
+            },
+            Dtype::F16 => FloatBounds {
+                max_finite: 65504.0,
+                // f16's last binade is [2^15, 2^16): the next representable
+                // magnitude after 65504 is 2^16, so rounding overflows from
+                // their midpoint onwards.
+                overflow_threshold: 65520.0,
+                min_subnormal: pow2(-24),
+            },
+            Dtype::BF16 => {
+                // (2 - 2^-7) * 2^127 — bf16 keeps f32's 8-bit exponent but
+                // narrows the significand to 8 bits, so its largest finite
+                // value is *smaller* than f32's.
+                let max_finite = 255.0 * pow2(120);
+                FloatBounds {
+                    max_finite,
+                    overflow_threshold: (max_finite + pow2(128)) / 2.0,
+                    min_subnormal: pow2(-133),
+                }
+            }
+            Dtype::U32 => return None,
+        };
+        Some(bounds)
+    }
 }
 
 impl fmt::Display for Dtype {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.name())
     }
+}
+
+/// 2^`exp` as an exact `f64`.
+///
+/// Constructed from exponent bits rather than a decimal literal so every
+/// bound below is exact by construction; the exponents used stay well inside
+/// `f64`'s normal range.
+fn pow2(exp: i32) -> f64 {
+    f64::from_bits(((1023 + exp) as u64) << 52)
+}
+
+/// The finite bounds of a floating dtype (IEEE-754 binaries).
+///
+/// These are the numbers that make a cast contract checkable: "overflow" and
+/// "flushes to zero" are only meaningful claims once the thresholds are
+/// pinned, because rounding is *nearest-first* — a value above the maximum
+/// finite value still rounds **down** to it as long as it is below the
+/// midpoint to the next power of two.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FloatBounds {
+    /// The largest finite value the dtype represents.
+    pub max_finite: f64,
+    /// At or above this magnitude, rounding to the dtype yields infinity.
+    ///
+    /// This is the midpoint between [`max_finite`](Self::max_finite) and the
+    /// next power of two, not the maximum finite value itself.
+    pub overflow_threshold: f64,
+    /// The smallest positive subnormal; below half of it, a nonzero source
+    /// value rounds to zero.
+    pub min_subnormal: f64,
 }
 
 /// Reject a dtype that is not the f32 contract dtype.
@@ -145,20 +215,38 @@ pub enum Roundtrip {
 }
 
 /// What a cast does to values beyond the target's range.
+///
+/// Rounding is nearest-first, so "beyond the range" is not the same as
+/// "above the maximum finite value": the overflow point is the midpoint to
+/// the next power of two (see [`FloatBounds::overflow_threshold`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Overflow {
-    /// Values beyond the target's maximum round to infinity.
+    /// Values at or above the target's overflow threshold become infinity;
+    /// values between the maximum finite value and that threshold round back
+    /// down to the maximum finite value.
     ToInfinity,
-    /// The target's range contains the source's, so overflow cannot happen.
+    /// The target's range contains the source's, so no source value can
+    /// reach the target's overflow threshold.
     CannotOverflow,
 }
 
 /// What a cast does to subnormal source values.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SubnormalPolicy {
-    /// The target represents every source subnormal.
+    /// Every source subnormal is exactly representable in the target.
     Preserved,
-    /// Source subnormals below the target's minimum subnormal become zero.
+    /// Source subnormals land on target subnormals, down to the target's
+    /// minimum subnormal; below half of it they round to zero.
+    ///
+    /// This is the `f32 -> bf16` case: bf16's exponent range matches f32's,
+    /// so its minimum subnormal (2^-133) is sixteen binades above f32's
+    /// deepest subnormal.
+    RoundsToTargetSubnormals,
+    /// Every source subnormal is below half of the target's minimum
+    /// subnormal, so all of them round to zero.
+    ///
+    /// This is the `f32 -> f16` case: f16's minimum subnormal (2^-24) sits
+    /// 102 binades above f32's largest subnormal (just below 2^-126).
     FlushesToZero,
 }
 
@@ -166,8 +254,12 @@ pub enum SubnormalPolicy {
 ///
 /// This is the whole of T0's cast contract: dtype policy is data, so a
 /// kernel author reads the semantics from the type instead of guessing at
-/// the hardware's rounding mode.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// the hardware's rounding mode. The three threshold fields are the target
+/// dtype's, so a caller can decide what a specific value will do without
+/// implementing rounding: below `max_finite` rounds back to `max_finite`,
+/// from `overflow_threshold` onwards it is infinity, and below half of
+/// `min_subnormal` it is zero.
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct CastContract {
     /// The source dtype.
     pub from: Dtype,
@@ -179,21 +271,29 @@ pub struct CastContract {
     pub overflow: Overflow,
     /// What happens to subnormal source values.
     pub subnormals: SubnormalPolicy,
+    /// The target's largest finite value.
+    pub max_finite: f64,
+    /// The target's overflow threshold: at or above it, infinity.
+    pub overflow_threshold: f64,
+    /// The target's smallest positive subnormal.
+    pub min_subnormal: f64,
 }
 
 impl CastContract {
     /// The contract for a cast pair.
     ///
-    /// Defined pairs (handover §4.3):
+    /// Defined pairs (handover §4.3), all round-to-nearest-even:
     ///
-    /// - `f32 -> f16`: round-to-nearest-even, half-ulp inexact; values above
-    ///   f16's maximum become infinity; f32 subnormals below f16's minimum
-    ///   subnormal become zero.
-    /// - `f32 -> bf16`: round-to-nearest-even, half-ulp inexact; bf16 shares
-    ///   f32's exponent range so it cannot overflow; f32 subnormals below
-    ///   bf16's minimum subnormal become zero.
+    /// - `f32 -> f16`: half-ulp inexact; values from 65520 (the midpoint
+    ///   between 65504 and 2^16) become infinity, values in between round
+    ///   back to 65504; every f32 subnormal is far below half of f16's
+    ///   minimum subnormal, so all of them become zero.
+    /// - `f32 -> bf16`: half-ulp inexact; bf16 has f32's exponent range but
+    ///   not f32's maximum finite value — `(2 - 2^-7) * 2^127 < f32::MAX` —
+    ///   so this narrowing **can** overflow, from the midpoint to 2^128.
+    ///   f32 subnormals survive as bf16 subnormals down to 2^-133.
     /// - `f16 -> f32`, `bf16 -> f32`: exact, no overflow, subnormals
-    ///   preserved.
+    ///   preserved (both fit f32's exponent range with room to spare).
     ///
     /// # Errors
     ///
@@ -210,8 +310,8 @@ impl CastContract {
             ),
             (S, B) => (
                 Roundtrip::HalfUlpInexact,
-                Overflow::CannotOverflow,
-                SubnormalPolicy::FlushesToZero,
+                Overflow::ToInfinity,
+                SubnormalPolicy::RoundsToTargetSubnormals,
             ),
             (H, S) | (B, S) => (
                 Roundtrip::Exact,
@@ -220,12 +320,19 @@ impl CastContract {
             ),
             _ => return Err(TensorError::CastNotDefined { from, to }),
         };
+        // Every defined pair has a float target, so the bounds exist.
+        let bounds = to
+            .float_bounds()
+            .expect("defined cast targets are floating dtypes");
         Ok(Self {
             from,
             to,
             roundtrip,
             overflow,
             subnormals,
+            max_finite: bounds.max_finite,
+            overflow_threshold: bounds.overflow_threshold,
+            min_subnormal: bounds.min_subnormal,
         })
     }
 }
