@@ -189,6 +189,69 @@ fn manifest_determinism_pin_is_honoured_by_every_t0_op() {
 }
 
 #[test]
+fn manifest_entries_must_not_overlap() {
+    // Reviewer repro (PR #65 round 1): two entries claiming the same span
+    // both passed validation, though the module documents that spans do not
+    // overlap. Aliasing weights is expressed by naming one entry twice, not
+    // by overlapping byte ranges.
+    let aliased = manifest(vec![
+        entry("a.weight", &[1], 0, 4),
+        entry("b.weight", &[1], 0, 4),
+    ]);
+    assert!(matches!(
+        validate_manifest(&aliased, 4),
+        Err(TensorError::OverlappingEntries {
+            ref first,
+            ref second,
+            offset: 0,
+            end: 4,
+        }) if first == "a.weight" && second == "b.weight"
+    ));
+
+    // Partial overlap, with the entries out of offset order in the list.
+    let straddling = manifest(vec![
+        entry("b.weight", &[2], 4, 8),
+        entry("a.weight", &[2], 0, 8),
+    ]);
+    assert!(matches!(
+        validate_manifest(&straddling, 12),
+        Err(TensorError::OverlappingEntries { offset: 4, end: 8, .. })
+    ));
+
+    // Adjacent spans do not overlap, and a zero-length entry aliases nothing.
+    let adjacent = manifest(vec![entry("a", &[1], 0, 4), entry("b", &[1], 4, 4)]);
+    assert!(validate_manifest(&adjacent, 8).is_ok());
+    let empty = manifest(vec![entry("empty", &[0], 0, 0), entry("x", &[1], 0, 4)]);
+    assert!(validate_manifest(&empty, 4).is_ok());
+}
+
+#[test]
+fn manifest_byte_footprints_that_overflow_u64_are_rejected() {
+    // Reviewer repro (PR #65 round 1): [u32::MAX, u32::MAX] f32 needs
+    // 73_786_976_260_478_468_100 bytes. A u64 byte_len cannot express that,
+    // so validation must reject the shape rather than compare it against a
+    // saturated footprint.
+    let m = manifest(vec![ManifestEntry {
+        name: "huge.weight".to_string(),
+        shape: vec![u32::MAX, u32::MAX],
+        byte_offset: 0,
+        byte_len: u64::MAX,
+    }]);
+
+    assert!(matches!(
+        validate_manifest(&m, u64::MAX),
+        Err(TensorError::ByteLenOverflow {
+            dtype: Dtype::F32,
+            ..
+        })
+    ));
+    assert!(matches!(
+        bind_to_op::<MatMul>(&m, u64::MAX),
+        Err(TensorError::ByteLenOverflow { .. })
+    ));
+}
+
+#[test]
 fn manifest_shapes_are_checked_against_the_op_shape_rule() {
     // Two [4,8] weights cannot be multiplied: the inner dims disagree.
     let m = manifest(vec![

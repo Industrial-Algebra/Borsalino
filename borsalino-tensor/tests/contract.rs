@@ -9,7 +9,7 @@
 //! assertions pin the rules a T1/T2 implementation must satisfy.
 
 use borsalino_tensor::dtype::{
-    BF16, CastContract, Dtype, F16, F32, Overflow, Roundtrip, SubnormalPolicy,
+    BF16, CastContract, Dtype, DtypeMarker, F16, F32, Overflow, Roundtrip, SubnormalPolicy,
 };
 use borsalino_tensor::error::TensorError;
 use borsalino_tensor::layout::{Shape, Strides, TensorLayout};
@@ -17,6 +17,11 @@ use borsalino_tensor::op::{DeterminismClass, OpLevel, PortRole, PortSpec, ShapeR
 use borsalino_tensor::ops::l0::{Add, BroadcastDiv, Cast, Copy, Gather, Mul};
 use borsalino_tensor::ops::l1::{MaskedMean, Max, RowwiseL2Norm, Sum};
 use borsalino_tensor::ops::l2::{BatchedMatMul, MatMul};
+
+/// 2^`exp` as an f64 — exact for every exponent these fixtures use.
+fn pow2(exp: i32) -> f64 {
+    f64::from_bits(((1023 + exp) as u64) << 52)
+}
 
 fn header<O: TensorOp>() -> (&'static str, OpLevel, usize) {
     (O::NAME, O::LEVEL, O::INPUTS.len())
@@ -171,8 +176,8 @@ fn cast_is_the_only_explicit_dtype_conversion() {
 
 #[test]
 fn narrowing_casts_document_roundtrip_semantics() {
-    // f32 -> f16: round-to-nearest-even, overflow saturates to infinity,
-    // f32 subnormals fall below f16's minimum subnormal.
+    // f32 -> f16: round-to-nearest-even, overflow above the midpoint to
+    // 2^16, and every f32 subnormal far below f16's minimum subnormal.
     let down = CastContract::for_dtypes(Dtype::F32, Dtype::F16).unwrap();
     assert_eq!(down.from, Dtype::F32);
     assert_eq!(down.to, Dtype::F16);
@@ -180,13 +185,13 @@ fn narrowing_casts_document_roundtrip_semantics() {
     assert_eq!(down.overflow, Overflow::ToInfinity);
     assert_eq!(down.subnormals, SubnormalPolicy::FlushesToZero);
 
-    // f32 -> bf16: bf16 shares f32's exponent range, so it cannot overflow;
-    // the mantissa narrows to 7 bits. Very small f32 subnormals still fall
-    // below bf16's minimum subnormal.
+    // f32 -> bf16: bf16 shares f32's exponent range but NOT f32's maximum
+    // finite value, so it does overflow; f32 subnormals survive as bf16
+    // subnormals down to bf16's floor.
     let down = CastContract::for_dtypes(Dtype::F32, Dtype::BF16).unwrap();
     assert_eq!(down.roundtrip, Roundtrip::HalfUlpInexact);
-    assert_eq!(down.overflow, Overflow::CannotOverflow);
-    assert_eq!(down.subnormals, SubnormalPolicy::FlushesToZero);
+    assert_eq!(down.overflow, Overflow::ToInfinity);
+    assert_eq!(down.subnormals, SubnormalPolicy::RoundsToTargetSubnormals);
 
     // Widening is exact in both directions.
     for (from, to) in [(Dtype::F16, Dtype::F32), (Dtype::BF16, Dtype::F32)] {
@@ -205,6 +210,163 @@ fn narrowing_casts_document_roundtrip_semantics() {
         Cast::<F16, F32>::contract().unwrap().roundtrip,
         Roundtrip::Exact
     );
+}
+
+#[test]
+fn f16_narrowing_overflows_at_the_midpoint_not_at_the_maximum() {
+    let c = CastContract::for_dtypes(Dtype::F32, Dtype::F16).unwrap();
+
+    // Reviewer repro (PR #65 round 1): f16's largest finite value is 65504
+    // and the next binade starts at 2^16, so rounding overflows to infinity
+    // only at or above their midpoint, 65520. Values in between round DOWN.
+    assert_eq!(c.max_finite, 65504.0);
+    assert_eq!(c.overflow_threshold, 65520.0);
+    assert_eq!(c.overflow_threshold, (c.max_finite + pow2(16)) / 2.0);
+
+    // 65505 is above the maximum finite value but below the midpoint, so it
+    // rounds to 65504 — it does not become infinity.
+    let just_past_max = 65505.0;
+    assert!(just_past_max > c.max_finite);
+    assert!(just_past_max < c.overflow_threshold);
+
+    // f32::MAX is far past the midpoint, so it does overflow.
+    assert!(f64::from(f32::MAX) > c.overflow_threshold);
+}
+
+#[test]
+fn f16_flushes_every_f32_subnormal_because_the_floor_is_far_above_them() {
+    let c = CastContract::for_dtypes(Dtype::F32, Dtype::F16).unwrap();
+
+    // f16's minimum subnormal is 2^-24; half of it (2^-25) is the flush
+    // threshold. The largest f32 subnormal is around 2^-126.
+    assert_eq!(c.min_subnormal, pow2(-24));
+    let largest_f32_subnormal = (pow2(23) - 1.0) * pow2(-149);
+    assert!(largest_f32_subnormal < c.min_subnormal / 2.0);
+}
+
+#[test]
+fn bf16_narrowing_overflows_because_its_maximum_finite_is_smaller() {
+    let c = CastContract::for_dtypes(Dtype::F32, Dtype::BF16).unwrap();
+
+    // Reviewer repro (PR #65 round 1): bf16 keeps f32's 8-bit exponent but
+    // not its 8-bit significand, so its largest finite value is
+    // (2 - 2^-7) * 2^127 = 3.3895e38 < f32::MAX = 3.4028e38. Narrowing CAN
+    // overflow, and f32::MAX is past the midpoint to 2^128.
+    let max_finite = 255.0 * pow2(120);
+    assert_eq!(c.max_finite, max_finite);
+    assert!(c.max_finite < f64::from(f32::MAX));
+
+    assert_eq!(c.overflow_threshold, (max_finite + pow2(128)) / 2.0);
+    assert!(f64::from(f32::MAX) >= c.overflow_threshold);
+}
+
+#[test]
+fn bf16_represents_f32_subnormals_down_to_its_own_floor() {
+    let c = CastContract::for_dtypes(Dtype::F32, Dtype::BF16).unwrap();
+
+    // bf16's minimum subnormal is 2^-133, sixteen binades above f32's
+    // deepest, so f32 subnormals become bf16 subnormals rather than zero.
+    assert_eq!(c.min_subnormal, pow2(-133));
+
+    // Reviewer repro: f32 bits 0x0000_c000 is 49152 * 2^-149 = 0.75 * 2^-133.
+    // Three quarters of bf16's minimum subnormal rounds to ONE ulp, not zero.
+    let value = f64::from(f32::from_bits(0x0000_c000));
+    assert_eq!(value, 0.75 * pow2(-133));
+    assert!(value > c.min_subnormal / 2.0);
+
+    // The genuine flush case sits below half of the minimum subnormal.
+    assert!(pow2(-135) < c.min_subnormal / 2.0);
+}
+
+#[test]
+fn widening_casts_are_exact_and_cannot_overflow() {
+    for from in [Dtype::F16, Dtype::BF16] {
+        let up = CastContract::for_dtypes(from, Dtype::F32).unwrap();
+        assert_eq!(up.overflow, Overflow::CannotOverflow);
+        assert_eq!(up.max_finite, f64::from(f32::MAX));
+        assert_eq!(up.min_subnormal, pow2(-149));
+
+        // The claim is numeric, not a convention: the largest finite source
+        // value sits strictly below the target's overflow threshold.
+        let source = from.float_bounds().unwrap();
+        assert!(source.max_finite < up.overflow_threshold);
+        // And every source subnormal is representable in f32.
+        assert!(source.min_subnormal >= up.min_subnormal);
+    }
+}
+
+#[test]
+fn dtype_bounds_are_the_ieee_754_values() {
+    let f32_bounds = Dtype::F32.float_bounds().unwrap();
+    assert_eq!(f32_bounds.max_finite, f64::from(f32::MAX));
+    assert_eq!(f32_bounds.min_subnormal, pow2(-149));
+    // The midpoint between f32::MAX and 2^128: nothing representable in f32
+    // reaches it, which is what makes an f16/bf16 widening exact.
+    assert_eq!(
+        f32_bounds.overflow_threshold,
+        (f64::from(f32::MAX) + pow2(128)) / 2.0
+    );
+
+    let f16_bounds = Dtype::F16.float_bounds().unwrap();
+    assert_eq!(f16_bounds.max_finite, 65504.0);
+    assert_eq!(f16_bounds.overflow_threshold, 65520.0);
+    assert_eq!(f16_bounds.min_subnormal, pow2(-24));
+
+    let bf16_bounds = Dtype::BF16.float_bounds().unwrap();
+    let bf16_max = 255.0 * pow2(120);
+    assert_eq!(bf16_bounds.max_finite, bf16_max);
+    assert_eq!(bf16_bounds.overflow_threshold, (bf16_max + pow2(128)) / 2.0);
+    assert_eq!(bf16_bounds.min_subnormal, pow2(-133));
+
+    // bf16's maximum finite value is strictly inside f32's: widening cannot
+    // overflow, narrowing can.
+    assert!(bf16_bounds.max_finite < f32_bounds.max_finite);
+
+    // Index dtypes have no floating bounds.
+    assert!(Dtype::U32.float_bounds().is_none());
+}
+
+#[test]
+fn the_cast_contract_and_the_input_gate_agree_across_every_marker_pair() {
+    fn layout_of<M: DtypeMarker>() -> TensorLayout {
+        TensorLayout::row_major(M::DTYPE, Shape::new(&[4]).unwrap()).unwrap()
+    }
+
+    fn assert_agreement<From: DtypeMarker, To: DtypeMarker>() {
+        let contract = Cast::<From, To>::contract().is_ok();
+        let gate = <Cast<From, To> as TensorOp>::check_inputs(&[layout_of::<From>()]).is_ok();
+        assert_eq!(
+            contract,
+            gate,
+            "cast {} -> {} disagrees: contract ok = {contract}, input gate ok = {gate}",
+            From::DTYPE,
+            To::DTYPE
+        );
+    }
+
+    // Exhaustive over the marker set (3 x 3). Indices have no marker, so no
+    // `Cast<U32, _>` can even be named; the taxonomy test pins that refusal.
+    assert_agreement::<F32, F32>();
+    assert_agreement::<F32, F16>();
+    assert_agreement::<F32, BF16>();
+    assert_agreement::<F16, F32>();
+    assert_agreement::<F16, F16>();
+    assert_agreement::<F16, BF16>();
+    assert_agreement::<BF16, F32>();
+    assert_agreement::<BF16, F16>();
+    assert_agreement::<BF16, BF16>();
+
+    // Agreement is not vacuous: exactly the four real conversions pass the
+    // gate, and the identity / mixed-narrowing pairs fail it.
+    assert!(<Cast<F32, F16> as TensorOp>::check_inputs(&[layout_of::<F32>()]).is_ok());
+    assert!(<Cast<F16, F32> as TensorOp>::check_inputs(&[layout_of::<F16>()]).is_ok());
+    assert!(<Cast<F32, BF16> as TensorOp>::check_inputs(&[layout_of::<F32>()]).is_ok());
+    assert!(<Cast<BF16, F32> as TensorOp>::check_inputs(&[layout_of::<BF16>()]).is_ok());
+    assert!(<Cast<F32, F32> as TensorOp>::check_inputs(&[layout_of::<F32>()]).is_err());
+    assert!(<Cast<F16, F16> as TensorOp>::check_inputs(&[layout_of::<F16>()]).is_err());
+    assert!(<Cast<BF16, BF16> as TensorOp>::check_inputs(&[layout_of::<BF16>()]).is_err());
+    assert!(<Cast<F16, BF16> as TensorOp>::check_inputs(&[layout_of::<F16>()]).is_err());
+    assert!(<Cast<BF16, F16> as TensorOp>::check_inputs(&[layout_of::<BF16>()]).is_err());
 }
 
 #[test]
@@ -423,10 +585,10 @@ fn reductions_infer_their_contracted_outputs() {
 
 #[test]
 fn check_inputs_enforces_arity_dtype_and_shape_rule() {
-    let a = TensorLayout::row_major(Dtype::F32, Shape::new(&[2, 3]).unwrap());
-    let b = TensorLayout::row_major(Dtype::F32, Shape::new(&[2, 3]).unwrap());
-    let wide = TensorLayout::row_major(Dtype::F32, Shape::new(&[2, 4]).unwrap());
-    let half = TensorLayout::row_major(Dtype::F16, Shape::new(&[2, 3]).unwrap());
+    let a = TensorLayout::row_major(Dtype::F32, Shape::new(&[2, 3]).unwrap()).unwrap();
+    let b = TensorLayout::row_major(Dtype::F32, Shape::new(&[2, 3]).unwrap()).unwrap();
+    let wide = TensorLayout::row_major(Dtype::F32, Shape::new(&[2, 4]).unwrap()).unwrap();
+    let half = TensorLayout::row_major(Dtype::F16, Shape::new(&[2, 3]).unwrap()).unwrap();
 
     assert!(<Add as TensorOp>::check_inputs(&[a.clone(), b.clone()]).is_ok());
 
@@ -450,8 +612,8 @@ fn check_inputs_enforces_arity_dtype_and_shape_rule() {
         Err(TensorError::BroadcastIncompatible { .. })
     ));
     // Gather indices must be U32.
-    let table = TensorLayout::row_major(Dtype::F32, Shape::new(&[10, 4]).unwrap());
-    let idx = TensorLayout::row_major(Dtype::F32, Shape::new(&[3]).unwrap());
+    let table = TensorLayout::row_major(Dtype::F32, Shape::new(&[10, 4]).unwrap()).unwrap();
+    let idx = TensorLayout::row_major(Dtype::F32, Shape::new(&[3]).unwrap()).unwrap();
     assert!(matches!(
         <Gather as TensorOp>::check_inputs(&[table, idx]),
         Err(TensorError::DtypeMismatch {
@@ -467,7 +629,7 @@ fn layouts_are_row_major_contiguous_only() {
     let shape = Shape::new(&[2, 3]).unwrap();
 
     // Canonical row-major strides for [2,3] are [3,1].
-    let layout = TensorLayout::row_major(Dtype::F32, shape.clone());
+    let layout = TensorLayout::row_major(Dtype::F32, shape.clone()).unwrap();
     assert_eq!(layout.strides().as_slice(), &[3u64, 1]);
     assert!(layout.is_row_major_contiguous());
     assert_eq!(layout.byte_len(), 24);
@@ -486,7 +648,7 @@ fn layouts_are_row_major_contiguous_only() {
 
 #[test]
 fn byte_lengths_must_match_shape_and_dtype() {
-    let layout = TensorLayout::row_major(Dtype::F32, Shape::new(&[2, 3]).unwrap());
+    let layout = TensorLayout::row_major(Dtype::F32, Shape::new(&[2, 3]).unwrap()).unwrap();
 
     assert!(layout.check_byte_len(24).is_ok());
     assert!(matches!(
@@ -498,8 +660,61 @@ fn byte_lengths_must_match_shape_and_dtype() {
         })
     ));
 
-    let half = TensorLayout::row_major(Dtype::F16, Shape::new(&[2, 3]).unwrap());
+    let half = TensorLayout::row_major(Dtype::F16, Shape::new(&[2, 3]).unwrap()).unwrap();
     assert_eq!(half.byte_len(), 12);
+}
+
+#[test]
+fn byte_footprints_that_overflow_u64_are_rejected_not_saturated() {
+    // Reviewer repro (PR #65 round 1): [u32::MAX, u32::MAX] f32 holds
+    // 18_446_744_065_119_617_025 elements (which fits in u64) but would need
+    // 73_786_976_260_478_468_100 bytes (which does not). Saturating to
+    // u64::MAX made that layout accept a byte length it cannot represent.
+    let shape = Shape::new(&[u32::MAX, u32::MAX]).unwrap();
+    assert_eq!(shape.element_count(), 18_446_744_065_119_617_025);
+    assert_eq!(
+        u128::from(shape.element_count()) * 4,
+        73_786_976_260_478_468_100
+    );
+    assert!(shape.element_count().checked_mul(4).is_none());
+
+    assert!(matches!(
+        TensorLayout::row_major(Dtype::F32, shape.clone()),
+        Err(TensorError::ByteLenOverflow {
+            dtype: Dtype::F32,
+            ..
+        })
+    ));
+    // Same shape in a 2-byte dtype: still past u64::MAX / 2.
+    assert!(matches!(
+        TensorLayout::row_major(Dtype::F16, shape),
+        Err(TensorError::ByteLenOverflow {
+            dtype: Dtype::F16,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn a_zero_dimension_is_detected_before_the_product_overflows() {
+    // Reviewer repro (PR #65 round 1): a left-to-right fold overflows on
+    // [MAX, MAX, MAX, 0] before it reaches the zero, while
+    // [0, MAX, MAX, MAX] short-circuits. Both shapes hold zero elements, so
+    // both must construct.
+    let trailing = Shape::new(&[u32::MAX, u32::MAX, u32::MAX, 0]).unwrap();
+    let leading = Shape::new(&[0, u32::MAX, u32::MAX, u32::MAX]).unwrap();
+    assert_eq!(trailing.element_count(), 0);
+    assert_eq!(leading.element_count(), 0);
+
+    // A zero-element layout has a zero-byte footprint, so it is bindable.
+    let layout = TensorLayout::row_major(Dtype::F32, trailing).unwrap();
+    assert_eq!(layout.byte_len(), 0);
+
+    // Without a zero dimension the product genuinely overflows.
+    assert!(matches!(
+        Shape::new(&[u32::MAX, u32::MAX, u32::MAX]),
+        Err(TensorError::ShapeOverflow { .. })
+    ));
 }
 
 #[test]
@@ -524,6 +739,7 @@ fn error_taxonomy_is_exhaustive() {
     fn slug(err: &TensorError) -> &'static str {
         match err {
             TensorError::ShapeOverflow { .. } => "shape_overflow",
+            TensorError::ByteLenOverflow { .. } => "byte_len_overflow",
             TensorError::NonContiguous { .. } => "non_contiguous",
             TensorError::ArityMismatch { .. } => "arity_mismatch",
             TensorError::DtypeMismatch { .. } => "dtype_mismatch",
@@ -536,6 +752,7 @@ fn error_taxonomy_is_exhaustive() {
             TensorError::CastNotDefined { .. } => "cast_not_defined",
             TensorError::ByteLenMismatch { .. } => "byte_len_mismatch",
             TensorError::OutOfBounds { .. } => "out_of_bounds",
+            TensorError::OverlappingEntries { .. } => "overlapping_entries",
             TensorError::ManifestArityMismatch { .. } => "manifest_arity_mismatch",
             TensorError::DeterminismDtypeMismatch { .. } => "determinism_dtype_mismatch",
             TensorError::NonContractDtype { .. } => "non_contract_dtype",
@@ -544,6 +761,10 @@ fn error_taxonomy_is_exhaustive() {
 
     let cases = [
         TensorError::ShapeOverflow { shape: vec![1] },
+        TensorError::ByteLenOverflow {
+            shape: vec![2],
+            dtype: Dtype::F32,
+        },
         TensorError::NonContiguous {
             shape: vec![1],
             strides: vec![1],
@@ -607,6 +828,12 @@ fn error_taxonomy_is_exhaustive() {
             end: 16,
             available: 12,
         },
+        TensorError::OverlappingEntries {
+            first: "a.weight".to_string(),
+            second: "b.weight".to_string(),
+            offset: 0,
+            end: 4,
+        },
         TensorError::ManifestArityMismatch {
             op: "matmul",
             expected: 2,
@@ -624,6 +851,7 @@ fn error_taxonomy_is_exhaustive() {
         slugs,
         vec![
             "shape_overflow",
+            "byte_len_overflow",
             "non_contiguous",
             "arity_mismatch",
             "dtype_mismatch",
@@ -636,6 +864,7 @@ fn error_taxonomy_is_exhaustive() {
             "cast_not_defined",
             "byte_len_mismatch",
             "out_of_bounds",
+            "overlapping_entries",
             "manifest_arity_mismatch",
             "determinism_dtype_mismatch",
             "non_contract_dtype",
