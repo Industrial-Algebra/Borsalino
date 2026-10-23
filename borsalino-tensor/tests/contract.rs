@@ -738,6 +738,7 @@ fn error_taxonomy_is_exhaustive() {
     // moment a variant is added or renamed, which is the point of the test.
     fn slug(err: &TensorError) -> &'static str {
         match err {
+            TensorError::UnalignedOffset { .. } => "unaligned_offset",
             TensorError::ShapeOverflow { .. } => "shape_overflow",
             TensorError::ByteLenOverflow { .. } => "byte_len_overflow",
             TensorError::NonContiguous { .. } => "non_contiguous",

@@ -13,6 +13,7 @@ use borsalino_tensor::error::TensorError;
 use borsalino_tensor::layout::Shape;
 use borsalino_tensor::manifest::{ManifestBinding, bind_to_op, validate_manifest};
 use borsalino_tensor::op::{PortRole, TensorOp};
+use borsalino_tensor::ops::l0::Copy as CopyOp;
 use borsalino_tensor::ops::l0::{Add, Cast, Copy, Gather};
 use borsalino_tensor::ops::l1::Sum;
 use borsalino_tensor::ops::l2::MatMul;
@@ -151,6 +152,40 @@ fn manifest_byte_len_must_match_shape_times_dtype() {
             got: 100,
         })
     );
+}
+
+/// Review r1 P1: an F32 entry whose byte_offset is not 4-byte aligned
+/// must be rejected — WGSL/Vulkan SSBO f32 loads require scalar
+/// alignment, and manifest conformance must imply kernel-readiness.
+/// (The Katakuri co-review asked for this invariant; the public fields
+/// do not guarantee upstream loader validation, so it lives HERE.)
+#[test]
+fn manifest_f32_offsets_must_be_element_aligned() {
+    for bad in [1u64, 2, 3, 5, 6, 7, 9] {
+        let m = manifest(vec![entry("w", &[1], bad, 4)]);
+        match validate_manifest(&m, bad + 4) {
+            Err(TensorError::UnalignedOffset {
+                name,
+                offset,
+                alignment,
+            }) => {
+                assert_eq!(name, "w");
+                assert_eq!(offset, bad);
+                assert_eq!(alignment, 4);
+            }
+            other => panic!("offset {bad} must be rejected as unaligned, got {other:?}"),
+        }
+    }
+}
+
+/// Aligned offsets of the same shapes pass validation and bind.
+#[test]
+fn manifest_aligned_f32_offsets_pass() {
+    for good in [0u64, 4, 8, 12] {
+        let m = manifest(vec![entry("w", &[2], good, 8)]);
+        validate_manifest(&m, good + 8).expect("aligned offset must validate");
+        bind_to_op::<CopyOp>(&m, good + 8).expect("aligned offset must bind");
+    }
 }
 
 #[test]

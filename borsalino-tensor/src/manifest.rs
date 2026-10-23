@@ -122,6 +122,19 @@ pub fn validate_manifest(manifest: &TensorManifest, available: u64) -> Result<()
         let layout = TensorLayout::row_major(dtype, shape)?;
         layout.check_byte_len_named(&entry.name, entry.byte_len)?;
 
+        // Kernel-readiness: a non-element-aligned offset is not
+        // zero-copy consumable (scalar alignment), and the manifest's
+        // public fields do not guarantee upstream loader validation —
+        // conformance is proven HERE (review r1 P1).
+        let alignment = dtype.size_bytes();
+        if entry.byte_offset % alignment != 0 {
+            return Err(TensorError::UnalignedOffset {
+                name: entry.name.clone(),
+                offset: entry.byte_offset,
+                alignment,
+            });
+        }
+
         let end = entry
             .byte_offset
             .checked_add(entry.byte_len)

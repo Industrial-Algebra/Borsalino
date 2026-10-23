@@ -181,6 +181,20 @@ pub enum TensorError {
         got: u64,
     },
 
+    /// A manifest entry's byte offset is not aligned to its dtype's
+    /// element size — the entry is not kernel-consumable zero-copy
+    /// (WGSL/Vulkan SSBO f32 loads require scalar alignment; co-review
+    /// invariant on Katakuri #14, enforced at the consumer boundary).
+    #[error("`{name}` starts at byte {offset}, not {alignment}-byte aligned")]
+    UnalignedOffset {
+        /// The manifest entry's name.
+        name: String,
+        /// The entry's start offset.
+        offset: u64,
+        /// The required alignment in bytes (the dtype's element size).
+        alignment: u64,
+    },
+
     /// A manifest entry's byte span does not fit the data section.
     #[error("`{name}` spans {offset}..{end}, past the {available}-byte data section")]
     OutOfBounds {
