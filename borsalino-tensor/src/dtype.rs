@@ -256,8 +256,9 @@ pub enum SubnormalPolicy {
 /// kernel author reads the semantics from the type instead of guessing at
 /// the hardware's rounding mode. The three threshold fields are the target
 /// dtype's, so a caller can decide what a specific value will do without
-/// implementing rounding: below `max_finite` rounds back to `max_finite`,
-/// from `overflow_threshold` onwards it is infinity, and below half of
+/// implementing rounding: values in the interval between `max_finite` and
+/// `overflow_threshold` round back to `max_finite`, from
+/// `overflow_threshold` onwards the result is infinity, and below half of
 /// `min_subnormal` it is zero.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct CastContract {
