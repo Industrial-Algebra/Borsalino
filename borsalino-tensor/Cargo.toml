@@ -1,0 +1,36 @@
+[package]
+name = "borsalino-tensor"
+# Independent versioning (handover §4.1): the tensor layer is pinned by
+# consumers (Ijima, Quantizon) without forcing Borsalino releases.
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+description = "Typed tensor op-set contract for Borsalino — L0-L2 kernels, no compute at T0"
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+keywords = ["tensor", "compute", "gpu", "inference", "borsalino"]
+categories = ["science", "mathematics"]
+
+# No optional features at T0, matching Borsalino's std-only stance (the
+# substrate has `default = []` and no `std` feature). The crate is the
+# typed contract: there is nothing to gate yet, and a dead `std` flag that
+# no `#![no_std]` path honours would misdescribe the crate.
+
+[dependencies]
+# Central error enum for the taxonomy — IA standard, and the same pin the
+# substrate (Borsalino 0.7.0), Katakuri 0.2.0, and Zunesha 0.1.2 carry.
+thiserror = "2"
+
+# The T0 co-sign partner. Katakuri 0.2.0 publishes its typed layout
+# manifest (`katakuri::manifest`) as a *proposal* that this crate reviews
+# and consumes; without the dep there is no interop proof. A version dep,
+# not a path dep: 0.2.0 is on crates.io (the repo convention — Borsalino's
+# own `karpal-verify` — is "path only as a local override"), and a path
+# dep would make the crate unpublishable. Katakuri's transitive `zunesha`
+# is inert here: the manifest is data, buffer binding is the consumer's
+# concern, and this crate names no `zunesha` type.
+katakuri = "0.2.0"
+
+# Declare nothing else. Every addition needs a written justification at
+# introduction (handover §8) — no pre-declared dependencies.
