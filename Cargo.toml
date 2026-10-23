@@ -1,13 +1,29 @@
 [package]
 name = "borsalino"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Thin GPU compute abstraction — Metal and Vulkan backends for Industrial Algebra"
+license.workspace = true
+repository.workspace = true
+keywords = ["gpu", "compute", "metal", "vulkan", "shader"]
+categories = ["hardware-support", "mathematics"]
+
+# The workspace root is Borsalino itself (package + workspace in one
+# manifest, karpal-style): the substrate keeps its single-crate shape and
+# the tensor extension is a sibling member. Resolver 3 is what edition 2024
+# already implies for this package — stated explicitly so the workspace
+# resolves the same way it did before the member was added.
+[workspace]
+members = ["borsalino-tensor"]
+resolver = "3"
+
+[workspace.package]
 version = "0.7.0"
 edition = "2024"
 rust-version = "1.85"
-description = "Thin GPU compute abstraction — Metal and Vulkan backends for Industrial Algebra"
 license = "Apache-2.0"
 repository = "https://github.com/industrial-algebra/Borsalino"
-keywords = ["gpu", "compute", "metal", "vulkan", "shader"]
-categories = ["hardware-support", "mathematics"]
 
 # Register Kani verifier cfg flag (set by `cargo kani`)
 [lints.rust]

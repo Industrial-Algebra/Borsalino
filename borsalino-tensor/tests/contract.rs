@@ -1,0 +1,647 @@
+// Copyright (C) 2026 Industrial Algebra
+// SPDX-License-Identifier: Apache-2.0
+
+//! T0 typed op-set contract tests (RED-first).
+//!
+//! The contract *is* the deliverable at T0: no kernel exists, so every
+//! assertion here pins a type, a constant, or a rejected shape. The
+//! inventory assertions mirror handover §3 one op at a time; the shape
+//! assertions pin the rules a T1/T2 implementation must satisfy.
+
+use borsalino_tensor::dtype::{
+    BF16, CastContract, Dtype, F16, F32, Overflow, Roundtrip, SubnormalPolicy,
+};
+use borsalino_tensor::error::TensorError;
+use borsalino_tensor::layout::{Shape, Strides, TensorLayout};
+use borsalino_tensor::op::{DeterminismClass, OpLevel, PortRole, PortSpec, ShapeRule, TensorOp};
+use borsalino_tensor::ops::l0::{Add, BroadcastDiv, Cast, Copy, Gather, Mul};
+use borsalino_tensor::ops::l1::{MaskedMean, Max, RowwiseL2Norm, Sum};
+use borsalino_tensor::ops::l2::{BatchedMatMul, MatMul};
+
+fn header<O: TensorOp>() -> (&'static str, OpLevel, usize) {
+    (O::NAME, O::LEVEL, O::INPUTS.len())
+}
+
+#[test]
+fn l0_inventory_matches_the_handover() {
+    // Handover §3 L0: copy, cast, add, mul, broadcast_div, gather.
+    let inventory = [
+        header::<Copy>(),
+        header::<Cast<F32, F16>>(),
+        header::<Add>(),
+        header::<Mul>(),
+        header::<BroadcastDiv>(),
+        header::<Gather>(),
+    ];
+
+    assert_eq!(
+        inventory,
+        [
+            ("copy", OpLevel::L0, 1),
+            ("cast", OpLevel::L0, 1),
+            ("add", OpLevel::L0, 2),
+            ("mul", OpLevel::L0, 2),
+            ("broadcast_div", OpLevel::L0, 2),
+            ("gather", OpLevel::L0, 2),
+        ]
+    );
+}
+
+#[test]
+fn l1_inventory_matches_the_handover() {
+    // Handover §3 L1: sum, attention-masked mean, L2 norm, max.
+    let inventory = [
+        header::<Sum>(),
+        header::<MaskedMean>(),
+        header::<RowwiseL2Norm>(),
+        header::<Max>(),
+    ];
+
+    assert_eq!(
+        inventory,
+        [
+            ("sum", OpLevel::L1, 1),
+            ("masked_mean", OpLevel::L1, 2),
+            ("rowwise_l2_norm", OpLevel::L1, 1),
+            ("max", OpLevel::L1, 1),
+        ]
+    );
+}
+
+#[test]
+fn l2_inventory_matches_the_handover() {
+    // Handover §3 L2: matmul (2D), batched matmul [B,H,S,D].
+    let inventory = [header::<MatMul>(), header::<BatchedMatMul>()];
+
+    assert_eq!(
+        inventory,
+        [
+            ("matmul", OpLevel::L2, 2),
+            ("batched_matmul", OpLevel::L2, 2)
+        ]
+    );
+}
+
+#[test]
+fn determinism_classes_are_per_level() {
+    // Elementwise/cast work is bit-exact by construction.
+    for class in [
+        <Copy as TensorOp>::DETERMINISM,
+        <Cast<F32, F16> as TensorOp>::DETERMINISM,
+        <Add as TensorOp>::DETERMINISM,
+        <Mul as TensorOp>::DETERMINISM,
+        <BroadcastDiv as TensorOp>::DETERMINISM,
+        <Gather as TensorOp>::DETERMINISM,
+    ] {
+        assert_eq!(class, DeterminismClass::BitExact);
+    }
+
+    // Reductions are determinism-sensitive (handover §3 L1).
+    for class in [
+        <Sum as TensorOp>::DETERMINISM,
+        <MaskedMean as TensorOp>::DETERMINISM,
+        <RowwiseL2Norm as TensorOp>::DETERMINISM,
+        <Max as TensorOp>::DETERMINISM,
+    ] {
+        assert_eq!(class, DeterminismClass::FixedOrderReduction);
+    }
+
+    // GEMM carries its own fixed tiling order.
+    for class in [
+        <MatMul as TensorOp>::DETERMINISM,
+        <BatchedMatMul as TensorOp>::DETERMINISM,
+    ] {
+        assert_eq!(class, DeterminismClass::FixedOrderGemm);
+    }
+}
+
+#[test]
+fn f32_is_the_only_operand_dtype() {
+    // Every operand port of every non-cast op is f32 (handover §4.3).
+    let port_sets: [&'static [PortSpec]; 11] = [
+        <Copy as TensorOp>::INPUTS,
+        <Add as TensorOp>::INPUTS,
+        <Mul as TensorOp>::INPUTS,
+        <BroadcastDiv as TensorOp>::INPUTS,
+        <Gather as TensorOp>::INPUTS,
+        <Sum as TensorOp>::INPUTS,
+        <MaskedMean as TensorOp>::INPUTS,
+        <RowwiseL2Norm as TensorOp>::INPUTS,
+        <Max as TensorOp>::INPUTS,
+        <MatMul as TensorOp>::INPUTS,
+        <BatchedMatMul as TensorOp>::INPUTS,
+    ];
+
+    for ports in port_sets {
+        for port in ports {
+            if port.role == PortRole::Indices {
+                assert_eq!(port.dtype, Dtype::U32);
+                assert!(port.dtype.is_index());
+            } else {
+                assert_eq!(port.dtype, Dtype::F32);
+            }
+        }
+    }
+
+    // Outputs of every op are f32 except the narrowing cast.
+    assert_eq!(<Cast<F32, F16> as TensorOp>::OUTPUT.dtype, Dtype::F16);
+    assert_eq!(<Cast<F16, F32> as TensorOp>::OUTPUT.dtype, Dtype::F32);
+    assert_eq!(<Cast<F32, BF16> as TensorOp>::OUTPUT.dtype, Dtype::BF16);
+}
+
+#[test]
+fn gather_takes_u32_indices_on_its_second_port() {
+    let ports = <Gather as TensorOp>::INPUTS;
+
+    assert_eq!(ports[0], PortSpec::f32());
+    assert_eq!(ports[1], PortSpec::indices());
+    assert_eq!(ports[1].dtype, Dtype::U32);
+    assert_eq!(ports[1].role, PortRole::Indices);
+    assert_eq!(<Gather as TensorOp>::OUTPUT, PortSpec::f32());
+}
+
+#[test]
+fn cast_is_the_only_explicit_dtype_conversion() {
+    // Typed markers carry the dtype through the op type itself.
+    assert_eq!(<Cast<F32, F16> as TensorOp>::INPUTS[0].dtype, Dtype::F32);
+    assert_eq!(<Cast<F32, F16> as TensorOp>::OUTPUT.dtype, Dtype::F16);
+    assert_eq!(<Cast<F16, F32> as TensorOp>::INPUTS[0].dtype, Dtype::F16);
+    assert_eq!(<Cast<F16, F32> as TensorOp>::OUTPUT.dtype, Dtype::F32);
+}
+
+#[test]
+fn narrowing_casts_document_roundtrip_semantics() {
+    // f32 -> f16: round-to-nearest-even, overflow saturates to infinity,
+    // f32 subnormals fall below f16's minimum subnormal.
+    let down = CastContract::for_dtypes(Dtype::F32, Dtype::F16).unwrap();
+    assert_eq!(down.from, Dtype::F32);
+    assert_eq!(down.to, Dtype::F16);
+    assert_eq!(down.roundtrip, Roundtrip::HalfUlpInexact);
+    assert_eq!(down.overflow, Overflow::ToInfinity);
+    assert_eq!(down.subnormals, SubnormalPolicy::FlushesToZero);
+
+    // f32 -> bf16: bf16 shares f32's exponent range, so it cannot overflow;
+    // the mantissa narrows to 7 bits. Very small f32 subnormals still fall
+    // below bf16's minimum subnormal.
+    let down = CastContract::for_dtypes(Dtype::F32, Dtype::BF16).unwrap();
+    assert_eq!(down.roundtrip, Roundtrip::HalfUlpInexact);
+    assert_eq!(down.overflow, Overflow::CannotOverflow);
+    assert_eq!(down.subnormals, SubnormalPolicy::FlushesToZero);
+
+    // Widening is exact in both directions.
+    for (from, to) in [(Dtype::F16, Dtype::F32), (Dtype::BF16, Dtype::F32)] {
+        let up = CastContract::for_dtypes(from, to).unwrap();
+        assert_eq!(up.roundtrip, Roundtrip::Exact);
+        assert_eq!(up.overflow, Overflow::CannotOverflow);
+        assert_eq!(up.subnormals, SubnormalPolicy::Preserved);
+    }
+
+    // The typed op exposes the same contract.
+    assert_eq!(
+        Cast::<F32, F16>::contract().unwrap().roundtrip,
+        Roundtrip::HalfUlpInexact
+    );
+    assert_eq!(
+        Cast::<F16, F32>::contract().unwrap().roundtrip,
+        Roundtrip::Exact
+    );
+}
+
+#[test]
+fn identity_and_non_float_casts_are_not_defined() {
+    // f32 -> f32 is `copy`, never a cast.
+    assert!(matches!(
+        CastContract::for_dtypes(Dtype::F32, Dtype::F32),
+        Err(TensorError::CastNotDefined { .. })
+    ));
+    // f16 -> bf16 is two-step: widen to f32, then narrow explicitly.
+    assert!(matches!(
+        CastContract::for_dtypes(Dtype::F16, Dtype::BF16),
+        Err(TensorError::CastNotDefined { .. })
+    ));
+    // Indices are not a cast target.
+    assert!(matches!(
+        CastContract::for_dtypes(Dtype::F32, Dtype::U32),
+        Err(TensorError::CastNotDefined { .. })
+    ));
+}
+
+#[test]
+fn dtype_inventory_excludes_f64() {
+    // Handover §3 NOT-scope: f64 exactness is Amari's layer.
+    let names: Vec<&'static str> = Dtype::ALL.iter().map(|d| d.name()).collect();
+    assert_eq!(names, vec!["f32", "f16", "bf16", "u32"]);
+
+    assert_eq!(Dtype::F32.size_bytes(), 4);
+    assert_eq!(Dtype::F16.size_bytes(), 2);
+    assert_eq!(Dtype::BF16.size_bytes(), 2);
+    assert_eq!(Dtype::U32.size_bytes(), 4);
+
+    assert!(Dtype::F32.is_contract());
+    assert!(!Dtype::F16.is_contract());
+    assert!(!Dtype::BF16.is_contract());
+    assert!(!Dtype::U32.is_contract());
+}
+
+#[test]
+fn matmul_infers_the_projection_shape() {
+    let lhs = Shape::new(&[4, 8]).unwrap();
+    let rhs = Shape::new(&[8, 16]).unwrap();
+
+    let out = <MatMul as TensorOp>::infer_shape(&[&lhs, &rhs]).unwrap();
+    assert_eq!(out, Shape::new(&[4, 16]).unwrap());
+    assert!(
+        <MatMul as TensorOp>::SHAPE_RULE
+            .check(<MatMul as TensorOp>::NAME, &[&lhs, &rhs], &out)
+            .is_ok()
+    );
+
+    // A declared output that disagrees with the rule is rejected.
+    assert!(matches!(
+        <MatMul as TensorOp>::SHAPE_RULE.check(
+            "matmul",
+            &[&lhs, &rhs],
+            &Shape::new(&[4, 15]).unwrap()
+        ),
+        Err(TensorError::OutputShapeMismatch { .. })
+    ));
+}
+
+#[test]
+fn matmul_rejects_disagreeing_inner_dimensions() {
+    let lhs = Shape::new(&[4, 8]).unwrap();
+    let rhs = Shape::new(&[9, 16]).unwrap();
+
+    assert!(matches!(
+        <MatMul as TensorOp>::infer_shape(&[&lhs, &rhs]),
+        Err(TensorError::InnerDimensionMismatch { lhs: 8, rhs: 9, .. })
+    ));
+}
+
+#[test]
+fn batched_matmul_carries_four_dimensions() {
+    // [B,H,S,D] x [B,H,D,T] -> [B,H,S,T] (attention projections).
+    let q = Shape::new(&[2, 4, 16, 64]).unwrap();
+    let k = Shape::new(&[2, 4, 64, 16]).unwrap();
+
+    let out = <BatchedMatMul as TensorOp>::infer_shape(&[&q, &k]).unwrap();
+    assert_eq!(out, Shape::new(&[2, 4, 16, 16]).unwrap());
+}
+
+#[test]
+fn batched_matmul_rejects_batch_and_rank_mismatches() {
+    let a = Shape::new(&[2, 4, 16, 64]).unwrap();
+    let bad_batch = Shape::new(&[3, 4, 64, 16]).unwrap();
+    let bad_head = Shape::new(&[2, 5, 64, 16]).unwrap();
+    let rank_three = Shape::new(&[4, 64, 16]).unwrap();
+
+    assert!(matches!(
+        <BatchedMatMul as TensorOp>::infer_shape(&[&a, &bad_batch]),
+        Err(TensorError::BatchDimensionMismatch { .. })
+    ));
+    assert!(matches!(
+        <BatchedMatMul as TensorOp>::infer_shape(&[&a, &bad_head]),
+        Err(TensorError::BatchDimensionMismatch { .. })
+    ));
+    assert!(matches!(
+        <BatchedMatMul as TensorOp>::infer_shape(&[&a, &rank_three]),
+        Err(TensorError::RankMismatch { .. })
+    ));
+}
+
+#[test]
+fn empty_batch_and_head_dimensions_are_legal() {
+    // Handover §5: empty batch/head dims are an adversarial shape class,
+    // not an invalidity — they must infer, not error.
+    let a = Shape::new(&[0, 4, 16, 64]).unwrap();
+    let b = Shape::new(&[0, 4, 64, 16]).unwrap();
+    let out = <BatchedMatMul as TensorOp>::infer_shape(&[&a, &b]).unwrap();
+    assert_eq!(out, Shape::new(&[0, 4, 16, 16]).unwrap());
+    assert_eq!(out.element_count(), 0);
+}
+
+#[test]
+fn elementwise_ops_broadcast_like_numpy() {
+    let row = Shape::new(&[1, 4]).unwrap();
+    let col = Shape::new(&[3, 1]).unwrap();
+    let out = <Add as TensorOp>::infer_shape(&[&row, &col]).unwrap();
+    assert_eq!(out, Shape::new(&[3, 4]).unwrap());
+
+    // Different ranks align on the trailing dimension.
+    let a = Shape::new(&[3, 1, 4]).unwrap();
+    let b = Shape::new(&[4]).unwrap();
+    let out = <Mul as TensorOp>::infer_shape(&[&a, &b]).unwrap();
+    assert_eq!(out, Shape::new(&[3, 1, 4]).unwrap());
+
+    // Scalar broadcast.
+    let s = Shape::new(&[]).unwrap();
+    let out = <BroadcastDiv as TensorOp>::infer_shape(&[&row, &s]).unwrap();
+    assert_eq!(out, row);
+}
+
+#[test]
+fn elementwise_ops_reject_incompatible_broadcasts() {
+    let a = Shape::new(&[2, 4]).unwrap();
+    let b = Shape::new(&[3, 4]).unwrap();
+
+    assert!(matches!(
+        <Add as TensorOp>::infer_shape(&[&a, &b]),
+        Err(TensorError::BroadcastIncompatible { .. })
+    ));
+    assert!(matches!(
+        <BroadcastDiv as TensorOp>::infer_shape(&[&a, &b]),
+        Err(TensorError::BroadcastIncompatible { .. })
+    ));
+}
+
+#[test]
+fn same_shape_ops_do_not_broadcast() {
+    // `add`/`mul` are declared broadcast-capable; `copy` is identity.
+    assert_eq!(<Copy as TensorOp>::SHAPE_RULE, ShapeRule::Identity);
+    assert_eq!(<Add as TensorOp>::SHAPE_RULE, ShapeRule::Broadcast);
+    assert_eq!(<Mul as TensorOp>::SHAPE_RULE, ShapeRule::Broadcast);
+    assert_eq!(<BroadcastDiv as TensorOp>::SHAPE_RULE, ShapeRule::Broadcast);
+}
+
+#[test]
+fn gather_looks_up_table_rows() {
+    // table [V,D] + indices [N] -> [N,D] (embedding lookup).
+    let table = Shape::new(&[10, 4]).unwrap();
+    let indices = Shape::new(&[3]).unwrap();
+    let out = <Gather as TensorOp>::infer_shape(&[&table, &indices]).unwrap();
+    assert_eq!(out, Shape::new(&[3, 4]).unwrap());
+
+    // A 1-D table is not the embedding shape.
+    let flat = Shape::new(&[10]).unwrap();
+    assert!(matches!(
+        <Gather as TensorOp>::infer_shape(&[&flat, &indices]),
+        Err(TensorError::RankMismatch { .. })
+    ));
+    // Scalar indices are not accepted at T0.
+    let scalar = Shape::new(&[]).unwrap();
+    assert!(matches!(
+        <Gather as TensorOp>::infer_shape(&[&table, &scalar]),
+        Err(TensorError::RankMismatch { .. })
+    ));
+}
+
+#[test]
+fn reductions_infer_their_contracted_outputs() {
+    let scalar = Shape::new(&[]).unwrap();
+
+    // Full reductions collapse to a rank-0 scalar.
+    let tokens = Shape::new(&[2, 7, 4]).unwrap();
+    assert_eq!(<Sum as TensorOp>::infer_shape(&[&tokens]).unwrap(), scalar);
+    assert_eq!(<Max as TensorOp>::infer_shape(&[&tokens]).unwrap(), scalar);
+
+    // Rowwise L2 norm: [R,D] -> [R].
+    let rows = Shape::new(&[3, 5]).unwrap();
+    assert_eq!(
+        <RowwiseL2Norm as TensorOp>::infer_shape(&[&rows]).unwrap(),
+        Shape::new(&[3]).unwrap()
+    );
+
+    // Attention-masked mean pools the token axis: [B,S,D] + [B,S] -> [B,D].
+    let values = Shape::new(&[2, 7, 4]).unwrap();
+    let mask = Shape::new(&[2, 7]).unwrap();
+    assert_eq!(
+        <MaskedMean as TensorOp>::infer_shape(&[&values, &mask]).unwrap(),
+        Shape::new(&[2, 4]).unwrap()
+    );
+
+    // Mask rank must be the token axis only.
+    assert!(matches!(
+        <MaskedMean as TensorOp>::infer_shape(&[&values, &Shape::new(&[7]).unwrap()]),
+        Err(TensorError::RankMismatch { .. })
+    ));
+    // Mask batch must agree with the values batch.
+    assert!(matches!(
+        <MaskedMean as TensorOp>::infer_shape(&[&values, &Shape::new(&[3, 7]).unwrap()]),
+        Err(TensorError::BatchDimensionMismatch { .. })
+    ));
+}
+
+#[test]
+fn check_inputs_enforces_arity_dtype_and_shape_rule() {
+    let a = TensorLayout::row_major(Dtype::F32, Shape::new(&[2, 3]).unwrap());
+    let b = TensorLayout::row_major(Dtype::F32, Shape::new(&[2, 3]).unwrap());
+    let wide = TensorLayout::row_major(Dtype::F32, Shape::new(&[2, 4]).unwrap());
+    let half = TensorLayout::row_major(Dtype::F16, Shape::new(&[2, 3]).unwrap());
+
+    assert!(<Add as TensorOp>::check_inputs(&[a.clone(), b.clone()]).is_ok());
+
+    // Arity.
+    assert!(matches!(
+        <Add as TensorOp>::check_inputs(std::slice::from_ref(&a)),
+        Err(TensorError::ArityMismatch {
+            expected: 2,
+            got: 1,
+            ..
+        })
+    ));
+    // Dtype policy: f16 never enters f32 arithmetic silently.
+    assert!(matches!(
+        <Add as TensorOp>::check_inputs(&[a.clone(), half.clone()]),
+        Err(TensorError::DtypeMismatch { port: 1, .. })
+    ));
+    // Shape rule: [2,3] + [2,4] does not broadcast.
+    assert!(matches!(
+        <Add as TensorOp>::check_inputs(&[a.clone(), wide]),
+        Err(TensorError::BroadcastIncompatible { .. })
+    ));
+    // Gather indices must be U32.
+    let table = TensorLayout::row_major(Dtype::F32, Shape::new(&[10, 4]).unwrap());
+    let idx = TensorLayout::row_major(Dtype::F32, Shape::new(&[3]).unwrap());
+    assert!(matches!(
+        <Gather as TensorOp>::check_inputs(&[table, idx]),
+        Err(TensorError::DtypeMismatch {
+            port: 1,
+            expected: Dtype::U32,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn layouts_are_row_major_contiguous_only() {
+    let shape = Shape::new(&[2, 3]).unwrap();
+
+    // Canonical row-major strides for [2,3] are [3,1].
+    let layout = TensorLayout::row_major(Dtype::F32, shape.clone());
+    assert_eq!(layout.strides().as_slice(), &[3u64, 1]);
+    assert!(layout.is_row_major_contiguous());
+    assert_eq!(layout.byte_len(), 24);
+
+    assert!(TensorLayout::new(Dtype::F32, shape.clone(), Strides::new(&[3, 1])).is_ok());
+    // Padded / transposed strides are rejected at the contract boundary.
+    assert!(matches!(
+        TensorLayout::new(Dtype::F32, shape.clone(), Strides::new(&[4, 1])),
+        Err(TensorError::NonContiguous { .. })
+    ));
+    assert!(matches!(
+        TensorLayout::new(Dtype::F32, shape, Strides::new(&[1, 2])),
+        Err(TensorError::NonContiguous { .. })
+    ));
+}
+
+#[test]
+fn byte_lengths_must_match_shape_and_dtype() {
+    let layout = TensorLayout::row_major(Dtype::F32, Shape::new(&[2, 3]).unwrap());
+
+    assert!(layout.check_byte_len(24).is_ok());
+    assert!(matches!(
+        layout.check_byte_len(20),
+        Err(TensorError::ByteLenMismatch {
+            expected: 24,
+            got: 20,
+            ..
+        })
+    ));
+
+    let half = TensorLayout::row_major(Dtype::F16, Shape::new(&[2, 3]).unwrap());
+    assert_eq!(half.byte_len(), 12);
+}
+
+#[test]
+fn shape_element_counts_are_overflow_checked() {
+    let huge = [u32::MAX, u32::MAX, u32::MAX];
+    assert!(matches!(
+        Shape::new(&huge),
+        Err(TensorError::ShapeOverflow { .. })
+    ));
+
+    // A zero dimension is legal and yields a zero count.
+    let empty = Shape::new(&[0, 4]).unwrap();
+    assert_eq!(empty.element_count(), 0);
+    assert!(!empty.is_scalar());
+    assert!(Shape::new(&[]).unwrap().is_scalar());
+}
+
+#[test]
+fn error_taxonomy_is_exhaustive() {
+    // One constructed value per variant: the match below stops compiling the
+    // moment a variant is added or renamed, which is the point of the test.
+    fn slug(err: &TensorError) -> &'static str {
+        match err {
+            TensorError::ShapeOverflow { .. } => "shape_overflow",
+            TensorError::NonContiguous { .. } => "non_contiguous",
+            TensorError::ArityMismatch { .. } => "arity_mismatch",
+            TensorError::DtypeMismatch { .. } => "dtype_mismatch",
+            TensorError::RankMismatch { .. } => "rank_mismatch",
+            TensorError::InnerDimensionMismatch { .. } => "inner_dimension_mismatch",
+            TensorError::BatchDimensionMismatch { .. } => "batch_dimension_mismatch",
+            TensorError::BroadcastIncompatible { .. } => "broadcast_incompatible",
+            TensorError::OutputShapeMismatch { .. } => "output_shape_mismatch",
+            TensorError::AxisOutOfRange { .. } => "axis_out_of_range",
+            TensorError::CastNotDefined { .. } => "cast_not_defined",
+            TensorError::ByteLenMismatch { .. } => "byte_len_mismatch",
+            TensorError::OutOfBounds { .. } => "out_of_bounds",
+            TensorError::ManifestArityMismatch { .. } => "manifest_arity_mismatch",
+            TensorError::DeterminismDtypeMismatch { .. } => "determinism_dtype_mismatch",
+            TensorError::NonContractDtype { .. } => "non_contract_dtype",
+        }
+    }
+
+    let cases = [
+        TensorError::ShapeOverflow { shape: vec![1] },
+        TensorError::NonContiguous {
+            shape: vec![1],
+            strides: vec![1],
+        },
+        TensorError::ArityMismatch {
+            op: "add",
+            expected: 2,
+            got: 1,
+        },
+        TensorError::DtypeMismatch {
+            op: "add",
+            port: 0,
+            expected: Dtype::F32,
+            got: Dtype::F16,
+        },
+        TensorError::RankMismatch {
+            op: "matmul",
+            port: 0,
+            expected: "rank 2",
+            got: 3,
+        },
+        TensorError::InnerDimensionMismatch {
+            op: "matmul",
+            lhs: 8,
+            rhs: 9,
+        },
+        TensorError::BatchDimensionMismatch {
+            op: "batched_matmul",
+            lhs: vec![2],
+            rhs: vec![3],
+        },
+        TensorError::BroadcastIncompatible {
+            op: "add",
+            lhs: vec![2],
+            rhs: vec![3],
+        },
+        TensorError::OutputShapeMismatch {
+            op: "copy",
+            expected: vec![1],
+            got: vec![2],
+        },
+        TensorError::AxisOutOfRange {
+            op: "sum",
+            axis: 3,
+            rank: 2,
+        },
+        TensorError::CastNotDefined {
+            from: Dtype::F32,
+            to: Dtype::F32,
+        },
+        TensorError::ByteLenMismatch {
+            name: "w".to_string(),
+            shape: vec![2],
+            dtype: Dtype::F32,
+            expected: 8,
+            got: 4,
+        },
+        TensorError::OutOfBounds {
+            name: "w".to_string(),
+            offset: 8,
+            end: 16,
+            available: 12,
+        },
+        TensorError::ManifestArityMismatch {
+            op: "matmul",
+            expected: 2,
+            got: 1,
+        },
+        TensorError::DeterminismDtypeMismatch {
+            pinned: Dtype::F32,
+            manifest: Dtype::F16,
+        },
+        TensorError::NonContractDtype { got: Dtype::F16 },
+    ];
+
+    let slugs: Vec<&'static str> = cases.iter().map(slug).collect();
+    assert_eq!(
+        slugs,
+        vec![
+            "shape_overflow",
+            "non_contiguous",
+            "arity_mismatch",
+            "dtype_mismatch",
+            "rank_mismatch",
+            "inner_dimension_mismatch",
+            "batch_dimension_mismatch",
+            "broadcast_incompatible",
+            "output_shape_mismatch",
+            "axis_out_of_range",
+            "cast_not_defined",
+            "byte_len_mismatch",
+            "out_of_bounds",
+            "manifest_arity_mismatch",
+            "determinism_dtype_mismatch",
+            "non_contract_dtype",
+        ]
+    );
+
+    // Errors render with the op name, not a bare "invalid argument".
+    assert!(cases[2].to_string().contains("add"));
+}
