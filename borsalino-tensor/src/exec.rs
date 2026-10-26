@@ -202,6 +202,21 @@ pub fn check_output<O: TensorOp + ?Sized>(shape: &Shape, len: usize) -> Result<(
     }
 }
 
+/// Whether an inferred output holds no elements, so there is nothing to
+/// compute and nothing to write.
+///
+/// This is an early exit taken **after** the gate, not a shortcut around it:
+/// arity, dtypes, the shape rule, every operand span, the output length, and
+/// finiteness have all been checked by the time an implementation consults
+/// it. Without it a legal shape whose output is empty still walks the
+/// declared dimensions — `[u32::MAX, u32::MAX, 0, 0]` is a legal
+/// batched-GEMM shape, and its batch loop would iterate 2^64 times over
+/// nothing.
+#[must_use]
+pub fn writes_nothing(shape: &Shape) -> bool {
+    shape.element_count() == 0
+}
+
 /// Reject a float operand that contains a NaN or an infinity.
 ///
 /// The nonfinite policy (handover §5, Amari's W3 wish): non-finite data is

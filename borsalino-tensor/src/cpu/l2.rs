@@ -17,7 +17,9 @@
 //! (`m == 0`, `n == 0`, an empty batch or head) write nothing at all.
 
 use crate::error::TensorError;
-use crate::exec::{Executable, View, check_output, check_span, require_finite, validate};
+use crate::exec::{
+    Executable, View, check_output, check_span, require_finite, validate, writes_nothing,
+};
 use crate::ops::l2::{BatchedMatMul, MatMul};
 
 impl Executable for MatMul {
@@ -34,6 +36,9 @@ impl Executable for MatMul {
         check_output::<Self>(&out_shape, output.len())?;
         require_finite::<Self>(0, lhs.data)?;
         require_finite::<Self>(1, rhs.data)?;
+        if writes_nothing(&out_shape) {
+            return Ok(());
+        }
 
         let m = lhs.layout.shape().dims()[0] as usize;
         let k = lhs.layout.shape().dims()[1] as usize;
@@ -57,6 +62,12 @@ impl Executable for BatchedMatMul {
         check_output::<Self>(&out_shape, output.len())?;
         require_finite::<Self>(0, lhs.data)?;
         require_finite::<Self>(1, rhs.data)?;
+        // `[u32::MAX, u32::MAX, 0, 0]` is a legal shape pair: an empty output
+        // reached through an enormous batch. Skipping the batch loop is what
+        // keeps the call proportional to the work it actually has.
+        if writes_nothing(&out_shape) {
+            return Ok(());
+        }
 
         let batch = lhs.layout.shape().dims()[0] as usize;
         let heads = lhs.layout.shape().dims()[1] as usize;

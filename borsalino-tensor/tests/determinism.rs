@@ -274,3 +274,71 @@ fn check_expected_rejects_a_length_mismatch() {
         &[1.0, 2.0],
     );
 }
+
+#[test]
+#[should_panic(expected = "was never written")]
+fn the_harness_rejects_a_candidate_that_writes_nothing() {
+    // The reference legitimately writes zeros. If both buffers started
+    // zeroed, "wrote nothing" would be indistinguishable from "wrote
+    // zeros" — so each side is poisoned with its own pattern instead.
+    let _ = check_bit_identical(
+        3,
+        |out: &mut [f32]| {
+            out.fill(0.0);
+            Ok(())
+        },
+        |_out: &mut [f32]| Ok(()),
+    );
+}
+
+#[test]
+#[should_panic(expected = "was never written")]
+fn the_harness_rejects_two_implementations_that_write_nothing() {
+    // Even when both sides leave the buffer untouched the harness must not
+    // agree: an op that writes nothing has not executed. The two poison
+    // patterns are distinct precisely so this case fails loudly.
+    let _ = check_bit_identical(2, |_out: &mut [f32]| Ok(()), |_out: &mut [f32]| Ok(()));
+}
+
+#[test]
+#[should_panic(expected = "was never written")]
+fn the_harness_rejects_a_candidate_that_writes_only_some_elements() {
+    let _ = check_bit_identical(
+        3,
+        |out: &mut [f32]| {
+            out.fill(2.5);
+            Ok(())
+        },
+        |out: &mut [f32]| {
+            out[0] = 2.5;
+            out[1] = 2.5;
+            Ok(())
+        },
+    );
+}
+
+#[test]
+fn the_harness_accepts_a_candidate_that_writes_every_element() {
+    // The poisoning must not make a correct run look wrong — including a run
+    // whose legitimate output *is* zero.
+    let output = check_bit_identical(
+        2,
+        |out: &mut [f32]| {
+            out.fill(0.0);
+            Ok(())
+        },
+        |out: &mut [f32]| {
+            out.fill(0.0);
+            Ok(())
+        },
+    )
+    .expect("both sides wrote every element");
+
+    assert_eq!(bits(&output), bits(&[0.0, 0.0]));
+}
+
+#[test]
+#[should_panic(expected = "was never written")]
+fn check_expected_rejects_a_run_that_writes_nothing() {
+    let _ = check_expected(2, |_out: &mut [f32]| Ok(()), &[1.0, 2.0]);
+}
