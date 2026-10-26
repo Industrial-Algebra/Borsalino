@@ -18,10 +18,10 @@ mod common;
 use borsalino_tensor::dtype::{F16, F32};
 use borsalino_tensor::error::TensorError;
 use borsalino_tensor::exec::{Executable, View};
-use borsalino_tensor::ops::l0::Cast;
+use borsalino_tensor::ops::l0::{Cast, Copy};
 use borsalino_tensor::ops::l1::{MaskedMean, Max, Sum};
 use borsalino_tensor::ops::l2::MatMul;
-use borsalino_tensor::oracle::{check_bit_identical, check_expected};
+use borsalino_tensor::oracle::{Bits, check_bit_identical, check_expected};
 use common::{bits, f32_layout, view};
 
 /// A fixture that exercises every op below: a 3x5 operand, a 5x2 one.
@@ -341,4 +341,109 @@ fn the_harness_accepts_a_candidate_that_writes_every_element() {
 #[should_panic(expected = "was never written")]
 fn check_expected_rejects_a_run_that_writes_nothing() {
     let _ = check_expected(2, |_out: &mut [f32]| Ok(()), &[1.0, 2.0]);
+}
+
+#[test]
+fn a_correct_output_that_collides_with_the_candidate_sentinel_still_passes() {
+    // Reviewer repro (round 2): the harness's candidate poison is a finite
+    // f32 bit pattern, so a *correct* output whose bits happen to equal it
+    // was reported as "never written" — a false verdict on a real result.
+    // The verdict must be the comparison, not the sentinel.
+    let source = f32_layout(&[2]);
+    let values = [f32::from_bits(0xdead_bee0), f32::from_bits(0xdead_beef)];
+
+    let output = check_bit_identical(
+        2,
+        |out: &mut [f32]| Copy::execute(view(&source, &values), out),
+        |out: &mut [f32]| Copy::execute(view(&source, &values), out),
+    )
+    .expect("agreement is the verdict, whatever the bytes are");
+
+    assert_eq!(bits(&output), bits(&values));
+}
+
+#[test]
+fn a_correct_output_that_collides_with_the_current_sentinel_still_passes() {
+    // The same class at the harness level: both sides agree on the exact bit
+    // pattern the candidate buffer was poisoned with.
+    let poison = f32::from_bits(0xdead_bee0);
+    let _ = check_bit_identical(
+        3,
+        |out: &mut [f32]| {
+            out.fill(poison);
+            Ok(())
+        },
+        |out: &mut [f32]| {
+            out.fill(poison);
+            Ok(())
+        },
+    )
+    .expect("an output equal to the sentinel is a pass when both sides agree");
+}
+
+#[test]
+fn a_golden_vector_that_collides_with_the_sentinel_still_passes() {
+    let golden = [f32::from_bits(0xdead_bee0), f32::from_bits(0xdead_beef)];
+
+    let actual = check_expected(
+        2,
+        |out: &mut [f32]| {
+            out.copy_from_slice(&golden);
+            Ok(())
+        },
+        &golden,
+    )
+    .expect("a golden value equal to the sentinel is a pass");
+
+    assert_eq!(bits(&actual), bits(&golden));
+}
+
+#[test]
+#[should_panic(expected = "was never written")]
+fn a_no_write_candidate_behind_a_nan_reference_is_still_diagnosed() {
+    // The realistic NaN case: the reference produced a canonical quiet NaN
+    // (a 0/0-class result), the candidate wrote nothing. The sentinel must
+    // not collide with the canonical payload, so the diagnosis survives.
+    let canonical_nan = f32::from_bits(0x7fc0_0000);
+    let _ = check_bit_identical(
+        2,
+        |out: &mut [f32]| {
+            out.fill(canonical_nan);
+            Ok(())
+        },
+        |_out: &mut [f32]| Ok(()),
+    );
+}
+
+#[test]
+fn the_candidate_sentinel_is_a_non_canonical_nan_payload() {
+    // The whole residual-false-pass argument rests on this property: the
+    // sentinel must be unreachable as an IEEE-754 *result*, which means a
+    // NaN payload no conforming implementation canonicalises to. Pinned
+    // here so a future "simplify the constant" edit cannot quietly restore
+    // a producible sentinel.
+    let candidate = <f32 as Bits>::poison(1);
+    let reference = <f32 as Bits>::poison(0);
+    assert!(
+        candidate.is_nan(),
+        "the sentinel must not be a finite value"
+    );
+    assert!(reference.is_nan());
+    assert_ne!(
+        candidate.to_bits(),
+        0x7fc0_0000,
+        "the canonical quiet NaN is a 0/0-class result, so it cannot be the sentinel"
+    );
+    assert_ne!(candidate.bits(), reference.bits(), "the slots must differ");
+
+    // u16 carries binary16 and bfloat16 patterns: the sentinel must be a NaN
+    // with a non-canonical payload in *both* encodings.
+    let candidate = <u16 as Bits>::poison(1);
+    assert_eq!((candidate >> 10) & 0x1f, 0x1f, "binary16 exponent all ones");
+    assert_ne!(candidate & 0x03ff, 0, "binary16 mantissa nonzero (a NaN)");
+    assert_eq!((candidate >> 7) & 0xff, 0xff, "bfloat16 exponent all ones");
+    assert_ne!(candidate & 0x007f, 0, "bfloat16 mantissa nonzero (a NaN)");
+    assert_ne!(candidate, 0x7e00, "not the binary16 canonical NaN");
+    assert_ne!(candidate, 0x7fc0, "not the bfloat16 canonical NaN");
+    assert_ne!(candidate, <u16 as Bits>::poison(0));
 }
