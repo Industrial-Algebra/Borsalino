@@ -20,7 +20,7 @@ jobs:
       - name: Verify tag matches Cargo.toml version
         run: |
           TAG_VERSION="${GITHUB_REF#refs/tags/v}"
-          CARGO_VERSION=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
+          CARGO_VERSION=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "borsalino") | .version')
           if [ "$TAG_VERSION" != "$CARGO_VERSION" ]; then
             echo "Tag version ($TAG_VERSION) does not match Cargo.toml version ($CARGO_VERSION)"
             exit 1
@@ -28,7 +28,7 @@ jobs:
           echo "Publishing borsalino v${CARGO_VERSION}"
 
       - name: Publish
-        run: cargo publish --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish --package borsalino --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
   github-release:
     name: Create GitHub Release
