@@ -57,36 +57,56 @@ cargo run --features vulkan --example hello_compute   # Linux / Windows
 
 | Backend | Platform | Feature | Status |
 |---|---|---|---|
-| Metal | macOS (Apple Silicon) | `metal` | ✅ Active — raw `objc_msgSend` FFI |
-| Vulkan | Linux, Windows | `vulkan` | ✅ Active — raw `ash` FFI |
+| Metal | macOS (Apple Silicon) | `metal` | ✅ Active — Zunesha substrate + consumer objc |
+| Vulkan | Linux, Windows | `vulkan` | ✅ Active — Zunesha substrate + ash pipelines |
 | Stub | Any | (none) | Returns `NoBackend` — safe fallback |
 
 ## Features
 
 | Feature | What it enables |
 |---|---|
-| `metal` | Metal backend (macOS only) |
-| `vulkan` | Vulkan backend via ash (Linux / Windows) |
+| `metal` | Metal backend (macOS only) — pulls `zunesha` with its `metal` feature |
+| `vulkan` | Vulkan backend (Linux / Windows) — pulls `zunesha` with its `vulkan` feature |
 | `verify` | karpal-verify 0.6 obligation bundles + numerical correctness + determinism verification |
 
 ## Architecture
+
+Since 0.8.0 Borsalino builds on the [Zunesha](https://github.com/Industrial-Algebra/Zunesha)
+substrate (crates.io `zunesha = "0.2"`): **Zunesha owns every device,
+queue, and buffer** — selection, allocation, placement strategy, staging
+transfers, and teardown quiescence. Borsalino keeps the consumer half —
+shader compilation, dispatch encoding, and dispatch accounting:
 
 ```
 GpuBackend trait
     │
     ├── MetalBackend     (metal.rs)
-    │   ├── naga WGSL → MSL translation
-    │   └── objc_msgSend FFI (19 selectors, 0 Metal crate deps)
+    │   ├── naga WGSL → MSL translation (+ _mslBufferSizes ABI)
+    │   └── substrate: zunesha::metal::MetalDevice
+    │       (consumer objc: pipelines + dispatch encoding)
     │
     ├── VulkanBackend    (vulkan.rs)
     │   ├── naga WGSL → SPIR-V translation
-    │   └── ash FFI (Vulkan 1.3)
+    │   ├── ash pipelines / descriptors / command buffers
+    │   └── substrate: zunesha::vulkan::VulkanDevice
     │
     ├── epoch            (epoch.rs) — AtomicU64 dispatch tracking
     ├── determinism      (determinism.rs) — empirical determinism check
     ├── numerical_check  (numerical_check.rs) — exact-match protocol
     └── kani_harnesses   (kani_harnesses.rs) — bounded model checking
 ```
+
+The seam is deliberately thin: on Metal, three raw surfaces (`raw_device`
+for compile, `command_queue` for dispatch, `raw_buffer` for binding); on
+Vulkan, the substrate's queue and buffer handles behind the same trait
+calls. Buffer creation, reads, and placement all delegate — including
+`create_device_buffer`'s forced device-local + persistent-staging contract
+and `read_buffer`'s staging-blit path for device-local memory.
+
+This crate is also a workspace root: the sibling member
+`borsalino-tensor` (typed tensor op-set contract for the candle
+replacement) versions independently and does not ship with this crate's
+releases.
 
 Opaque handle types (`ComputePipeline`, `GpuBuffer`) carry raw pointers and
 backend-specific drop functions — no coupling between `lib.rs` and backend

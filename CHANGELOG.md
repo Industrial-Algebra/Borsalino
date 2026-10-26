@@ -4,6 +4,8 @@ All notable changes to Borsalino are documented in this file.
 
 ## [Unreleased]
 
+## [0.8.0] — 2026-10-23
+
 ### Changed — Zunesha 0.2.0 (published)
 
 - Flip the temporary Phase-3 git dep to `zunesha = { version = "0.2" }` —

@@ -22,10 +22,11 @@ Borsalino's Metal backend therefore:
 
 ## Shared lifetimes (Vulkan)
 
-An async `Pulse` can outlive its backend, so the pulse shares ownership of the
-epoch tracker (`Arc<GpuEpochTracker>`) and of the logical device
-(`SharedDevice` — an `Arc` + `Deref` wrapper around `ash::Device`). The
-device is destroyed only when the last holder drops, and the loader
-(`Entry`) stays pinned for the whole chain. Dropping a backend with dispatches
-still in flight idles the device first — destroying pools a pending
-submission references is UB.
+An async `Pulse` can outlive its backend, so the pulse shares ownership of
+the epoch tracker (`Arc<GpuEpochTracker>`); buffers and pipelines hold
+`Arc<zunesha::vulkan::VulkanDevice>` shares — buffers must not outlive the
+substrate device (a documented Zunesha invariant, enforced by construction
+since every buffer inner carries the device Arc). The Vulkan instance,
+loader, and logical device are owned by the substrate; teardown quiescence
+(device-local staging teardown serialized with submissions) is Zunesha's
+contract, not this crate's.
