@@ -757,6 +757,9 @@ fn error_taxonomy_is_exhaustive() {
             TensorError::ManifestArityMismatch { .. } => "manifest_arity_mismatch",
             TensorError::DeterminismDtypeMismatch { .. } => "determinism_dtype_mismatch",
             TensorError::NonContractDtype { .. } => "non_contract_dtype",
+            TensorError::NonFiniteInput { .. } => "non_finite_input",
+            TensorError::IndexOutOfRange { .. } => "index_out_of_range",
+            TensorError::EmptyReduction { .. } => "empty_reduction",
         }
     }
 
@@ -845,6 +848,21 @@ fn error_taxonomy_is_exhaustive() {
             manifest: Dtype::F16,
         },
         TensorError::NonContractDtype { got: Dtype::F16 },
+        // T1 additions: the execution-time rejections. A non-finite operand,
+        // a gather index past the table, and a reduction with no identity
+        // element are all typed, not panics.
+        TensorError::NonFiniteInput {
+            op: "sum",
+            port: 0,
+            index: 3,
+        },
+        TensorError::IndexOutOfRange {
+            op: "gather",
+            position: 1,
+            index: 9,
+            rows: 4,
+        },
+        TensorError::EmptyReduction { op: "max" },
     ];
 
     let slugs: Vec<&'static str> = cases.iter().map(slug).collect();
@@ -869,6 +887,9 @@ fn error_taxonomy_is_exhaustive() {
             "manifest_arity_mismatch",
             "determinism_dtype_mismatch",
             "non_contract_dtype",
+            "non_finite_input",
+            "index_out_of_range",
+            "empty_reduction",
         ]
     );
 

@@ -12,6 +12,18 @@
 //! into an op inventory with an explicit dtype policy, a determinism class
 //! per op, a shape rule per op, and a shared layout manifest with Katakuri.
 //!
+//! ## What T1 adds
+//!
+//! - [`exec`] — the execution surface: the [`Executable`](exec::Executable)
+//!   trait every implementation satisfies, borrowed [`View`](exec::View)s,
+//!   and the gate order (contract first, then finiteness, then compute).
+//! - [`cpu`] — the CPU reference for L0–L2: first-class, because it is both
+//!   Ijima's GPU-less execution path and the oracle later kernels are
+//!   measured against. Summation order and accumulation precision are
+//!   contract, not implementation detail; both are pinned there and tested.
+//! - [`oracle`] — the equivalence harness: one entry point, any two
+//!   implementations, bit-for-bit comparison.
+//!
 //! ## What T0 is
 //!
 //! - [`ops`] — the L0/L1/L2 inventory from handover §3: elementwise and
@@ -29,10 +41,11 @@
 //!
 //! ## What T0 is not
 //!
-//! No kernels, no CPU reference, no compute of any kind — those are T1 (CPU
-//! reference for L0–L2) and T2 (WGSL kernels behind the DeepReinforce and
-//! determinism gates). Level 3 (activations, softmax, the fused 4-D
-//! attention mask) is not declared here: it composes from these.
+//! No kernels on a device, and no GPU dispatch of any kind — those are T2
+//! (WGSL kernels behind the DeepReinforce and determinism gates). T1's CPU
+//! reference is the oracle for them, not a substitute. Level 3 (activations,
+//! softmax, the fused 4-D attention mask) is not declared here: it composes
+//! from these.
 //!
 //! Also out of scope by decision (handover §3): autodiff, training,
 //! optimizers, gradients; model specs, tokenization, and checkpoint loading
@@ -65,13 +78,36 @@
 //! let out = MatMul::infer_shape(&[&lhs, &rhs]).unwrap();
 //! assert_eq!(out, Shape::new(&[4, 16]).unwrap());
 //! ```
+//!
+//! Running an op: borrowed operands, a caller-provided output buffer, and a
+//! typed error for anything the contract rejects.
+//!
+//! ```
+//! use borsalino_tensor::dtype::Dtype;
+//! use borsalino_tensor::exec::{Executable, View};
+//! use borsalino_tensor::layout::{Shape, TensorLayout};
+//! use borsalino_tensor::ops::l2::MatMul;
+//!
+//! let lhs = TensorLayout::row_major(Dtype::F32, Shape::new(&[1, 2]).unwrap()).unwrap();
+//! let rhs = TensorLayout::row_major(Dtype::F32, Shape::new(&[2, 1]).unwrap()).unwrap();
+//! let mut out = [0.0f32; 1];
+//! MatMul::execute(
+//!     (View::new(&lhs, &[3.0, 4.0]), View::new(&rhs, &[5.0, 6.0])),
+//!     &mut out,
+//! )
+//! .unwrap();
+//! assert_eq!(out[0], 39.0);
+//! ```
 
 #![deny(missing_docs)]
 #![deny(unsafe_code)]
 
+pub mod cpu;
 pub mod dtype;
 pub mod error;
+pub mod exec;
 pub mod layout;
 pub mod manifest;
 pub mod op;
 pub mod ops;
+pub mod oracle;
