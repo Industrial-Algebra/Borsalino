@@ -10,10 +10,12 @@
 
 mod common;
 
+use std::time::Duration;
+
 use borsalino_tensor::error::TensorError;
 use borsalino_tensor::exec::Executable;
 use borsalino_tensor::ops::l2::{BatchedMatMul, MatMul};
-use common::{SENTINEL, bits, f32_layout, view};
+use common::{SENTINEL, bits, f32_layout, view, within};
 
 /// An independent row-major `[m,k] x [k,n]` reference with an ascending,
 /// f32 `k`-chain — the order the contract fixes.
@@ -392,4 +394,73 @@ fn batched_matmul_rejects_disagreeing_inner_dimensions() {
         error,
         Err(TensorError::InnerDimensionMismatch { lhs: 3, rhs: 4, .. })
     ));
+}
+
+#[test]
+fn an_empty_output_gemm_returns_without_iterating() {
+    // [MAX, MAX, 0, 0] x [MAX, MAX, 0, 0] is a legal shape pair whose output
+    // holds no elements. The batch loop must not walk 2^64 empty slices to
+    // discover that.
+    within(Duration::from_secs(2), || {
+        let lhs_layout = f32_layout(&[u32::MAX, u32::MAX, 0, 0]);
+        let rhs_layout = f32_layout(&[u32::MAX, u32::MAX, 0, 0]);
+        let mut output: [f32; 0] = [];
+        BatchedMatMul::execute(
+            (view(&lhs_layout, &[]), view(&rhs_layout, &[])),
+            &mut output,
+        )
+        .expect("an empty batch of empty GEMMs");
+    });
+
+    // The 2-D shape of the same class: a huge row count with no columns, so
+    // every row iteration would be empty.
+    within(Duration::from_secs(2), || {
+        let lhs_layout = f32_layout(&[u32::MAX, 0]);
+        let rhs_layout = f32_layout(&[0, 0]);
+        let mut output: [f32; 0] = [];
+        MatMul::execute(
+            (view(&lhs_layout, &[]), view(&rhs_layout, &[])),
+            &mut output,
+        )
+        .expect("an empty output GEMM");
+    });
+}
+
+#[test]
+fn an_empty_output_gemm_still_runs_the_full_gate() {
+    // Skipping the compute loop must not skip validation: the checks are the
+    // contract, the loop is the work.
+
+    // Inner dimensions still have to agree.
+    let lhs_layout = f32_layout(&[2, 2, 0, 4]);
+    let rhs_layout = f32_layout(&[2, 2, 5, 5]);
+    let error = BatchedMatMul::execute((view(&lhs_layout, &[]), view(&rhs_layout, &[])), &mut []);
+    assert!(matches!(
+        error,
+        Err(TensorError::InnerDimensionMismatch { lhs: 4, rhs: 5, .. })
+    ));
+
+    // A non-finite operand is still rejected — even though the result would
+    // have been empty, the input gate runs first.
+    let lhs_layout = f32_layout(&[1, 1, 0, 2]);
+    let rhs_layout = f32_layout(&[1, 1, 2, 3]);
+    let rhs = [1.0f32, f32::NAN, 0.0, 0.0, 0.0, 0.0];
+    let error = BatchedMatMul::execute((view(&lhs_layout, &[]), view(&rhs_layout, &rhs)), &mut []);
+    assert!(matches!(
+        error,
+        Err(TensorError::NonFiniteInput {
+            port: 1,
+            index: 1,
+            ..
+        })
+    ));
+
+    // A non-empty output shape with a short buffer is still an error.
+    let lhs_layout = f32_layout(&[2, 0]);
+    let rhs_layout = f32_layout(&[0, 0]);
+    let error = MatMul::execute(
+        (view(&lhs_layout, &[]), view(&rhs_layout, &[])),
+        &mut [0.0; 4],
+    );
+    assert!(matches!(error, Err(TensorError::ByteLenMismatch { .. })));
 }

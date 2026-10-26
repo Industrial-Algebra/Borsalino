@@ -44,3 +44,22 @@ pub fn bits(values: &[f32]) -> Vec<u32> {
 /// The sentinel a "the output must not be touched" assertion fills a buffer
 /// with. Distinct from every fixture value used in these tests.
 pub const SENTINEL: f32 = -1234.5678;
+
+/// Run `work` on a worker thread and fail the test if it has not finished
+/// within `limit`.
+///
+/// Nothing in the reference may take proportional-to-a-declared-dimension
+/// time when the work itself is empty, so a timeout is the assertion: a hung
+/// loop fails the test instead of wedging the suite. The worker is detached
+/// rather than joined — the process exit kills a straggler.
+pub fn within(limit: std::time::Duration, work: impl FnOnce() + Send + 'static) {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        work();
+        let _ = sender.send(());
+    });
+    assert!(
+        matches!(receiver.recv_timeout(limit), Ok(())),
+        "the op did not finish within {limit:?}: an empty dimension is being iterated"
+    );
+}

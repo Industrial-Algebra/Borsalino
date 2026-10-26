@@ -24,7 +24,9 @@
 //!   `NaN` (T0's shape rule already declares the shape legal).
 
 use crate::error::TensorError;
-use crate::exec::{Executable, View, check_output, check_span, require_finite, validate};
+use crate::exec::{
+    Executable, View, check_output, check_span, require_finite, validate, writes_nothing,
+};
 use crate::op::TensorOp;
 use crate::ops::l1::{MaskedMean, Max, RowwiseL2Norm, Sum};
 
@@ -112,6 +114,11 @@ impl Executable for MaskedMean {
         check_output::<Self>(&out_shape, output.len())?;
         require_finite::<Self>(0, values.data)?;
         require_finite::<Self>(1, mask.data)?;
+        // An empty output (a zero-width pool, or an empty token axis with a
+        // huge batch) has nothing to write; the gate above still ran.
+        if writes_nothing(&out_shape) {
+            return Ok(());
+        }
 
         let batch = values.layout.shape().dims()[0] as usize;
         let tokens = values.layout.shape().dims()[1] as usize;

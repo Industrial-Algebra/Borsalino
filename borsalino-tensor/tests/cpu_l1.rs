@@ -10,10 +10,12 @@
 
 mod common;
 
+use std::time::Duration;
+
 use borsalino_tensor::error::TensorError;
 use borsalino_tensor::exec::Executable;
 use borsalino_tensor::ops::l1::{MaskedMean, Max, RowwiseL2Norm, Sum};
-use common::{SENTINEL, bits, f32_layout, view};
+use common::{SENTINEL, bits, f32_layout, view, within};
 
 /// An independent left-to-right fold — the order the contract fixes.
 fn fold_left(values: &[f32]) -> f32 {
@@ -405,4 +407,34 @@ fn masked_mean_rejects_a_zero_token_axis_output_buffer_mismatch() {
     )
     .expect("[2,0,3] pools to [2,3] of zeros");
     assert_eq!(bits(&output), bits(&[0.0; 6]));
+}
+
+#[test]
+fn an_empty_masked_pool_returns_without_iterating() {
+    // [MAX, 0, 0] values and [MAX, 0] mask pool to [MAX, 0]: an empty output
+    // reached through a huge batch, so the batch loop must be skipped rather
+    // than walked 2^32 times with no token and no column to visit.
+    within(Duration::from_secs(2), || {
+        let values_layout = f32_layout(&[u32::MAX, 0, 0]);
+        let mask_layout = f32_layout(&[u32::MAX, 0]);
+        let mut output: [f32; 0] = [];
+        MaskedMean::execute(
+            (view(&values_layout, &[]), view(&mask_layout, &[])),
+            &mut output,
+        )
+        .expect("an empty pool over an empty token axis");
+    });
+}
+
+#[test]
+fn an_empty_masked_pool_still_runs_the_gate() {
+    // The zero-token case already has its own output shape; a wrong buffer
+    // length is still reported.
+    let values_layout = f32_layout(&[2, 0, 3]);
+    let mask_layout = f32_layout(&[2, 0]);
+    let error = MaskedMean::execute(
+        (view(&values_layout, &[]), view(&mask_layout, &[])),
+        &mut [0.0; 5],
+    );
+    assert!(matches!(error, Err(TensorError::ByteLenMismatch { .. })));
 }
