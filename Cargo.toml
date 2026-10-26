@@ -45,10 +45,7 @@ naga = { version = "27", features = ["wgsl-in", "spv-out", "msl-out"] }
 #
 # TEMPORARY git dep: Phase 1 needs Zunesha's `VulkanDevice: Send + Sync`
 # (soundness of `Arc<VulkanDevice>` sharing) which is unpublished — it rides
-# TEMP (Phase 3): git dep — Zunesha's Metal backend ships as 0.2.0; until
-# it publishes, both features resolve from develop (a superset of 0.1.2:
-# Metal + ADR-0005 Phase 1). Flip to `version = "0.2"` at the 0.8.0 cut.
-zunesha = { git = "https://github.com/Industrial-Algebra/Zunesha.git", branch = "develop", optional = true }
+zunesha = { version = "0.2", optional = true }
 
 # Verification (GPU safety properties, obligation bundles)
 # For local development, add: path = "../karpal/karpal-verify"

@@ -4,6 +4,12 @@ All notable changes to Borsalino are documented in this file.
 
 ## [Unreleased]
 
+### Changed — Zunesha 0.2.0 (published)
+
+- Flip the temporary Phase-3 git dep to `zunesha = { version = "0.2" }` —
+  the published crate carries the Metal backend + ADR-0005 dispatch-scope
+  guard; resolves identically to the git dep the phases were built on.
+
 ### Changed — Phase 3: Metal delegation to the Zunesha substrate (2026-10-18)
 
 - `MetalBackend` now builds on `zunesha::metal::MetalDevice` (git dep on
