@@ -46,7 +46,7 @@ checksum = "3ded4057c258ba199e2d26386d3af3780957ecaee6c4ef4041c6b4b8b97c0b06"
 
 [[package]]
 name = "borsalino"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "ash",
  "bytemuck",
@@ -57,7 +57,7 @@ dependencies = [
  "rand",
  "serial_test",
  "thiserror",
- "zunesha 0.1.2 (git+https://github.com/Industrial-Algebra/Zunesha.git?branch=develop)",
+ "zunesha 0.2.0",
 ]
 
 [[package]]
@@ -290,7 +290,7 @@ dependencies = [
  "thiserror",
  "unicode-normalization",
  "unicode_categories",
- "zunesha 0.1.2 (registry+https://github.com/rust-lang/crates.io-index)",
+ "zunesha 0.1.2",
 ]
 
 [[package]]
