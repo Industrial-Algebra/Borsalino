@@ -4,6 +4,44 @@ All notable changes to Borsalino are documented in this file.
 
 ## [Unreleased]
 
+### Added — borsalino-tensor T1: CPU reference for L0–L2 (2026-10-26)
+
+- `borsalino-tensor::cpu` — the CPU reference implementation of the whole
+  T0 inventory (copy, cast, add, mul, broadcast_div, gather; sum,
+  masked_mean, rowwise_l2_norm, max; matmul, batched_matmul). First-class,
+  not a fallback (handover §4.2): it is Ijima's GPU-less execution path and
+  the equivalence oracle T2's kernels are measured against.
+- `borsalino-tensor::exec` — the execution surface: `Executable` (one trait,
+  every implementation), borrowed `View`s, and the documented gate order
+  (contract → spans → output → finiteness → compute).
+- `borsalino-tensor::oracle` — the equivalence harness:
+  `check_bit_identical` / `check_expected`, bit-pattern comparison with no
+  tolerance, generic over the output element type (so a cast kernel's `u16`
+  output is covered).
+- **Determinism policy**: every reduction sums strictly left-to-right over
+  the row-major element order in a single thread; matmul's `k`-chain is
+  ascending. No threads, no atomics, no order-dependent fast paths.
+- **Accumulation precision**: f32 throughout, including reduction
+  intermediates. f64 accumulation was rejected because the oracle must live
+  in the arithmetic domain of the kernels it judges (WGSL has no f64), and
+  f64 exactness is Amari's layer.
+- **Non-finite policy**: NaN/±inf *inputs* are rejected with the new typed
+  `TensorError::NonFiniteInput` before any element is read, so a NaN can
+  never decide an ordering or poison a reduction. Outputs stay unpoliced:
+  cast overflow to infinity and division by zero keep their contracted
+  IEEE-754 results.
+- New typed errors `IndexOutOfRange` (gather) and `EmptyReduction` (`max`
+  over an empty tensor — `sum` and `rowwise_l2_norm` return their
+  identities instead).
+- f16/bf16 conversions implemented in-crate (round-to-nearest-even, contract
+  midpoints, subnormal ramps) — **no new dependency**; every threshold in
+  `CastContract` is now an executable test, plus a full 65,536-pattern
+  roundtrip per narrow dtype.
+- Adversarial property tests: boundary buffer offsets, non-power-of-2 dims,
+  zero-sized and single-element tensors, empty batch/head dims, subnormal
+  magnitude spreads, huge-but-valid declared shapes, and order-sensitive
+  fixtures that fail under any other summation order.
+
 ## [0.8.0] — 2026-10-23
 
 ### Changed — Zunesha 0.2.0 (published)

@@ -249,6 +249,59 @@ pub enum TensorError {
         manifest: Dtype,
     },
 
+    /// A float operand carried a NaN or an infinity into an op.
+    ///
+    /// This is a T1 policy, not a T0 shape question: non-finite data is
+    /// rejected *before* any element is read, so a NaN can never silently
+    /// decide an ordering (a `max` tie-break) or poison a reduction. The
+    /// first offending element in row-major order is reported, so the same
+    /// input always names the same element.
+    ///
+    /// Only inputs are policed. An op's *output* may legitimately be
+    /// non-finite: `f32 -> f16` overflows to infinity at the contract
+    /// midpoint, and [`BroadcastDiv`](crate::ops::l0::BroadcastDiv) by zero
+    /// produces the IEEE-754 result rather than trapping.
+    #[error("op `{op}` port {port} has a non-finite value at element {index}")]
+    NonFiniteInput {
+        /// The op's contract name.
+        op: &'static str,
+        /// Zero-based input port index.
+        port: usize,
+        /// Index of the first offending element, in row-major order.
+        index: u64,
+    },
+
+    /// A gather index addresses a row the table does not have.
+    ///
+    /// Out-of-range indices are computed at run time, so they are a caller
+    /// error the op must report rather than a shape violation the T0 rule
+    /// can catch. The position of the offending index is reported, not just
+    /// its value, because the same value may be legal at another position.
+    #[error("op `{op}` index {index} at position {position} is out of range for {rows} row(s)")]
+    IndexOutOfRange {
+        /// The op's contract name.
+        op: &'static str,
+        /// Position of the offending index in the index operand.
+        position: u64,
+        /// The rejected index value.
+        index: u32,
+        /// Rows the table actually has.
+        rows: u32,
+    },
+
+    /// A reduction with no identity element was given an empty operand.
+    ///
+    /// `sum` over an empty tensor is `0` and `rowwise_l2_norm` of an empty
+    /// row is `0` — both are their algebra's identity. `max` has no such
+    /// value that is representable as data, so it rejects the call instead
+    /// of inventing `-inf` (which would put a non-finite number into an
+    /// otherwise finite pipeline).
+    #[error("op `{op}` needs at least one element, got an empty operand")]
+    EmptyReduction {
+        /// The op's contract name.
+        op: &'static str,
+    },
+
     /// A dtype that is not the f32 contract reached a contract boundary.
     ///
     /// v1 manifests are f32-only, so this guard is expected to be
