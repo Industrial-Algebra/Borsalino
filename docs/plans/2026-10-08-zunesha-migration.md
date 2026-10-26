@@ -233,6 +233,11 @@ against Zunesha's merged Metal backend (Zunesha PR #13; ships as Zunesha
 - TEMP: git dep on Zunesha `develop` until 0.2.0 publishes; flip to
   `version = "0.2"` at the 0.8.0 cut (mirrors Phase 1's git→version flip).
 
+### Phase 4 — release — **executing (v0.8.0)**
+
+Release PR #66; tag `v0.8.0` on merge; announce. Backmerge main →
+develop after the release.
+
 ### Phase 4 — release
 
 Version bump (0.8.0 — the public API gains `from_zunesha`/`into_zunesha` and
