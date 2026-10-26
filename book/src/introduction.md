@@ -24,10 +24,10 @@ no async runtime.
 
 ## Relation to the ecosystem
 
-Borsalino is the **compute** face of the IA GPU stack. The planned direction
-(roadmap): the device/buffer/epoch substrate moves into
-[Zunesha](https://github.com/Industrial-Algebra/Zunesha), with Borsalino as
-its compute consumer and Goldenweek (graphics) beside it on the same device —
-enabling zero-copy compute→render interop. **This release still owns its
-device and buffers internally; the Zunesha migration is upcoming work**, not
-shipped in v0.7.
+Borsalino is the **compute** face of the IA GPU stack. Since v0.8.0 the
+device/queue/buffer substrate lives in
+[Zunesha](https://github.com/Industrial-Algebra/Zunesha) (crates.io `0.2`):
+Borsalino is its compute consumer, with Goldenweek (graphics) beside it on
+the same device — enabling zero-copy compute→render interop. The staged
+migration (Vulkan device swap → buffer delegation → Metal delegation)
+completed in v0.8.0.

@@ -2,6 +2,135 @@
 
 All notable changes to Borsalino are documented in this file.
 
+## [Unreleased]
+
+## [0.8.0] — 2026-10-23
+
+### Changed — Zunesha 0.2.0 (published)
+
+- Flip the temporary Phase-3 git dep to `zunesha = { version = "0.2" }` —
+  the published crate carries the Metal backend + ADR-0005 dispatch-scope
+  guard; resolves identically to the git dep the phases were built on.
+
+### Changed — Phase 3: Metal delegation to the Zunesha substrate (2026-10-18)
+
+- `MetalBackend` now builds on `zunesha::metal::MetalDevice` (git dep on
+  `develop` until Zunesha 0.2.0 publishes): the substrate owns the
+  MTLDevice, MTLCommandQueue, and every MTLBuffer — Borsalino's
+  device/queue ownership structs and buffer-allocation paths are deleted.
+- All buffer constructors delegate; `read_buffer` delegates to the
+  substrate (Private storage needs the staging-blit read — a raw
+  `contents()` read would return stale staging bytes).
+- `MemoryStrategy::DeviceLocal` is no longer silently ignored on Metal:
+  it maps to Private storage + staging (Zunesha R1), pinned by
+  `device_local_strategy_buffers_roundtrip`.
+- Delegation anchors: `create_device_buffer(_uninit)_delegates_to_substrate`,
+  `device_buffer_roundtrips_under_forced_unified` (mirror the Phase-2
+  Vulkan anchors; macOS CI).
+- Review r1 coverage: Private buffers pin the FRESH device→staging blit
+  (kernel-write/readback, double-dispatch against cached-blit staleness),
+  the DeviceLocal strategy path round-trips kernel outputs with a
+  substrate-level placement assertion, and unified strategy asserts
+  HostVisible placement.
+- Metal-path lints now held to the standard gates
+  (`unsafe_op_in_unsafe_fn` in `nsstring_read`, an unnecessary nested
+  `unsafe`, an MSL-options initializer, a redundant cast).
+
+### Changed — Phase 2: buffer delegation to the substrate (2026-10-10)
+
+- Bump `zunesha` to `0.1.2` — picks up the substrate's seven-round
+  submission-protocol soundness pass (allocation-failure cleanup,
+  quiesce-or-leak teardown, per-protocol reentrancy incl. the fix for
+  the pre-existing nested-entry deadlock), which Phase 2's delegated
+  paths now exercise directly.
+
+- `create_device_buffer(_uninit)` now delegates to Zunesha's documented
+  contract: **forced device-local + persistent staging**, including under
+  forced `Unified` on discrete hardware (Borsalino's previous
+  host-visible divergence and temp-staging profile are gone). Every
+  device-local buffer holds a persistent host-visible staging twin;
+  readback runs through the substrate's locked transfer path.
+- `read_buffer` is a pure delegation; Borsalino's own Vulkan allocation
+  code is deleted (`find_memory_type_index`, `align_up`, both allocate
+  paths, `one_shot_transfer`, the transfer command pool).
+- `contents()` on `create_device_buffer` buffers now returns the
+  substrate sentinel tag instead of null — reads go through `read_buffer`
+  either way (unchanged since Phase 1 for `create_buffer` buffers).
+- **Mixed-size reads are byte-based** (review r1): `read_buffer::<u8>` on a
+  buffer created from two `u32`s returns 8 elements (was 2 — the old path
+  returned the creation-time element count). `GpuBuffer.len` remains the
+  creation-time element count; the read length derives from the substrate's
+  byte length.
+- Error surface reclassified (review r1): buffer-creation failures surface
+  as `BufferCreationFailed` wrapping the substrate's message
+  (`zunesha create_device_buffer: …`), and device-buffer read failures as
+  `BufferReadFailed` from the substrate's locked read path — the
+  Borsalino-specific staging error messages are gone with the staging code.
+
+### Changed — dependency flip (2026-10-10)
+
+- `zunesha` dependency flipped from the temporary git dep on the
+  `feat/device-buffer-override` branch to `version = "0.1.1"` from
+  crates.io (published today). The staged git-dep exception is closed.
+
+### Fixed — review round 2 (2026-10-10)
+
+- Allocation-failure leaks on every error path: `create_device_buffer`
+  frees the device allocation when the staging allocation itself fails;
+  `allocate_buffer`/`allocate_device_local_buffer` destroy partial
+  state (buffer, then memory) when memory-type lookup, `vkAllocateMemory`,
+  `vkBindBufferMemory`, or `vkMapMemory` fails; `build` releases all
+  dispatch resources (layouts, pools, timestamp pool) via an armed RAII
+  guard when any construction step fails.
+
+### Fixed — review round 1 (2026-10-09)
+
+- **P1 (soundness):** every queue submission now joins the substrate's
+  protocol — `zunesha::vulkan::VulkanDevice::with_compute_queue` — because
+  the compute queue is an externally synchronized Vulkan object shared
+  with the substrate's staging transfers (two `from_zunesha` backends, or
+  a backend plus a substrate buffer creation, could previously race
+  `vkQueueSubmit` from safe code). Applies to dispatch, dispatch_many,
+  dispatch_async (submit only — fence waits need no lock), timestamps,
+  and both one-shot transfer paths. The `queue` field is gone; the
+  handle lives in the substrate.
+- Readback/upload staging allocations are freed before propagating
+  transfer errors (`create_device_buffer` upload frees staging AND the
+  device allocation; `read_buffer` frees its temp staging) — previously
+  inherited-from-develop leaks on the error paths.
+
+### Changed — Zunesha device substrate, Vulkan backend (Phase 1 of the
+### staged migration)
+
+- The Vulkan backend now owns its device through
+  `Arc<zunesha::vulkan::VulkanDevice>` instead of building its own
+  instance/physical/logical device: instance creation, physical-device
+  selection and scoring, queue-family selection, API-version negotiation,
+  memory-strategy detection, and strategy-respecting buffer
+  allocation/readback all delegate to the substrate (ADR 0001/0003).
+  The former `SharedDevice`/`SharedInstance` wrappers collapse onto the
+  `Arc` — buffers, pipelines, and pulses still outlive the backend (P1
+  review contract preserved; the device dies with the last holder).
+- New: `VulkanBackend::from_zunesha(Arc<VulkanDevice>)` and
+  `VulkanBackend::into_zunesha()` — share one substrate device between
+  Borsalino compute and e.g. Goldenweek rendering (ADR 0001 interop).
+- `create_buffer`/`create_buffer_uninit`/`read_buffer` delegate to the
+  substrate (`zunesha::Device`); the returned `GpuBuffer` wraps a
+  `zunesha::Buffer`.
+- `create_device_buffer(_uninit)` keeps Borsalino's own temp-staging
+  allocation profile (migration plan §5.1 — delegation is an explicit
+  Phase-2 decision, not a silent swap).
+- Epoch tracking stays on Borsalino's side until Zunesha wires consumer
+  dispatch accounting (ADR 0003 end state; honest intermediate).
+- Net −214 lines; WGSL→SPIR-V compilation, dispatch, dispatch_many,
+  dispatch_async, timestamps, and the verification layer are unchanged.
+
+### Dependencies
+
+- `zunesha` (Vulkan substrate; requires ≥0.1.1 for `VulkanDevice:
+  Send + Sync` — temporarily a git dep on the Zunesha PR branch until
+  0.1.1 publishes). `borsalino/vulkan` now forwards to `zunesha/vulkan`.
+
 ## [0.7.0] — 2026-10-03
 
 ### Fixed — review findings (2026-10-01)
