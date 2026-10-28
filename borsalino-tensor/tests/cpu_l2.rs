@@ -537,6 +537,20 @@ fn transpose_2d_rejects_non_rank_2_shapes() {
     }
 }
 
+/// Review r1 P2-3: an empty shape must do zero work regardless of how
+/// large the OTHER dimension is — [100000000, 0] took 589 ms with the
+/// row loop iterating empty inner loops. The `within` timeout is the
+/// assertion.
+#[test]
+fn transpose_2d_on_empty_rows_is_constant_time() {
+    within(Duration::from_millis(100), || {
+        let layout = f32_layout(&[1_000_000_000, 0]);
+        let input: [f32; 0] = [];
+        let mut output: Vec<f32> = vec![];
+        Transpose2D::execute(view(&layout, &input), &mut output).unwrap();
+    });
+}
+
 #[test]
 fn transpose_2d_composes_with_matmul_the_way_consumers_need_it() {
     // The issue #71 story end to end: Katakuri weights are `[out, in]`;

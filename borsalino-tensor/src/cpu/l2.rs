@@ -128,11 +128,31 @@ impl Executable for Transpose2D {
                 got: values.layout.shape().rank(),
             });
         };
+        // Empty work is constant-time, not proportional to the non-zero
+        // dimension: [1e9, 0] must not iterate a billion empty rows
+        // (review r2 P2). AFTER the complete gate — the contract checks
+        // above still run.
+        if writes_nothing(values.layout.shape()) {
+            return Ok(());
+        }
         for r in 0..*rows {
             for c in 0..*cols {
-                output[(c * rows + r) as usize] = values.data[(r * cols + c) as usize];
+                let (out_at, in_at) = (
+                    transpose_index(r, c, *rows, *cols),
+                    r as u64 * *cols as u64 + c as u64,
+                );
+                output[out_at as usize] = values.data[in_at as usize];
             }
         }
         Ok(())
     }
+}
+
+/// The output-side transpose permutation index, `out[c, r] = in[r, c]`
+/// flattened: widened to `u64` BEFORE multiplying — `c * rows` overflows
+/// `u32` for valid shapes like `[65536, 65537]` at `c = 65536` (review r1
+/// P1-2: the exact-arithmetic boundary case is pinned in the contract
+/// tests without allocating).
+pub const fn transpose_index(r: u32, c: u32, rows: u32, _cols: u32) -> u64 {
+    c as u64 * rows as u64 + r as u64
 }

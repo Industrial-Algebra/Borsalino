@@ -740,6 +740,7 @@ fn error_taxonomy_is_exhaustive() {
     fn slug(err: &TensorError) -> &'static str {
         match err {
             TensorError::UnalignedOffset { .. } => "unaligned_offset",
+            TensorError::FlattenOverflow { .. } => "flatten_overflow",
             TensorError::ShapeOverflow { .. } => "shape_overflow",
             TensorError::ByteLenOverflow { .. } => "byte_len_overflow",
             TensorError::NonContiguous { .. } => "non_contiguous",
@@ -957,7 +958,54 @@ fn shape_squeeze_drops_unit_dims() {
 
 #[test]
 fn shape_flatten_is_rank_one_with_the_element_count() {
-    assert_eq!(Shape::new(&[2, 3]).unwrap().flatten().dims(), &[6]);
-    assert_eq!(Shape::new(&[4]).unwrap().flatten().dims(), &[4]);
-    assert_eq!(Shape::new(&[2, 3, 4]).unwrap().flatten().dims(), &[24]);
+    assert_eq!(Shape::new(&[2, 3]).unwrap().flatten().unwrap().dims(), &[6]);
+    assert_eq!(Shape::new(&[4]).unwrap().flatten().unwrap().dims(), &[4]);
+    assert_eq!(
+        Shape::new(&[2, 3, 4]).unwrap().flatten().unwrap().dims(),
+        &[24]
+    );
+}
+
+/// Review r1 P1-1: a count exceeding `u32::MAX` cannot be a rank-1 dim —
+/// flatten must fail loudly, never silently change the element count.
+#[test]
+fn shape_flatten_rejects_counts_above_u32_max() {
+    // Exactly representable: [u32::MAX] flattens to itself.
+    assert_eq!(
+        Shape::new(&[u32::MAX]).unwrap().flatten().unwrap().dims(),
+        &[u32::MAX]
+    );
+    // 2^32 elements: the largest square shape that fits a u64 count.
+    match Shape::new(&[65536, 65536]).unwrap().flatten() {
+        Err(TensorError::FlattenOverflow { count }) => assert_eq!(count, 1 << 32),
+        other => panic!("flatten must reject a u32-unrepresentable count, got {other:?}"),
+    }
+    // And a non-square over-count too.
+    match Shape::new(&[u32::MAX, 2]).unwrap().flatten() {
+        Err(TensorError::FlattenOverflow { .. }) => {}
+        other => panic!("expected FlattenOverflow, got {other:?}"),
+    }
+}
+
+/// Review r1 P1-2: the transpose permutation index, exercised at the
+/// u32-overflow boundary WITHOUT allocating — the index function is pure.
+#[test]
+fn transpose_index_is_exact_at_the_u32_boundary() {
+    use borsalino_tensor::cpu::l2::transpose_index;
+    // [65536, 65537]: c = 65536, r = 0 → c*rows = 2^32, which wraps to 0
+    // in u32 arithmetic. The widened form must return exactly 2^32.
+    assert_eq!(transpose_index(0, 65536, 65536, 65537), 1 << 32);
+    // The input-side index for the same element: r*cols + c.
+    assert_eq!(transpose_input_index(0, 65536, 65537), 65536);
+    // A representable large case, both corners.
+    assert_eq!(transpose_index(1, 1, 2, 2), 3);
+    assert_eq!(
+        transpose_index(u32::MAX - 1, 0, u32::MAX, 1),
+        u32::MAX as u64 - 1
+    );
+}
+
+/// The input-side permutation index (kept alongside for the test).
+fn transpose_input_index(r: u32, c: u32, cols: u32) -> u64 {
+    r as u64 * cols as u64 + c as u64
 }

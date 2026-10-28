@@ -92,10 +92,21 @@ impl Shape {
     /// Flatten to rank 1, `[n]` where `n` is the element count (issue #71
     /// ergonomics): any contiguous row-major shape reinterpreted as one
     /// axis. No data moves.
-    #[must_use]
-    pub fn flatten(&self) -> Shape {
-        Shape::new(&[u32::try_from(self.element_count).unwrap_or(u32::MAX)])
-            .expect("a valid element count re-interprets as one axis")
+    ///
+    /// # Errors
+    ///
+    /// [`TensorError::FlattenOverflow`] when the element count exceeds
+    /// `u32::MAX` — a rank-1 dimension could not represent it, and
+    /// saturating would silently change the element count (review r1 P1).
+    pub fn flatten(&self) -> Result<Shape, crate::error::TensorError> {
+        let count = u32::try_from(self.element_count).map_err(|_| {
+            crate::error::TensorError::FlattenOverflow {
+                count: self.element_count,
+            }
+        })?;
+        Shape::new(&[count]).map_err(|_| crate::error::TensorError::FlattenOverflow {
+            count: self.element_count,
+        })
     }
 
     /// The number of elements, `0` when any dimension is zero.
