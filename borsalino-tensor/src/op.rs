@@ -43,6 +43,11 @@ pub enum OpLevel {
     /// adversarial shape classes (subnormal spreads, non-power-of-2 dims,
     /// alignment-boundary offsets, empty batch/head dims).
     L2,
+    /// Activation and composition ops (issue #71): elementwise activations
+    /// start here (`relu`); the handover §3 compositions (layernorm, GELU,
+    /// softmax, attention, the fused 4-D mask) follow once the
+    /// transcendental tolerance classes land with them.
+    L3,
 }
 
 /// The determinism a kernel must prove (handover §5).
@@ -132,6 +137,10 @@ pub enum ShapeRule {
     /// Attention-masked pooling over the token axis: `[B,S,D]` values +
     /// `[B,S]` mask -> `[B,D]` (`masked_mean`).
     MaskedPool,
+    /// 2-D transpose: `[R,C]` -> `[C,R]` (`transpose_2d`, issue #71 —
+    /// Katakuri's canonical weight layout is `[out, in]`; the swap removes
+    /// a per-consumer permute step before `matmul`).
+    Transpose2D,
     /// 2-D GEMM: `[M,K] x [K,N]` -> `[M,N]` (`matmul`).
     MatMul,
     /// Batched 4-D GEMM: `[B,H,S,D] x [B,H,D,T]` -> `[B,H,S,T]`
@@ -144,7 +153,10 @@ impl ShapeRule {
     #[must_use]
     pub const fn arity(self) -> usize {
         match self {
-            ShapeRule::Identity | ShapeRule::FullReduction | ShapeRule::RowReduction => 1,
+            ShapeRule::Identity
+            | ShapeRule::FullReduction
+            | ShapeRule::RowReduction
+            | ShapeRule::Transpose2D => 1,
             ShapeRule::Broadcast
             | ShapeRule::RowSelect
             | ShapeRule::MaskedPool
@@ -170,6 +182,7 @@ impl ShapeRule {
         }
         match self {
             ShapeRule::Identity => Ok(inputs[0].clone()),
+            ShapeRule::Transpose2D => transpose_2d(op, inputs[0]),
             ShapeRule::Broadcast => broadcast(op, inputs[0], inputs[1]),
             ShapeRule::RowSelect => row_select(op, inputs[0], inputs[1]),
             ShapeRule::FullReduction => Shape::new(&[]),
@@ -361,6 +374,11 @@ fn masked_pool(op: &'static str, values: &Shape, mask: &Shape) -> Result<Shape, 
 }
 
 /// `[M,K] x [K,N]` -> `[M,N]`.
+fn transpose_2d(op: &'static str, input: &Shape) -> Result<Shape, TensorError> {
+    expect_rank(op, 0, input, 2)?;
+    Shape::new(&[input.dims()[1], input.dims()[0]])
+}
+
 fn matmul(op: &'static str, lhs: &Shape, rhs: &Shape) -> Result<Shape, TensorError> {
     expect_rank(op, 0, lhs, 2)?;
     expect_rank(op, 1, rhs, 2)?;

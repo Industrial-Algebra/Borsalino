@@ -27,10 +27,12 @@
     }
   },
   "tdd": {
-    "phase": "idle",
-    "testFiles": [],
+    "phase": "red-pending",
+    "testFiles": [
+      "/home/lucien/working/industrial-algebra/Borsalino/borsalino-tensor/tests/cpu_l3.rs"
+    ],
     "sourceFiles": [],
-    "redVerificationPending": false
+    "redVerificationPending": true
   },
   "debug": {
     "active": false,

@@ -16,7 +16,8 @@ use borsalino_tensor::layout::{Shape, Strides, TensorLayout};
 use borsalino_tensor::op::{DeterminismClass, OpLevel, PortRole, PortSpec, ShapeRule, TensorOp};
 use borsalino_tensor::ops::l0::{Add, BroadcastDiv, Cast, Copy, Gather, Mul};
 use borsalino_tensor::ops::l1::{MaskedMean, Max, RowwiseL2Norm, Sum};
-use borsalino_tensor::ops::l2::{BatchedMatMul, MatMul};
+use borsalino_tensor::ops::l2::{BatchedMatMul, MatMul, Transpose2D};
+use borsalino_tensor::ops::l3::Relu;
 
 /// 2^`exp` as an f64 — exact for every exponent these fixtures use.
 fn pow2(exp: i32) -> f64 {
@@ -901,4 +902,62 @@ fn error_taxonomy_is_exhaustive() {
         .find(|error| matches!(error, TensorError::ArityMismatch { .. }))
         .expect("the taxonomy covers ArityMismatch");
     assert!(arity.to_string().contains("add"));
+}
+
+// ── issue #71: relu, transpose_2d, shape ergonomics ───────────────────
+
+#[test]
+fn relu_contract_is_l3_bitexact_identity() {
+    assert_eq!(<Relu as TensorOp>::NAME, "relu");
+    assert_eq!(<Relu as TensorOp>::LEVEL, OpLevel::L3);
+    assert_eq!(<Relu as TensorOp>::DETERMINISM, DeterminismClass::BitExact);
+    assert_eq!(<Relu as TensorOp>::SHAPE_RULE, ShapeRule::Identity);
+    let layout = TensorLayout::row_major(Dtype::F32, Shape::new(&[4]).unwrap()).unwrap();
+    let out = <Relu as TensorOp>::infer_shape(&[&layout.shape().clone()]).unwrap();
+    assert_eq!(out.dims(), &[4]);
+}
+
+#[test]
+fn transpose_2d_contract_swaps_rank_2_axes() {
+    assert_eq!(<Transpose2D as TensorOp>::NAME, "transpose_2d");
+    assert_eq!(
+        <Transpose2D as TensorOp>::DETERMINISM,
+        DeterminismClass::BitExact
+    );
+    assert_eq!(
+        <Transpose2D as TensorOp>::SHAPE_RULE,
+        ShapeRule::Transpose2D
+    );
+    let input = Shape::new(&[3, 5]).unwrap();
+    let out = ShapeRule::Transpose2D
+        .infer("transpose_2d", &[&input])
+        .unwrap();
+    assert_eq!(out.dims(), &[5, 3]);
+    // arity 1
+    let two: Vec<&Shape> = vec![&input, &input];
+    assert!(matches!(
+        ShapeRule::Transpose2D.infer("transpose_2d", &two),
+        Err(TensorError::ArityMismatch { .. })
+    ));
+    // non-rank-2 rejected
+    let rank3 = Shape::new(&[2, 3, 4]).unwrap();
+    assert!(matches!(
+        ShapeRule::Transpose2D.infer("transpose_2d", &[&rank3]),
+        Err(TensorError::RankMismatch { .. })
+    ));
+}
+
+#[test]
+fn shape_squeeze_drops_unit_dims() {
+    assert_eq!(Shape::new(&[7, 1]).unwrap().squeeze().dims(), &[7]);
+    assert_eq!(Shape::new(&[1, 7, 1]).unwrap().squeeze().dims(), &[7]);
+    assert_eq!(Shape::new(&[1, 1]).unwrap().squeeze().dims(), &[] as &[u32]);
+    assert_eq!(Shape::new(&[2, 3]).unwrap().squeeze().dims(), &[2, 3]);
+}
+
+#[test]
+fn shape_flatten_is_rank_one_with_the_element_count() {
+    assert_eq!(Shape::new(&[2, 3]).unwrap().flatten().dims(), &[6]);
+    assert_eq!(Shape::new(&[4]).unwrap().flatten().dims(), &[4]);
+    assert_eq!(Shape::new(&[2, 3, 4]).unwrap().flatten().dims(), &[24]);
 }

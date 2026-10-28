@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use borsalino_tensor::error::TensorError;
 use borsalino_tensor::exec::Executable;
-use borsalino_tensor::ops::l2::{BatchedMatMul, MatMul};
+use borsalino_tensor::ops::l2::{BatchedMatMul, MatMul, Transpose2D};
 use common::{SENTINEL, bits, f32_layout, view, within};
 
 /// An independent row-major `[m,k] x [k,n]` reference with an ascending,
@@ -463,4 +463,109 @@ fn an_empty_output_gemm_still_runs_the_full_gate() {
         &mut [0.0; 4],
     );
     assert!(matches!(error, Err(TensorError::ByteLenMismatch { .. })));
+}
+
+// ── transpose_2d (issue #71) ──────────────────────────────────────────
+
+/// An independent `[r, c] -> [c, r]` permutation.
+fn reference_transpose(input: &[f32], rows: usize, cols: usize) -> Vec<f32> {
+    let mut out = vec![0.0f32; rows * cols];
+    for r in 0..rows {
+        for c in 0..cols {
+            out[c * rows + r] = input[r * cols + c];
+        }
+    }
+    out
+}
+
+#[test]
+fn transpose_2d_permutes_a_non_square_matrix() {
+    let rows = 3usize;
+    let cols = 5usize;
+    let input: Vec<f32> = (0..rows * cols).map(|i| i as f32 * 0.5 - 3.0).collect();
+    let layout = f32_layout(&[rows as u32, cols as u32]);
+    let mut output = vec![SENTINEL; rows * cols];
+    Transpose2D::execute(view(&layout, &input), &mut output).unwrap();
+    assert_eq!(
+        bits(&output),
+        bits(&reference_transpose(&input, rows, cols))
+    );
+    // Spot-check the corner mappings: [0,0] stays; in[0, cols-1] lands
+    // at out[cols-1, 0]; in[rows-1, 0] lands at out[0, rows-1].
+    assert_eq!(output[0], input[0]);
+    assert_eq!(output[(cols - 1) * rows], input[cols - 1]);
+    assert_eq!(output[rows - 1], input[(rows - 1) * cols]);
+}
+
+#[test]
+fn transpose_2d_round_trips() {
+    let input: Vec<f32> = (0..12).map(|i| i as f32 * 0.25).collect();
+    let layout = f32_layout(&[3, 4]);
+    let mut once = vec![SENTINEL; 12];
+    Transpose2D::execute(view(&layout, &input), &mut once).unwrap();
+    let layout_t = f32_layout(&[4, 3]);
+    let mut twice = vec![SENTINEL; 12];
+    Transpose2D::execute(view(&layout_t, &once), &mut twice).unwrap();
+    assert_eq!(bits(&twice), bits(&input));
+}
+
+#[test]
+fn transpose_2d_on_empty_dimensions_writes_nothing() {
+    for dims in [[0u32, 4], [4, 0]] {
+        let layout = f32_layout(&dims);
+        let input: [f32; 0] = [];
+        let mut output: Vec<f32> = vec![];
+        Transpose2D::execute(view(&layout, &input), &mut output).unwrap();
+        assert!(output.is_empty());
+    }
+}
+
+#[test]
+fn transpose_2d_rejects_non_rank_2_shapes() {
+    let layout = f32_layout(&[2, 3, 4]);
+    let input = vec![0.0f32; 24];
+    let mut output = vec![SENTINEL; 24];
+    match Transpose2D::execute(view(&layout, &input), &mut output) {
+        Err(TensorError::RankMismatch {
+            op, expected, got, ..
+        }) => {
+            assert_eq!(op, "transpose_2d");
+            assert_eq!(expected, "rank 2");
+            assert_eq!(got, 3);
+        }
+        other => panic!("rank-3 input must be rejected, got {other:?}"),
+    }
+}
+
+#[test]
+fn transpose_2d_composes_with_matmul_the_way_consumers_need_it() {
+    // The issue #71 story end to end: Katakuri weights are `[out, in]`;
+    // matmul contracts `[M, K] x [K, N]`. A transposed `[out, in]` weight
+    // feeds the right operand directly.
+    let m = 2usize;
+    let k = 3usize;
+    let n = 2usize;
+    let activations = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]; // [m, k]
+    let weights_out_in = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]; // [n, k] = [out, in]
+
+    let w_layout = f32_layout(&[n as u32, k as u32]);
+    let mut weights_kn = vec![SENTINEL; k * n];
+    Transpose2D::execute(view(&w_layout, &weights_out_in), &mut weights_kn).unwrap();
+
+    let a_layout = f32_layout(&[m as u32, k as u32]);
+    let b_layout = f32_layout(&[k as u32, n as u32]);
+    let mut out = vec![SENTINEL; m * n];
+    MatMul::execute(
+        (view(&a_layout, &activations), view(&b_layout, &weights_kn)),
+        &mut out,
+    )
+    .unwrap();
+    // Independent expectation: activations x weights^T, by hand.
+    let expected = [
+        1.0 * 1.0 + 2.0 * 2.0 + 3.0 * 3.0,
+        1.0 * 4.0 + 2.0 * 5.0 + 3.0 * 6.0,
+        4.0 * 1.0 + 5.0 * 2.0 + 6.0 * 3.0,
+        4.0 * 4.0 + 5.0 * 5.0 + 6.0 * 6.0,
+    ];
+    assert_eq!(bits(&out), bits(&expected));
 }

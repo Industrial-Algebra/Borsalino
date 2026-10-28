@@ -71,6 +71,33 @@ impl Shape {
         self.dims.len()
     }
 
+    /// Drop every unit dimension (issue #71 ergonomics): `[rows, 1]`
+    /// head outputs become `[rows]`, `[1, 1]` becomes the rank-0 scalar.
+    ///
+    /// A pure layout reinterpretation — valid because row-major element
+    /// order is unchanged, so no data moves.
+    #[must_use]
+    pub fn squeeze(&self) -> Shape {
+        Shape::new(
+            &self
+                .dims
+                .iter()
+                .copied()
+                .filter(|dim| *dim != 1)
+                .collect::<Vec<_>>(),
+        )
+        .expect("removing unit dims cannot overflow a valid shape")
+    }
+
+    /// Flatten to rank 1, `[n]` where `n` is the element count (issue #71
+    /// ergonomics): any contiguous row-major shape reinterpreted as one
+    /// axis. No data moves.
+    #[must_use]
+    pub fn flatten(&self) -> Shape {
+        Shape::new(&[u32::try_from(self.element_count).unwrap_or(u32::MAX)])
+            .expect("a valid element count re-interprets as one axis")
+    }
+
     /// The number of elements, `0` when any dimension is zero.
     #[must_use]
     pub const fn element_count(&self) -> u64 {

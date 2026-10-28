@@ -52,3 +52,23 @@ impl TensorOp for BatchedMatMul {
     const DETERMINISM: DeterminismClass = DeterminismClass::FixedOrderGemm;
     const SHAPE_RULE: ShapeRule = ShapeRule::BatchedMatMul;
 }
+
+/// 2-D transpose, `[R, C] -> [C, R]` (issue #71).
+///
+/// Katakuri's canonical weight layout is `[out, in]`; `matmul` contracts
+/// `[M, K] x [K, N]`, so a weight consumed as the right operand needs its
+/// axes swapped. Declaring the swap as an op (rather than every consumer
+/// hand-rolling a strided view) gives it a contract, a CPU reference, and
+/// — at T2 — a kernel with the same semantics. A pure permutation:
+/// [`DeterminismClass::BitExact`] by construction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Transpose2D;
+
+impl TensorOp for Transpose2D {
+    const NAME: &'static str = "transpose_2d";
+    const LEVEL: OpLevel = OpLevel::L2;
+    const INPUTS: &'static [PortSpec] = &[PortSpec::f32()];
+    const OUTPUT: PortSpec = PortSpec::f32();
+    const DETERMINISM: DeterminismClass = DeterminismClass::BitExact;
+    const SHAPE_RULE: ShapeRule = ShapeRule::Transpose2D;
+}

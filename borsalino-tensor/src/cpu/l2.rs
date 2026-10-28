@@ -20,7 +20,8 @@ use crate::error::TensorError;
 use crate::exec::{
     Executable, View, check_output, check_span, require_finite, validate, writes_nothing,
 };
-use crate::ops::l2::{BatchedMatMul, MatMul};
+use crate::op::TensorOp;
+use crate::ops::l2::{BatchedMatMul, MatMul, Transpose2D};
 
 impl Executable for MatMul {
     type Operands<'a> = (View<'a, f32>, View<'a, f32>);
@@ -101,5 +102,37 @@ fn gemm(lhs: &[f32], rhs: &[f32], output: &mut [f32], m: usize, k: usize, n: usi
             }
             output[row * n + column] = accumulation;
         }
+    }
+}
+
+/// 2-D transpose, `[R, C] -> [C, R]` — a pure permutation of row-major
+/// elements: `out[c * r + r_i] = in[r_i * c_total + c]`, walked once,
+/// single-threaded. Bit-exact by construction (no arithmetic at all).
+impl Executable for Transpose2D {
+    type Operands<'a> = View<'a, f32>;
+    type Output = f32;
+
+    fn execute(values: View<'_, f32>, output: &mut [f32]) -> Result<(), TensorError> {
+        let out_shape = validate::<Self>(&[values.layout])?;
+        check_span::<Self>(0, values.layout, values.data.len())?;
+        check_output::<Self>(&out_shape, output.len())?;
+        require_finite::<Self>(0, values.data)?;
+        let [rows, cols] = values.layout.shape().dims() else {
+            // Unreachable in practice: the Transpose2D shape rule rejects
+            // non-rank-2 inputs at `validate` above. Kept as an exhaustive
+            // guard over the slice pattern.
+            return Err(TensorError::RankMismatch {
+                op: <Transpose2D as TensorOp>::NAME,
+                port: 0,
+                expected: "rank 2",
+                got: values.layout.shape().rank(),
+            });
+        };
+        for r in 0..*rows {
+            for c in 0..*cols {
+                output[(c * rows + r) as usize] = values.data[(r * cols + c) as usize];
+            }
+        }
+        Ok(())
     }
 }

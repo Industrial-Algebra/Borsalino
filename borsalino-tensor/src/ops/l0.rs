@@ -128,6 +128,12 @@ impl TensorOp for Mul {
 /// The divisor must not be zero: T1 defines division by zero as producing
 /// the IEEE-754 result (`inf`/`NaN`) rather than trapping, and callers who
 /// need masking use [`MaskedMean`](crate::ops::l1::MaskedMean) instead.
+///
+/// Naming note (issue #71): [`Add`](struct@Add) and [`Mul`] broadcast too
+/// — the `Broadcast` prefix here marks the DIVISOR position (the right
+/// operand broadcasts against the left, never the reverse); it is not the
+/// only broadcasting op, just the only one whose name must say which side
+/// is fixed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BroadcastDiv;
 
