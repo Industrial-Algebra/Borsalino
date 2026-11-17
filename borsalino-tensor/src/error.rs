@@ -30,6 +30,16 @@ pub enum TensorError {
         shape: Vec<u32>,
     },
 
+    /// A [`Shape::flatten`](crate::layout::Shape::flatten) target cannot
+    /// represent the element count: rank 1 needs one `u32` dimension, and
+    /// the count exceeds `u32::MAX`. Saturating would silently change the
+    /// element count, so flatten rejects instead (review r1 P1-1).
+    #[error("element count {count} exceeds u32::MAX and has no rank-1 shape")]
+    FlattenOverflow {
+        /// The unrepresentable element count.
+        count: u64,
+    },
+
     /// A layout's byte footprint does not fit in a `u64`.
     ///
     /// The element count can fit while `element count × dtype size` does

@@ -3,3 +3,4 @@
 worktrees/
 .cargo/
 book/book/
+.pi/

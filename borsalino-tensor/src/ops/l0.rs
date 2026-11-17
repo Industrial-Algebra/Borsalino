@@ -128,6 +128,12 @@ impl TensorOp for Mul {
 /// The divisor must not be zero: T1 defines division by zero as producing
 /// the IEEE-754 result (`inf`/`NaN`) rather than trapping, and callers who
 /// need masking use [`MaskedMean`](crate::ops::l1::MaskedMean) instead.
+///
+/// Naming note (issue #71): broadcasting here is symmetric NumPy-style —
+/// either operand may be the scalar, so a scalar dividend divided by a
+/// vector divisor is as legal as the reverse. The `Broadcast` prefix is a
+/// usage convention (the divisor is the broadcast operand in every real
+/// call site, e.g. per-feature scaling), not a direction claim.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BroadcastDiv;
 

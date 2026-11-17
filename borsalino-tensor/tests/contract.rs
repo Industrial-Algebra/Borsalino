@@ -16,7 +16,8 @@ use borsalino_tensor::layout::{Shape, Strides, TensorLayout};
 use borsalino_tensor::op::{DeterminismClass, OpLevel, PortRole, PortSpec, ShapeRule, TensorOp};
 use borsalino_tensor::ops::l0::{Add, BroadcastDiv, Cast, Copy, Gather, Mul};
 use borsalino_tensor::ops::l1::{MaskedMean, Max, RowwiseL2Norm, Sum};
-use borsalino_tensor::ops::l2::{BatchedMatMul, MatMul};
+use borsalino_tensor::ops::l2::{BatchedMatMul, MatMul, Transpose2D};
+use borsalino_tensor::ops::l3::Relu;
 
 /// 2^`exp` as an f64 — exact for every exponent these fixtures use.
 fn pow2(exp: i32) -> f64 {
@@ -739,6 +740,7 @@ fn error_taxonomy_is_exhaustive() {
     fn slug(err: &TensorError) -> &'static str {
         match err {
             TensorError::UnalignedOffset { .. } => "unaligned_offset",
+            TensorError::FlattenOverflow { .. } => "flatten_overflow",
             TensorError::ShapeOverflow { .. } => "shape_overflow",
             TensorError::ByteLenOverflow { .. } => "byte_len_overflow",
             TensorError::NonContiguous { .. } => "non_contiguous",
@@ -901,4 +903,109 @@ fn error_taxonomy_is_exhaustive() {
         .find(|error| matches!(error, TensorError::ArityMismatch { .. }))
         .expect("the taxonomy covers ArityMismatch");
     assert!(arity.to_string().contains("add"));
+}
+
+// ── issue #71: relu, transpose_2d, shape ergonomics ───────────────────
+
+#[test]
+fn relu_contract_is_l3_bitexact_identity() {
+    assert_eq!(<Relu as TensorOp>::NAME, "relu");
+    assert_eq!(<Relu as TensorOp>::LEVEL, OpLevel::L3);
+    assert_eq!(<Relu as TensorOp>::DETERMINISM, DeterminismClass::BitExact);
+    assert_eq!(<Relu as TensorOp>::SHAPE_RULE, ShapeRule::Identity);
+    let layout = TensorLayout::row_major(Dtype::F32, Shape::new(&[4]).unwrap()).unwrap();
+    let out = <Relu as TensorOp>::infer_shape(&[&layout.shape().clone()]).unwrap();
+    assert_eq!(out.dims(), &[4]);
+}
+
+#[test]
+fn transpose_2d_contract_swaps_rank_2_axes() {
+    assert_eq!(<Transpose2D as TensorOp>::NAME, "transpose_2d");
+    assert_eq!(
+        <Transpose2D as TensorOp>::DETERMINISM,
+        DeterminismClass::BitExact
+    );
+    assert_eq!(
+        <Transpose2D as TensorOp>::SHAPE_RULE,
+        ShapeRule::Transpose2D
+    );
+    let input = Shape::new(&[3, 5]).unwrap();
+    let out = ShapeRule::Transpose2D
+        .infer("transpose_2d", &[&input])
+        .unwrap();
+    assert_eq!(out.dims(), &[5, 3]);
+    // arity 1
+    let two: Vec<&Shape> = vec![&input, &input];
+    assert!(matches!(
+        ShapeRule::Transpose2D.infer("transpose_2d", &two),
+        Err(TensorError::ArityMismatch { .. })
+    ));
+    // non-rank-2 rejected
+    let rank3 = Shape::new(&[2, 3, 4]).unwrap();
+    assert!(matches!(
+        ShapeRule::Transpose2D.infer("transpose_2d", &[&rank3]),
+        Err(TensorError::RankMismatch { .. })
+    ));
+}
+
+#[test]
+fn shape_squeeze_drops_unit_dims() {
+    assert_eq!(Shape::new(&[7, 1]).unwrap().squeeze().dims(), &[7]);
+    assert_eq!(Shape::new(&[1, 7, 1]).unwrap().squeeze().dims(), &[7]);
+    assert_eq!(Shape::new(&[1, 1]).unwrap().squeeze().dims(), &[] as &[u32]);
+    assert_eq!(Shape::new(&[2, 3]).unwrap().squeeze().dims(), &[2, 3]);
+}
+
+#[test]
+fn shape_flatten_is_rank_one_with_the_element_count() {
+    assert_eq!(Shape::new(&[2, 3]).unwrap().flatten().unwrap().dims(), &[6]);
+    assert_eq!(Shape::new(&[4]).unwrap().flatten().unwrap().dims(), &[4]);
+    assert_eq!(
+        Shape::new(&[2, 3, 4]).unwrap().flatten().unwrap().dims(),
+        &[24]
+    );
+}
+
+/// Review r1 P1-1: a count exceeding `u32::MAX` cannot be a rank-1 dim —
+/// flatten must fail loudly, never silently change the element count.
+#[test]
+fn shape_flatten_rejects_counts_above_u32_max() {
+    // Exactly representable: [u32::MAX] flattens to itself.
+    assert_eq!(
+        Shape::new(&[u32::MAX]).unwrap().flatten().unwrap().dims(),
+        &[u32::MAX]
+    );
+    // 2^32 elements: the largest square shape that fits a u64 count.
+    match Shape::new(&[65536, 65536]).unwrap().flatten() {
+        Err(TensorError::FlattenOverflow { count }) => assert_eq!(count, 1 << 32),
+        other => panic!("flatten must reject a u32-unrepresentable count, got {other:?}"),
+    }
+    // And a non-square over-count too.
+    match Shape::new(&[u32::MAX, 2]).unwrap().flatten() {
+        Err(TensorError::FlattenOverflow { .. }) => {}
+        other => panic!("expected FlattenOverflow, got {other:?}"),
+    }
+}
+
+/// Review r1 P1-2: the transpose permutation index, exercised at the
+/// u32-overflow boundary WITHOUT allocating — the index function is pure.
+#[test]
+fn transpose_index_is_exact_at_the_u32_boundary() {
+    use borsalino_tensor::cpu::l2::transpose_index;
+    // [65536, 65537]: c = 65536, r = 0 → c*rows = 2^32, which wraps to 0
+    // in u32 arithmetic. The widened form must return exactly 2^32.
+    assert_eq!(transpose_index(0, 65536, 65536, 65537), 1 << 32);
+    // The input-side index for the same element: r*cols + c.
+    assert_eq!(transpose_input_index(0, 65536, 65537), 65536);
+    // A representable large case, both corners.
+    assert_eq!(transpose_index(1, 1, 2, 2), 3);
+    assert_eq!(
+        transpose_index(u32::MAX - 1, 0, u32::MAX, 1),
+        u32::MAX as u64 - 1
+    );
+}
+
+/// The input-side permutation index (kept alongside for the test).
+fn transpose_input_index(r: u32, c: u32, cols: u32) -> u64 {
+    r as u64 * cols as u64 + c as u64
 }
