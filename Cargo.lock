@@ -61,24 +61,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "borsalino"
-version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "52d3e23fb0c9be96303ea5cc91a5ffd45c33920ef922fe9c597ea56c200a8b43"
-dependencies = [
- "ash",
- "bytemuck",
- "naga",
- "objc",
- "thiserror",
- "zunesha 0.2.0",
-]
-
-[[package]]
 name = "borsalino-tensor"
 version = "0.1.0"
 dependencies = [
- "borsalino 0.8.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "borsalino",
  "katakuri",
  "serial_test",
  "thiserror",

@@ -6,6 +6,29 @@ follows [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+### Fixed — T2b review round 1
+
+- Reduction entries indexed shapes before validating them (r1 P1):
+  empty shape lists and short-rank shapes PANICKED at `dims()` before
+  the gate could reject. Arity + rank guards now run first, the
+  masked-mean `B*D` product is u64-widened (u32 multiply could overflow
+  before the gate compared it), and CPU-only `ErrBackend` regression
+  tests pin all three reproductions (no GPU needed — the reviewer's
+  technique, made permanent).
+- Documentation no longer claims WGSL forbids reassociation/fusion (it
+  promises nothing of the kind — r1 P1): bit-equality rests on the
+  explicit `fma`/`mul_add` pairing (one specified IEEE operation per
+  term, both sides) and is oracle-verified per stack.
+- Precision docs now include BroadcastDiv's finite results in the
+  architecture-precision seam, and mark the ulp bounds as observed on
+  this stack rather than portable guarantees (r1 P2).
+- `borsalino-tensor` now depends on the workspace `borsalino` by path
+  (version+path — publish-compatible): the version-only dep resolved
+  ambiguously and could compile against the published crate instead of
+  the local tree.
+- `borsalino` re-exports `bytemuck` so external `GpuBackend`
+  implementors (tests, spies) can name the `Pod` bound.
+
 ### Added — T2b: broadcast execution + fixed-order reductions (feature `gpu`)
 
 - Broadcast execution: `Add`/`Mul`/`BroadcastDiv` with unequal shapes
@@ -25,14 +48,17 @@ follows [Semantic Versioning](https://semver.org).
   outputs skip dispatch).
 - **Term granularity is now one fused multiply-add** in
   `masked_mean`/`rowwise_l2_norm` accumulations — WGSL `fma`, CPU
-  `mul_add`. Drivers contract mul-into-add anyway; making the fusion
-  explicit on both sides is what pins identical bits cross-device.
-  Order unchanged; CPU T1 tests unaffected (their fixtures are
-  exact-product cases).
+  `mul_add`. WGSL makes no promise about contraction; making the fusion
+  explicit on both sides means each term is ONE specified IEEE fused
+  operation on both sides, so the same rounding sequence holds by
+  construction (oracle-verified per stack). Order unchanged; CPU T1
+  tests unaffected (their fixtures are exact-product cases).
 - **New GPU equivalence seam, documented in the `gpu` module docs**:
   f32 division and `sqrt` are architecture-precision on this stack
-  (observed ≤1 and ≤2 ulp vs correctly-rounded). `masked_mean`/
-  `rowwise_l2_norm` oracles assert ulp bounds; determinism stays
+  (observed ≤1 and ≤2 ulp vs correctly-rounded — observed bounds, not
+  portable guarantees; the same oracle tests measure any other stack).
+  Affected: `masked_mean`, `rowwise_l2_norm`, and finite `div` results
+  whose exact quotient is not representable. Determinism stays
   unconditional. NaN payloads are platform-defined (`0/0` emits
   `0x7FFFFFFF` on GPU vs canonical quiet NaN on CPU) — NaNs compare by
   class.

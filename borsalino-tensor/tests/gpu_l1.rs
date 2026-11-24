@@ -480,6 +480,95 @@ fn gpu_reduction_pipelines_cache() {
     assert!(tg.pipelines().contains_key("masked_mean"));
 }
 
+/// A backend whose every call fails — the guards under test run BEFORE
+/// any backend call, so rejections prove the guards fired (r1's
+/// reproduction technique, made permanent).
+struct ErrBackend;
+
+impl borsalino::GpuBackend for ErrBackend {
+    fn init() -> borsalino::Result<Self> {
+        Err(borsalino::GpuError::NoBackend)
+    }
+    fn compile(&self, _entry: &str, _wgsl: &str) -> borsalino::Result<borsalino::ComputePipeline> {
+        Err(borsalino::GpuError::NoBackend)
+    }
+    fn create_buffer<T: borsalino::bytemuck::Pod>(
+        &self,
+        _data: &[T],
+    ) -> borsalino::Result<borsalino::GpuBuffer> {
+        Err(borsalino::GpuError::NoBackend)
+    }
+    fn create_buffer_uninit<T: borsalino::bytemuck::Pod>(
+        &self,
+        _len: usize,
+    ) -> borsalino::Result<borsalino::GpuBuffer> {
+        Err(borsalino::GpuError::NoBackend)
+    }
+    fn dispatch(
+        &self,
+        _pipeline: &borsalino::ComputePipeline,
+        _buffers: &[&borsalino::GpuBuffer],
+        _workgroups: (u32, u32, u32),
+    ) -> borsalino::Result<()> {
+        Err(borsalino::GpuError::NoBackend)
+    }
+    fn read_buffer<T: borsalino::bytemuck::Pod>(
+        &self,
+        _buffer: &borsalino::GpuBuffer,
+    ) -> borsalino::Result<Vec<T>> {
+        Err(borsalino::GpuError::NoBackend)
+    }
+    fn dispatch_ex(
+        &self,
+        _pipeline: &borsalino::ComputePipeline,
+        _buffers: &[&borsalino::GpuBuffer],
+        _workgroups: (u32, u32, u32),
+        _threads_per_group: (u32, u32, u32),
+    ) -> borsalino::Result<()> {
+        Err(borsalino::GpuError::NoBackend)
+    }
+    fn timestamp(&self) -> borsalino::Result<u64> {
+        Err(borsalino::GpuError::NoBackend)
+    }
+}
+
+/// r1 P1 regressions (CPU-only — no GPU needed): malformed reduction
+/// shapes must REJECT, not panic. Every case indexes shapes only after
+/// its guards, so `NoBackendStub` suffices: the panic happened before
+/// any backend call would have been made.
+#[test]
+#[serial_test::serial]
+fn gpu_reduction_entries_reject_malformed_shapes_without_panicking() {
+    let mut tg = TensorGpu::new(ErrBackend);
+    let rank2 = Shape::new(&[1, 1]).expect("fixture");
+
+    // masked_mean: empty shape list.
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        tg.execute_masked_mean(&[], &[], &[])
+    }));
+    assert!(
+        matches!(r, Ok(Err(TensorError::GpuDispatch { .. }))),
+        "empty shapes must reject, got {r:?}"
+    );
+    // masked_mean: rank-2 values shape where rank 3 is required.
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        tg.execute_masked_mean(&[], &[], &[&rank2, &rank2])
+    }));
+    assert!(
+        matches!(r, Ok(Err(TensorError::RankMismatch { .. }))),
+        "wrong rank must reject, got {r:?}"
+    );
+    // rowwise_l2_norm: rank-0 shape.
+    let scalar = Shape::new(&[]).expect("fixture");
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        tg.execute_rowwise_l2_norm(&[], &scalar)
+    }));
+    assert!(
+        matches!(r, Ok(Err(TensorError::RankMismatch { .. }))),
+        "rank-0 must reject, got {r:?}"
+    );
+}
+
 /// Type-level exports still resolve (the ops are usable through the
 /// trait surface used by the executor).
 #[test]

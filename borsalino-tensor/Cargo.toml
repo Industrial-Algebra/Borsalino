@@ -27,7 +27,7 @@ thiserror = "2"
 
 # T2: the compute half rides the substrate consumer (Borsalino 0.8 —
 # devices, queues, buffers are Zunesha's; dispatch/compile is Borsalino's).
-borsalino = { version = "0.8", optional = true }
+borsalino = { version = "0.8", path = "..", optional = true }
 
 # The T0 co-sign partner. Katakuri 0.2.0 publishes its typed layout
 # manifest (`katakuri::manifest`) as a *proposal* that this crate reviews
@@ -47,7 +47,7 @@ katakuri = "0.2.0"
 # `borsalino::init()` resolves per platform and the GPU gates skip
 # politely (or fail hard under BORSALINO_TENSOR_REQUIRE_GPU=1) when no
 # backend initialises.
-borsalino = { version = "0.8", features = ["vulkan", "metal"] }
+borsalino = { version = "0.8", path = "..", features = ["vulkan", "metal"] }
 # GPU tests serialise (driver state is not safe under concurrent device
 # creation — the substrate's own discipline).
 serial_test = "3"

@@ -14,14 +14,20 @@
 //! T2b adds broadcast execution (stride-mapped in the kernel, never a
 //! materialized expansion — equal shapes keep the elementwise pipeline)
 //! and the fixed-order reductions (`sum`, `max`, `rowwise_l2_norm`,
-//! `masked_mean`). Reduction kernels preserve the CPU reference's exact
-//! parenthesization: one invocation per output element, accumulating
+//! `masked_mean`). Reduction kernels preserve the CPU reference's
+//! accumulation order: one invocation per output element, accumulating
 //! strictly left-to-right, one **explicit fused multiply-add per term**
-//! (`fma` in WGSL, `mul_add` on the CPU — drivers contract mul-into-add
-//! anyway, so the fusion is made explicit on both sides to pin identical
-//! bits). That forecloses intra-axis parallelism (a tree or chunked
-//! split is a different parenthesization, hence different bits);
-//! parallelism is across output rows, where it is free.
+//! (`fma` in WGSL, `mul_add` on the CPU). WGSL makes NO promise that a
+//! compiler will not contract `acc + a*b` into an FMA — which is
+//! precisely why the fusion is explicit on both sides: `fma` and
+//! `mul_add` each denote ONE IEEE-754 fused operation with a single
+//! rounding, so both sides compute the same rounding sequence by
+//! construction rather than by compiler grace. Bit-equality is then
+//! VERIFIED per stack by the oracle tests, not assumed from the spec.
+//! The order-preserving structure forecloses intra-axis parallelism (a
+//! tree or chunked split is a different parenthesization, hence
+//! different bits); parallelism is across output rows, where it is
+//! free.
 //!
 //! The layer is thin by design: buffer lifetimes are per-call (created,
 //! dispatched, read back), matching the verification harness. Buffer
@@ -37,15 +43,21 @@
 //!   correctly-rounded result (`1e10 / 7` observed);
 //! - **`sqrt`** — up to two ulp off (RTX 5080, observed).
 //!
-//! Affected final results: `masked_mean` (ends in `weighted / weight`)
-//! and `rowwise_l2_norm` (ends in `sqrt`). Their oracles assert
-//! ulp-distance bounds instead of bit-equality; **dispatch-to-dispatch
-//! determinism is unconditional** (the same approximation replays
-//! identically). Additionally, **NaN payloads are platform-defined**:
-//! GPU `0/0` emits `0x7FFFFFFF` where the CPU emits the canonical quiet
-//! NaN — NaN results compare by class, never by bits. Everything else
-//! (elementwise ops, broadcast mapping, gather, transpose, `sum`,
-//! `max`) is bit-exact against the CPU oracle on the normal range.
+//! Affected results: `masked_mean` (ends in `weighted / weight`),
+//! `rowwise_l2_norm` (ends in `sqrt`), and the FINITE results of
+//! `BroadcastDiv`/elementwise `div` (divisions whose exact quotient is
+//! representable still land bit-exact; others may round one ulp off).
+//! Their oracles assert ulp-distance bounds — **the bounds are what
+//! this stack exhibits, not a portable guarantee**: on another
+//! backend the same tests run and report that stack's bound (or
+//! bit-equality). **Dispatch-to-dispatch determinism is unconditional**
+//! (the same approximation replays identically). Additionally, **NaN
+//! payloads are platform-defined**: GPU `0/0` emits `0x7FFFFFFF` where
+//! the CPU emits the canonical quiet NaN — NaN results compare by
+//! class, never by bits. Everything else (add/mul, broadcast mapping,
+//! gather, transpose, `sum`, `max`, and the reduction accumulations)
+//! is bit-exact against the CPU oracle on the normal range — again as
+//! oracle-verified fact, not spec promise.
 //!
 //! # Subnormal policy (FTZ/DAZ) — the first GPU equivalence seam
 //!
@@ -576,6 +588,16 @@ impl<B: GpuBackend> TensorGpu<B> {
     ) -> Result<Vec<f32>, TensorError> {
         type K = crate::ops::l1::RowwiseL2Norm;
         require_f32_ports::<K>()?;
+        // Rank guard BEFORE indexing (r1 P1): a rank-0 shape would panic
+        // at dims()[0] before the gate's validate could reject it.
+        if shape.rank() != 2 {
+            return Err(TensorError::RankMismatch {
+                op: K::NAME,
+                port: 0,
+                expected: "rank 2",
+                got: shape.rank(),
+            });
+        }
         let out_shape = gate::<K>(&[shape], &[input.len()], shape.dims()[0] as usize)?;
         if out_shape.element_count() == 0 {
             return Ok(Vec::new());
@@ -610,10 +632,32 @@ impl<B: GpuBackend> TensorGpu<B> {
     ) -> Result<Vec<f32>, TensorError> {
         type K = crate::ops::l1::MaskedMean;
         require_f32_ports::<K>()?;
+        // Arity + rank guards BEFORE indexing (r1 P1): empty shape lists
+        // and short-rank shapes panicked at dims() before the gate could
+        // reject them; the B*D product is widened so it cannot overflow
+        // u32 before the gate compares it against the inferred count.
+        if input_shapes.len() != K::INPUTS.len() {
+            return Err(TensorError::GpuDispatch {
+                op: K::NAME,
+                message: format!(
+                    "executor arity mismatch: op takes {} inputs, {} shapes given",
+                    K::INPUTS.len(),
+                    input_shapes.len()
+                ),
+            });
+        }
+        if input_shapes[0].rank() != 3 {
+            return Err(TensorError::RankMismatch {
+                op: K::NAME,
+                port: 0,
+                expected: "rank 3",
+                got: input_shapes[0].rank(),
+            });
+        }
         let out_shape = gate::<K>(
             input_shapes,
             &[values.len(), mask.len()],
-            (input_shapes[0].dims()[0] * input_shapes[0].dims()[2]) as usize,
+            (u64::from(input_shapes[0].dims()[0]) * u64::from(input_shapes[0].dims()[2])) as usize,
         )?;
         if out_shape.element_count() == 0 {
             return Ok(Vec::new());

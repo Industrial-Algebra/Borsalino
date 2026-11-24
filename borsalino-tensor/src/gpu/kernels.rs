@@ -11,8 +11,10 @@
 //! the T2b reductions carry
 //! [`DeterminismClass::FixedOrderReduction`](crate::op::DeterminismClass::FixedOrderReduction):
 //! each accumulating loop runs strictly left-to-right over its axis,
-//! one invocation per output element — WGSL forbids reassociation and
-//! fusion, so the parenthesization matches the CPU reference exactly.
+//! one invocation per output element, with one explicit `fma` per
+//! mul-into-add term — WGSL promises nothing about contraction, so the
+//! fusion is explicit on both sides (see the module docs in
+//! [`super`]).
 //! That forecloses intra-axis parallelism (a tree or chunked split is
 //! a different parenthesization, hence different bits); parallelism is
 //! across output rows/columns, where it is free.

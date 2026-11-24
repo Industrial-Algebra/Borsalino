@@ -112,6 +112,10 @@ mod kani_harnesses;
 /// Statistical determinism verification for GPU kernels.
 ///
 /// See [`determinism`] module docs for the determinism protocol.
+/// Re-exported so external [`GpuBackend`] implementors can name the
+/// `Pod` bound without matching borsalino's bytemuck version.
+pub use bytemuck;
+
 pub mod determinism;
 
 /// Reusable WGSL kernels for the Industrial Algebra ecosystem.
