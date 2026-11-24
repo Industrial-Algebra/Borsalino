@@ -117,7 +117,9 @@ impl<B: GpuBackend> TensorGpu<B> {
         output_len: usize,
         input_shapes: &[&crate::layout::Shape],
     ) -> Result<Vec<f32>, TensorError> {
-        gate::<K>(input_shapes, &[input.len()], output_len)?;
+        require_f32_ports::<K>()?;
+        let out_shape = gate::<K>(input_shapes, &[input.len()], output_len)?;
+        require_elementwise::<K>(input_shapes, &out_shape)?;
         Self::ensure_pipeline::<K>(&self.backend, &mut self.pipelines)?;
         let pipeline = self.pipelines.get(K::NAME).expect("just ensured");
         let in_buf = self
@@ -146,7 +148,7 @@ impl<B: GpuBackend> TensorGpu<B> {
 
         let workgroups = workgroup_count(output_len);
         self.backend
-            .dispatch(&pipeline, &buffers, workgroups)
+            .dispatch(pipeline, &buffers, workgroups)
             .map_err(|e| gpu_err::<K>(e))?;
         let result: Vec<f32> = self
             .backend
@@ -164,7 +166,9 @@ impl<B: GpuBackend> TensorGpu<B> {
         output_len: usize,
         input_shapes: &[&crate::layout::Shape],
     ) -> Result<Vec<f32>, TensorError> {
-        gate::<K>(input_shapes, &[lhs.len(), rhs.len()], output_len)?;
+        require_f32_ports::<K>()?;
+        let out_shape = gate::<K>(input_shapes, &[lhs.len(), rhs.len()], output_len)?;
+        require_elementwise::<K>(input_shapes, &out_shape)?;
         Self::ensure_pipeline::<K>(&self.backend, &mut self.pipelines)?;
         let pipeline = self.pipelines.get(K::NAME).expect("just ensured");
         let lhs_buf = self
@@ -194,7 +198,7 @@ impl<B: GpuBackend> TensorGpu<B> {
             buffers.push(pb);
         }
         self.backend
-            .dispatch(&pipeline, &buffers, workgroup_count(output_len))
+            .dispatch(pipeline, &buffers, workgroup_count(output_len))
             .map_err(|e| gpu_err::<K>(e))?;
         let result: Vec<f32> = self
             .backend
@@ -211,6 +215,26 @@ fn gpu_err<K: TensorOp>(e: borsalino::GpuError) -> TensorError {
     }
 }
 
+/// The generic f32 entry points refuse mixed-dtype ops (r2 P1): u32
+/// and f32 are both 4 bytes, so byte-length checks cannot tell a
+/// `[u32]`-shaped port fed an `&[f32]` slice apart — and that path
+/// would bypass `execute_gather`'s index validation into Unchecked
+/// reads. Mixed-dtype ops take dedicated entries.
+fn require_f32_ports<K: TensorOp>() -> Result<(), TensorError> {
+    for (port, input) in K::INPUTS.iter().enumerate() {
+        if input.dtype != crate::dtype::Dtype::F32 {
+            return Err(TensorError::GpuDispatch {
+                op: K::NAME,
+                message: format!(
+                    "port {port} takes {:?}; this entry point is f32-only (use a dedicated entry)",
+                    input.dtype
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// The executor's contract gate (review r1 P1): shapes must satisfy the
 /// op's rule, operand slices must match their shapes' element counts,
 /// and `output_len` must equal the inferred output — BEFORE any buffer
@@ -225,8 +249,22 @@ fn gate<K: TensorOp>(
     input_shapes: &[&Shape],
     input_lens: &[usize],
     output_len: usize,
-) -> Result<(), TensorError> {
+) -> Result<Shape, TensorError> {
     use crate::exec::{check_output, check_span, validate};
+
+    // Arity first (r2 P1): a caller passing MORE shapes than the op has
+    // ports would index `K::INPUTS` out of bounds; fewer shapes means a
+    // port silently defaults to layout[0]'s dtype downstream.
+    if input_shapes.len() != K::INPUTS.len() {
+        return Err(TensorError::GpuDispatch {
+            op: K::NAME,
+            message: format!(
+                "executor arity mismatch: op takes {} inputs, {} shapes given",
+                K::INPUTS.len(),
+                input_shapes.len()
+            ),
+        });
+    }
 
     let layouts: Vec<crate::layout::TensorLayout> = input_shapes
         .iter()
@@ -248,6 +286,31 @@ fn gate<K: TensorOp>(
                 "output count {output_len} exceeds the 1-D dispatch limit (u32::MAX elements)"
             ),
         });
+    }
+    Ok(out_shape)
+}
+
+/// Elementwise entries additionally require same-shape operands (r2 P1):
+/// an op's rule may infer a larger output from broadcast dims — the CPU
+/// reference expands; these kernels read elementwise and would need
+/// Unchecked OOB reads to satisfy that. Broadcast execution is T2b;
+/// reject rather than read past a short operand. (Gather is exempt:
+/// its indices operand is `[N]` while the output is `[N, D]` by
+/// design.)
+fn require_elementwise<K: TensorOp>(
+    input_shapes: &[&Shape],
+    out_shape: &Shape,
+) -> Result<(), TensorError> {
+    for shape in input_shapes {
+        if shape.element_count() != out_shape.element_count() {
+            return Err(TensorError::GpuDispatch {
+                op: K::NAME,
+                message: format!(
+                    "broadcasting is not yet supported by the GPU executor (input {:?} vs output {:?}); T2b",
+                    shape, out_shape
+                ),
+            });
+        }
     }
     Ok(())
 }

@@ -15,9 +15,8 @@
 
 mod common;
 
-use borsalino::GpuBackend;
 use borsalino_tensor::error::TensorError;
-use borsalino_tensor::gpu::{GpuKernel, TensorGpu};
+use borsalino_tensor::gpu::TensorGpu;
 use borsalino_tensor::layout::Shape;
 use borsalino_tensor::ops::l0::{Add, Mul};
 use borsalino_tensor::ops::l2::Transpose2D;
@@ -244,6 +243,35 @@ fn gpu_subnormal_flush_rule_is_sign_preserving_and_daz() {
         "negative subnormal sum → -0.0 (sign preserved through the flush)"
     );
 
+    let one_shape = Shape::new(&[1]).expect("fixture");
+    // INPUT-class discriminators (r2 P2): the exact result is NORMAL,
+    // so only input-flushing (DAZ) can produce a zero here — a
+    // result-flush (FTZ) alone would leave these results intact.
+    // sub × 1e10: exact = 5.9e-30 (normal). DAZ reads sub as 0 → 0.
+    let ten_shape = Shape::new(&[2]).expect("fixture");
+    let got = tg
+        .execute_binary::<Mul>(&[sub, neg_sub], &[1e10, 1e10], 2, &[&ten_shape, &ten_shape])
+        .expect("dispatch");
+    assert_eq!(
+        got[0].to_bits(),
+        0,
+        "subnormal INPUT × normal → 0 (input flush, not result flush)"
+    );
+    assert_eq!(
+        got[1].to_bits(),
+        (-0.0f32).to_bits(),
+        "sign preserved through the input read"
+    );
+    // sub + min_normal: exact = 1.5×min_normal (normal). DAZ → min_normal.
+    let got = tg
+        .execute_binary::<Add>(&[sub], &[f32::MIN_POSITIVE], 1, &[&one_shape, &one_shape])
+        .expect("dispatch");
+    assert_eq!(
+        got[0].to_bits(),
+        f32::MIN_POSITIVE.to_bits(),
+        "subnormal INPUT + normal → normal (the subnormal contributed nothing)"
+    );
+
     // mul, RESULT class (FTZ): normal × normal with a subnormal product.
     let two_shape = Shape::new(&[2]).expect("fixture");
     let tiny = 1e-20f32; // normal
@@ -328,6 +356,57 @@ fn gpu_executor_gates_malformed_calls() {
     match tg.execute_unary::<Relu>(&input, 7, &[&shape]) {
         Err(TensorError::ByteLenMismatch { .. }) => {}
         other => panic!("wrong output length must reject, got {other:?}"),
+    }
+}
+
+/// r2 P1 regressions: the two bypass classes the arity/type gate closes.
+#[test]
+#[serial_test::serial]
+fn gpu_executor_rejects_arity_and_dtype_bypass() {
+    let Some(g) = gpu() else { return };
+    let mut tg = TensorGpu::new(g);
+    let shape = Shape::new(&[8]).expect("fixture");
+    let input = vec![1.0f32; 8];
+
+    // Excess shapes: op takes 1 input, 2 given — must reject, not index
+    // K::INPUTS out of bounds.
+    match tg.execute_unary::<Relu>(&input, 8, &[&shape, &shape]) {
+        Err(TensorError::GpuDispatch { op, .. }) => assert_eq!(op, "relu"),
+        other => panic!("arity mismatch must reject, got {other:?}"),
+    }
+
+    // The generic f32 entry must refuse gather (its index port is u32 —
+    // same 4-byte width, so span checks alone cannot tell): this call
+    // previously dispatched Unchecked reads bypassing index validation.
+    match tg.execute_binary::<borsalino_tensor::ops::l0::Gather>(
+        &input,
+        &[0.0; 8],
+        8,
+        &[&shape, &shape],
+    ) {
+        Err(TensorError::GpuDispatch { op, .. }) => assert_eq!(op, "gather"),
+        other => panic!("mixed-dtype op must reject at the generic entry, got {other:?}"),
+    }
+}
+
+/// r2 P1 regression: broadcasting passes the op's shape rule but these
+/// kernels read elementwise — reject instead of reading past a short
+/// operand.
+#[test]
+#[serial_test::serial]
+fn gpu_executor_rejects_broadcasting() {
+    let Some(g) = gpu() else { return };
+    let mut tg = TensorGpu::new(g);
+    let n = Shape::new(&[8]).expect("fixture");
+    let one = Shape::new(&[1]).expect("fixture");
+    let lhs = vec![1.0f32; 8];
+    let rhs = vec![2.0f32; 1]; // [1] broadcasts to [8] on CPU
+    match tg.execute_binary::<Add>(&lhs, &rhs, 8, &[&n, &one]) {
+        Err(TensorError::GpuDispatch { op, message }) => {
+            assert_eq!(op, "add");
+            assert!(message.contains("broadcasting"), "{message}");
+        }
+        other => panic!("broadcast must reject, got {other:?}"),
     }
 }
 
