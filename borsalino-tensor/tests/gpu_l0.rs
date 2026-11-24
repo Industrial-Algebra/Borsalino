@@ -247,7 +247,9 @@ fn gpu_subnormal_flush_rule_is_sign_preserving_and_daz() {
     // INPUT-class discriminators (r2 P2): the exact result is NORMAL,
     // so only input-flushing (DAZ) can produce a zero here — a
     // result-flush (FTZ) alone would leave these results intact.
-    // sub × 1e10: exact = 5.9e-30 (normal). DAZ reads sub as 0 → 0.
+    // sub × 1e10: exact = 1.4e-35 (normal — well above min_normal
+    // 1.18e-38, so a result-flush alone could not zero it). DAZ reads
+    // sub as 0 → 0.
     let ten_shape = Shape::new(&[2]).expect("fixture");
     let got = tg
         .execute_binary::<Mul>(&[sub, neg_sub], &[1e10, 1e10], 2, &[&ten_shape, &ten_shape])
@@ -262,7 +264,8 @@ fn gpu_subnormal_flush_rule_is_sign_preserving_and_daz() {
         (-0.0f32).to_bits(),
         "sign preserved through the input read"
     );
-    // sub + min_normal: exact = 1.5×min_normal (normal). DAZ → min_normal.
+    // sub + min_normal: exact = min_normal + 1 ulp (sub IS the ulp of
+    // min_normal — a normal, distinct bits). DAZ → exactly min_normal.
     let got = tg
         .execute_binary::<Add>(&[sub], &[f32::MIN_POSITIVE], 1, &[&one_shape, &one_shape])
         .expect("dispatch");
@@ -373,6 +376,18 @@ fn gpu_executor_rejects_arity_and_dtype_bypass() {
     match tg.execute_unary::<Relu>(&input, 8, &[&shape, &shape]) {
         Err(TensorError::GpuDispatch { op, .. }) => assert_eq!(op, "relu"),
         other => panic!("arity mismatch must reject, got {other:?}"),
+    }
+
+    // Wrong ENTRY with matching shapes (r3 P1): execute_unary::<Add>
+    // with both shapes passed the shapes-vs-INPUTS gate — the zip
+    // silently dropped the missing operand and reached compilation.
+    match tg.execute_unary::<borsalino_tensor::ops::l0::Add>(&input, 8, &[&shape, &shape]) {
+        Err(TensorError::GpuDispatch { op, .. }) => assert_eq!(op, "add"),
+        other => panic!("binary op at the unary entry must reject, got {other:?}"),
+    }
+    match tg.execute_binary::<Relu>(&input, &input, 8, &[&shape]) {
+        Err(TensorError::GpuDispatch { op, .. }) => assert_eq!(op, "relu"),
+        other => panic!("unary op at the binary entry must reject, got {other:?}"),
     }
 
     // The generic f32 entry must refuse gather (its index port is u32 —

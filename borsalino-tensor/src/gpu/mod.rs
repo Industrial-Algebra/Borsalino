@@ -107,16 +107,30 @@ impl<B: GpuBackend> TensorGpu<B> {
     /// Execute a unary op over flat f32 operands: binds `input` then the
     /// `output` buffer, dispatches, reads the output back.
     ///
-    /// Shape validation is the caller's gate (the contract tests run
-    /// `validate` first — the executor does not re-derive it from flat
-    /// lengths, which is why the public execution API lands in T2b with
-    /// typed operands).
+    /// The contract gate runs first (r1): shapes through the op's rule,
+    /// slice lengths against shapes, output length against the inferred
+    /// shape — before any buffer exists.
     pub fn execute_unary<K: GpuKernel>(
         &mut self,
         input: &[f32],
         output_len: usize,
         input_shapes: &[&crate::layout::Shape],
     ) -> Result<Vec<f32>, TensorError> {
+        // Entry arity (r3 P1): the gate checks shapes-vs-INPUTS, but
+        // `execute_unary::<Add>` with BOTH shapes passed it — the zip of
+        // layouts with a one-element lens slice silently dropped the
+        // missing operand's span check and reached compilation. Each
+        // entry serves exactly its own arity.
+        if K::INPUTS.len() != 1 {
+            return Err(TensorError::GpuDispatch {
+                op: K::NAME,
+                message: format!(
+                    "execute_unary serves 1-input ops; {} takes {} — use the matching entry",
+                    K::NAME,
+                    K::INPUTS.len()
+                ),
+            });
+        }
         require_f32_ports::<K>()?;
         let out_shape = gate::<K>(input_shapes, &[input.len()], output_len)?;
         require_elementwise::<K>(input_shapes, &out_shape)?;
@@ -166,6 +180,16 @@ impl<B: GpuBackend> TensorGpu<B> {
         output_len: usize,
         input_shapes: &[&crate::layout::Shape],
     ) -> Result<Vec<f32>, TensorError> {
+        if K::INPUTS.len() != 2 {
+            return Err(TensorError::GpuDispatch {
+                op: K::NAME,
+                message: format!(
+                    "execute_binary serves 2-input ops; {} takes {} — use the matching entry",
+                    K::NAME,
+                    K::INPUTS.len()
+                ),
+            });
+        }
         require_f32_ports::<K>()?;
         let out_shape = gate::<K>(input_shapes, &[lhs.len(), rhs.len()], output_len)?;
         require_elementwise::<K>(input_shapes, &out_shape)?;
@@ -422,8 +446,16 @@ impl GpuKernel for crate::ops::l2::Transpose2D {
 
     fn params(input_shapes: &[&Shape]) -> Result<Vec<u32>, TensorError> {
         // The input's row count R: not recoverable from binding lengths
-        // (input and output have the same element count).
-        let [rows, _cols] = input_shapes[0].dims() else {
+        // (input and output have the same element count). The executor
+        // calls this only after the gate, but the trait method is
+        // public — reject instead of indexing (r3 P1).
+        let Some(first) = input_shapes.first() else {
+            return Err(TensorError::GpuDispatch {
+                op: Self::NAME,
+                message: "params called without input shapes".to_string(),
+            });
+        };
+        let [rows, _cols] = first.dims() else {
             return Err(TensorError::RankMismatch {
                 op: Self::NAME,
                 port: 0,
