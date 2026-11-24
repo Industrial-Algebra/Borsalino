@@ -6,6 +6,41 @@ follows [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+### Added — T2b: broadcast execution + fixed-order reductions (feature `gpu`)
+
+- Broadcast execution: `Add`/`Mul`/`BroadcastDiv` with unequal shapes
+  run stride-mapped kernels (params: `[rank, out_dims, lhs_strides,
+  rhs_strides]`; de-linearization from the fastest axis down). Equal
+  shapes keep the T2a elementwise pipeline. The r2 "broadcasting not
+  yet supported" rejection is gone — incompatible shapes still reject
+  at the shape rule. `execute_binary` is now bounded by the new
+  `BroadcastKernel` trait (compile-time: only 2-input all-f32
+  Broadcast-rule ops fit).
+- Reductions, preserving the CPU reference's exact parenthesization
+  (one invocation per output element, sequential within): `sum` (empty
+  input sums to `0.0`), `max` (strictly-`>` earliest-wins; empty input
+  rejects with `EmptyReduction` before dispatch), `rowwise_l2_norm`
+  (`[R,C]→[R]`, parallel across rows), `masked_mean`
+  (`[B,S,D]+[B,S]→[B,D]`, all-zero mask rows are `0.0`, zero-width
+  outputs skip dispatch).
+- **Term granularity is now one fused multiply-add** in
+  `masked_mean`/`rowwise_l2_norm` accumulations — WGSL `fma`, CPU
+  `mul_add`. Drivers contract mul-into-add anyway; making the fusion
+  explicit on both sides is what pins identical bits cross-device.
+  Order unchanged; CPU T1 tests unaffected (their fixtures are
+  exact-product cases).
+- **New GPU equivalence seam, documented in the `gpu` module docs**:
+  f32 division and `sqrt` are architecture-precision on this stack
+  (observed ≤1 and ≤2 ulp vs correctly-rounded). `masked_mean`/
+  `rowwise_l2_norm` oracles assert ulp bounds; determinism stays
+  unconditional. NaN payloads are platform-defined (`0/0` emits
+  `0x7FFFFFFF` on GPU vs canonical quiet NaN on CPU) — NaNs compare by
+  class.
+- 16-test `gpu_l1` suite: independent broadcast oracle (right-aligned
+  stride reference), reduction oracles, determinism, pipeline-cache,
+  empty/edge cases. Mutation-verified: broadcast order and reversed
+  sum order both fail their oracles.
+
 ### Added — T2a: GPU execution through Borsalino (feature `gpu`)
 
 - `gpu` feature + `gpu` module: `TensorGpu<B: GpuBackend>` executes
