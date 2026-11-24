@@ -12,15 +12,22 @@ readme = "README.md"
 keywords = ["tensor", "compute", "gpu", "inference", "borsalino"]
 categories = ["science", "mathematics"]
 
-# No optional features at T0, matching Borsalino's std-only stance (the
-# substrate has `default = []` and no `std` feature). The crate is the
-# typed contract: there is nothing to gate yet, and a dead `std` flag that
-# no `#![no_std]` path honours would misdescribe the crate.
+# T2 adds the `gpu` feature (WGSL-kernel execution through Borsalino);
+# the CPU reference stays the no-default-features execution path (Ijima's
+# GPU-less hosts). The consumer picks a backend by enabling `vulkan` or
+# `metal` on borsalino — feature unification carries it through this dep.
+
+[features]
+gpu = ["dep:borsalino"]
 
 [dependencies]
 # Central error enum for the taxonomy — IA standard, and the same pin the
 # substrate (Borsalino 0.7.0), Katakuri 0.2.0, and Zunesha 0.1.2 carry.
 thiserror = "2"
+
+# T2: the compute half rides the substrate consumer (Borsalino 0.8 —
+# devices, queues, buffers are Zunesha's; dispatch/compile is Borsalino's).
+borsalino = { version = "0.8", optional = true }
 
 # The T0 co-sign partner. Katakuri 0.2.0 publishes its typed layout
 # manifest (`katakuri::manifest`) as a *proposal* that this crate reviews
@@ -34,3 +41,13 @@ katakuri = "0.2.0"
 
 # Declare nothing else. Every addition needs a written justification at
 # introduction (handover §8) — no pre-declared dependencies.
+
+[dev-dependencies]
+# Both backends: on Linux only vulkan builds, on macOS only metal —
+# `borsalino::init()` resolves per platform and the GPU gates skip
+# politely (or fail hard under BORSALINO_TENSOR_REQUIRE_GPU=1) when no
+# backend initialises.
+borsalino = { version = "0.8", features = ["vulkan", "metal"] }
+# GPU tests serialise (driver state is not safe under concurrent device
+# creation — the substrate's own discipline).
+serial_test = "3"

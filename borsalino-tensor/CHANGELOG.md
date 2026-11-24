@@ -6,6 +6,30 @@ follows [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+### Added — T2a: GPU execution through Borsalino (feature `gpu`)
+
+- `gpu` feature + `gpu` module: `TensorGpu<B: GpuBackend>` executes
+  contracted ops as WGSL kernels (compile-once-per-op cache, operands
+  in port order with output last and op-params buffers after it);
+  `GpuKernel` binds an op type to its source/entry/params.
+- Kernels for the BitExact op class: `relu`, `add`/`mul` (same-shape),
+  `gather`, `transpose_2d` (shape carried in a trailing u32 params
+  buffer — not recoverable from binding lengths).
+- Equivalence gates: every kernel runs against the T1 CPU oracle with
+  bit-identical comparison on the normal range, plus repeat-dispatch
+  determinism. Mutation-checked (a passthrough relu mutant fails).
+- **Subnormal policy (FTZ/DAZ), the GPU equivalence seam:** dispatch
+  determinism is unconditional; oracle bit-equality holds on the normal
+  range. Subnormals flush to a sign-preserving zero (inputs AND
+  results), and comparisons read them as zero — Vulkan/Metal permit
+  both, WGSL cannot disable them, and the hardware (RTX 5080)
+  exercises both. Pinned as contract by
+  `gpu_subnormal_flush_rule_is_sign_preserving_and_daz`. Katakuri's
+  TrustPolicy keeps subnormal weights — consumers moving them to GPU
+  accept the flush.
+- New `TensorError::GpuDispatch` taxonomy variant (op-named backend
+  failures).
+
 ### Added — issue #71 requirements (from Amari Cohort 8, the first T1 consumer)
 
 - `ops::l3` module with `Relu` — the first activation op, so

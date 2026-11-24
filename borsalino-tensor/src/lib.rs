@@ -111,3 +111,9 @@ pub mod manifest;
 pub mod op;
 pub mod ops;
 pub mod oracle;
+
+/// WGSL-kernel execution through Borsalino (T2a; feature `gpu`). The
+/// CPU reference in [`cpu`] remains the equivalence oracle and the
+/// no-default-features execution path.
+#[cfg(feature = "gpu")]
+pub mod gpu;

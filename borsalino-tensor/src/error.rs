@@ -30,6 +30,16 @@ pub enum TensorError {
         shape: Vec<u32>,
     },
 
+    /// A GPU dispatch failed at the Borsalino layer (compile, buffer
+    /// creation, submission, or readback). The op name names the kernel.
+    #[error("gpu dispatch of `{op}` failed: {message}")]
+    GpuDispatch {
+        /// The op's contract name (the kernel that was dispatched).
+        op: &'static str,
+        /// The backend error, stringified.
+        message: String,
+    },
+
     /// A [`Shape::flatten`](crate::layout::Shape::flatten) target cannot
     /// represent the element count: rank 1 needs one `u32` dimension, and
     /// the count exceeds `u32::MAX`. Saturating would silently change the
