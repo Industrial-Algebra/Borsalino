@@ -46,6 +46,7 @@ pub mod kernels;
 
 use crate::error::TensorError;
 use crate::op::TensorOp;
+use crate::ops::l0::Gather;
 
 /// WGSL source and entry point for a contracted op's kernel.
 pub trait GpuKernel: TensorOp {
@@ -116,6 +117,7 @@ impl<B: GpuBackend> TensorGpu<B> {
         output_len: usize,
         input_shapes: &[&crate::layout::Shape],
     ) -> Result<Vec<f32>, TensorError> {
+        gate::<K>(input_shapes, &[input.len()], output_len)?;
         Self::ensure_pipeline::<K>(&self.backend, &mut self.pipelines)?;
         let pipeline = self.pipelines.get(K::NAME).expect("just ensured");
         let in_buf = self
@@ -162,6 +164,7 @@ impl<B: GpuBackend> TensorGpu<B> {
         output_len: usize,
         input_shapes: &[&crate::layout::Shape],
     ) -> Result<Vec<f32>, TensorError> {
+        gate::<K>(input_shapes, &[lhs.len(), rhs.len()], output_len)?;
         Self::ensure_pipeline::<K>(&self.backend, &mut self.pipelines)?;
         let pipeline = self.pipelines.get(K::NAME).expect("just ensured");
         let lhs_buf = self
@@ -208,7 +211,103 @@ fn gpu_err<K: TensorOp>(e: borsalino::GpuError) -> TensorError {
     }
 }
 
+/// The executor's contract gate (review r1 P1): shapes must satisfy the
+/// op's rule, operand slices must match their shapes' element counts,
+/// and `output_len` must equal the inferred output — BEFORE any buffer
+/// is created or dispatched. Kernels compile with `Unchecked` buffer
+/// bounds, so a short operand against a declared shape would otherwise
+/// be an unchecked GPU read.
+///
+/// Also rejects output counts the 1-D dispatch grid cannot cover
+/// (r1 P2: `ceil(n/256)` saturates `u32` above `u32::MAX` elements and
+/// would silently omit the tail).
+fn gate<K: TensorOp>(
+    input_shapes: &[&Shape],
+    input_lens: &[usize],
+    output_len: usize,
+) -> Result<(), TensorError> {
+    use crate::exec::{check_output, check_span, validate};
+
+    let layouts: Vec<crate::layout::TensorLayout> = input_shapes
+        .iter()
+        .enumerate()
+        .map(|(port, shape)| {
+            crate::layout::TensorLayout::row_major(K::INPUTS[port].dtype, (*shape).clone())
+        })
+        .collect::<Result<_, _>>()?;
+    let layout_refs: Vec<&crate::layout::TensorLayout> = layouts.iter().collect();
+    let out_shape = validate::<K>(&layout_refs)?;
+    for (port, (layout, len)) in layouts.iter().zip(input_lens).enumerate() {
+        check_span::<K>(port, layout, *len)?;
+    }
+    check_output::<K>(&out_shape, output_len)?;
+    if output_len > u32::MAX as usize {
+        return Err(TensorError::GpuDispatch {
+            op: K::NAME,
+            message: format!(
+                "output count {output_len} exceeds the 1-D dispatch limit (u32::MAX elements)"
+            ),
+        });
+    }
+    Ok(())
+}
+
 /// 1-D dispatch grid for `n` elements at 256 threads per group.
+impl<B: GpuBackend> TensorGpu<B> {
+    /// Execute `gather`: `[V, D]` table + `[N]` u32 indices → `[N, D]`.
+    ///
+    /// Mirrors the CPU reference's contract exactly: the whole index
+    /// list is validated BEFORE dispatch — an out-of-range index
+    /// rejects with [`TensorError::IndexOutOfRange`] instead of the
+    /// kernel's defensive clamp ever mattering (review r1: gather
+    /// lacked executor integration; the kernel clamp is the last line,
+    /// not the contract).
+    pub fn execute_gather(
+        &mut self,
+        table: &[f32],
+        indices: &[u32],
+        output_len: usize,
+        input_shapes: &[&Shape],
+    ) -> Result<Vec<f32>, TensorError> {
+        gate::<Gather>(input_shapes, &[table.len(), indices.len()], output_len)?;
+        // Index validation (the CPU gate, host-side).
+        let rows = input_shapes[0].dims()[0];
+        for (position, &index) in indices.iter().enumerate() {
+            if index >= rows {
+                return Err(TensorError::IndexOutOfRange {
+                    op: <Gather as TensorOp>::NAME,
+                    position: position as u64,
+                    index,
+                    rows,
+                });
+            }
+        }
+        Self::ensure_pipeline::<Gather>(&self.backend, &mut self.pipelines)?;
+        let pipeline = self.pipelines.get(Gather::NAME).expect("just ensured");
+        let table_buf = self
+            .backend
+            .create_buffer(table)
+            .map_err(gpu_err::<Gather>)?;
+        let index_buf = self
+            .backend
+            .create_buffer(indices)
+            .map_err(gpu_err::<Gather>)?;
+        let out_buf = self
+            .backend
+            .create_buffer_uninit::<f32>(output_len)
+            .map_err(gpu_err::<Gather>)?;
+        let buffers: Vec<&GpuBuffer> = vec![&table_buf, &index_buf, &out_buf];
+        self.backend
+            .dispatch(pipeline, &buffers, workgroup_count(output_len))
+            .map_err(gpu_err::<Gather>)?;
+        let result: Vec<f32> = self
+            .backend
+            .read_buffer(&out_buf)
+            .map_err(gpu_err::<Gather>)?;
+        Ok(result)
+    }
+}
+
 fn workgroup_count(n: usize) -> (u32, u32, u32) {
     let n = u32::try_from(n).unwrap_or(u32::MAX);
     (n.div_ceil(256), 1, 1)
@@ -239,6 +338,15 @@ impl GpuKernel for crate::ops::l0::Add {
 impl GpuKernel for crate::ops::l0::Mul {
     const SOURCE: &'static str = kernels::MUL;
     const ENTRY: &'static str = "mul";
+
+    fn params(_input_shapes: &[&Shape]) -> Result<Vec<u32>, TensorError> {
+        Ok(Vec::new())
+    }
+}
+
+impl GpuKernel for crate::ops::l0::Gather {
+    const SOURCE: &'static str = kernels::GATHER;
+    const ENTRY: &'static str = "gather";
 
     fn params(_input_shapes: &[&Shape]) -> Result<Vec<u32>, TensorError> {
         Ok(Vec::new())

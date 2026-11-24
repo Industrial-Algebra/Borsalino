@@ -16,6 +16,7 @@
 mod common;
 
 use borsalino::GpuBackend;
+use borsalino_tensor::error::TensorError;
 use borsalino_tensor::gpu::{GpuKernel, TensorGpu};
 use borsalino_tensor::layout::Shape;
 use borsalino_tensor::ops::l0::{Add, Mul};
@@ -98,12 +99,46 @@ fn gpu_add_matches_cpu_oracle_bit_exactly() {
     let mut tg = TensorGpu::new(g);
     let n = 1027;
     let lhs = adversarial_normal(n);
-    let rhs = adversarial_normal(n + 1); // shifted classes
+    // rhs is GENUINELY class-shifted by one position (classes[(i+1)%11]
+    // at index i — NOT a slice of a longer vector, which yields the same
+    // values at the same indices and pairs MAX with MAX → inf).
+    let rhs: Vec<f32> = (0..n)
+        .map(|i| {
+            let classes = [
+                1.0f32,
+                -1.0,
+                0.0,
+                -0.0,
+                f32::MIN_POSITIVE,
+                -f32::MIN_POSITIVE,
+                f32::MAX,
+                f32::MIN,
+                1e-20,
+                -3.75,
+                0.5,
+            ];
+            classes[(i + 1) % 11] + (i / 64) as f32 * 1e-3
+        })
+        .collect();
     let shape = Shape::new(&[n as u32]).expect("fixture");
     let got = tg
-        .execute_binary::<Add>(&lhs[..n], &rhs[..n], n, &[&shape, &shape])
+        .execute_binary::<Add>(&lhs, &rhs, n, &[&shape, &shape])
         .expect("dispatch");
-    let expected: Vec<f32> = lhs[..n].iter().zip(&rhs[..n]).map(|(a, b)| a + b).collect();
+    // The fixture proves itself: every expected sum is finite and
+    // normal-or-zero (overflow and subnormal sums are outside this gate
+    // — the flush seam has its own test).
+    let expected: Vec<f32> = lhs
+        .iter()
+        .zip(&rhs)
+        .map(|(a, b)| {
+            let s = a + b;
+            assert!(
+                s.is_finite() && (s.is_normal() || s == 0.0),
+                "fixture produced {s} from {a} + {b}"
+            );
+            s
+        })
+        .collect();
     assert_eq!(bits(&got), bits(&expected));
 }
 
@@ -187,17 +222,113 @@ fn gpu_subnormal_flush_rule_is_sign_preserving_and_daz() {
         "(-sub) + (-sub) → -0.0 (sign preserved)"
     );
 
-    // mul: a subnormal RESULT flushes too (normal × normal → subnormal).
+    // add, RESULT class (FTZ): two NORMAL operands whose exact sum is
+    // subnormal — 1.5×min_normal + (-min_normal) = 0.5×min_normal. The
+    // inputs survive; only the result flushes.
+    let min_n = f32::MIN_POSITIVE; // smallest normal
+    let a = 1.5f32 * min_n; // normal
+    let b = -min_n; // normal
+    let exact = a + b; // subnormal on exact hardware
+    assert!(exact.is_subnormal(), "fixture: exact sum must be subnormal");
+    let got = tg
+        .execute_binary::<Add>(&[a, -a, sub], &[b, -b, sub], 3, &[&shape, &shape])
+        .expect("dispatch");
+    assert_eq!(
+        got[0].to_bits(),
+        0,
+        "subnormal SUM of normals → +0.0 (result FTZ)"
+    );
+    assert_eq!(
+        got[1].to_bits(),
+        (-0.0f32).to_bits(),
+        "negative subnormal sum → -0.0 (sign preserved through the flush)"
+    );
+
+    // mul, RESULT class (FTZ): normal × normal with a subnormal product.
+    let two_shape = Shape::new(&[2]).expect("fixture");
     let tiny = 1e-20f32; // normal
     let got = tg
-        .execute_binary::<Mul>(&[tiny, tiny], &[1.0, 1.0], 2, &[&shape, &shape])
+        .execute_binary::<Mul>(&[tiny, tiny], &[1.0, 1.0], 2, &[&two_shape, &two_shape])
         .expect("dispatch");
     // tiny×1.0 = tiny (normal): passes through.
     let got2 = tg
-        .execute_binary::<Mul>(&[tiny, tiny], &[tiny, tiny], 2, &[&shape, &shape])
+        .execute_binary::<Mul>(&[tiny, tiny], &[tiny, tiny], 2, &[&two_shape, &two_shape])
         .expect("dispatch");
     assert_eq!(got[0].to_bits(), tiny.to_bits());
-    assert_eq!(got2[0].to_bits(), 0, "subnormal result → +0.0");
+    assert_eq!(got2[0].to_bits(), 0, "subnormal product → +0.0");
+}
+
+/// Gather end-to-end: oracle equality vs an independently written
+/// row-copy reference, plus the contract rejection (out-of-range index
+/// → IndexOutOfRange BEFORE dispatch — mirroring the CPU gate, not the
+/// kernel's defensive clamp).
+#[test]
+#[serial_test::serial]
+fn gpu_gather_matches_cpu_oracle_and_rejects_bad_indices() {
+    let Some(g) = gpu() else { return };
+    let mut tg = TensorGpu::new(g);
+    let (vocab, dim) = (37u32, 11u32);
+    let table: Vec<f32> = (0..vocab * dim).map(|i| i as f32 * 0.25 - 40.0).collect();
+    let indices: Vec<u32> = vec![0, 36, 5, 0, 19, 36, 36, 5];
+    let table_shape = Shape::new(&[vocab, dim]).expect("fixture");
+    let idx_shape = Shape::new(&[indices.len() as u32]).expect("fixture");
+    let out_len = indices.len() * dim as usize;
+
+    let got = tg
+        .execute_gather(&table, &indices, out_len, &[&table_shape, &idx_shape])
+        .expect("dispatch");
+    // Independent reference: out[n*d + c] = table[idx[n]*d + c].
+    let expected: Vec<f32> = indices
+        .iter()
+        .flat_map(|&idx| {
+            table[(idx * dim) as usize..((idx + 1) * dim) as usize]
+                .iter()
+                .copied()
+        })
+        .collect();
+    assert_eq!(bits(&got), bits(&expected));
+
+    // Out-of-range rejects BEFORE dispatch (the CPU contract, host-side).
+    let mut bad = vec![0u32; indices.len()];
+    bad[indices.len() - 1] = vocab;
+    match tg.execute_gather(
+        &table,
+        &bad,
+        indices.len() * dim as usize,
+        &[&table_shape, &idx_shape],
+    ) {
+        Err(TensorError::IndexOutOfRange {
+            op, index, rows, ..
+        }) => {
+            assert_eq!(op, "gather");
+            assert_eq!(index, vocab);
+            assert_eq!(rows, vocab);
+        }
+        other => panic!("out-of-range index must reject, got {other:?}"),
+    }
+}
+
+/// The executor's contract gate (review r1 P1): malformed calls reject
+/// BEFORE any buffer exists — a short operand against a declared shape,
+/// and a wrong output length.
+#[test]
+#[serial_test::serial]
+fn gpu_executor_gates_malformed_calls() {
+    let Some(g) = gpu() else { return };
+    let mut tg = TensorGpu::new(g);
+    let shape = Shape::new(&[8]).expect("fixture");
+    let input = vec![1.0f32; 8];
+
+    // Operand shorter than its declared shape.
+    match tg.execute_unary::<Relu>(&input[..5], 5, &[&shape]) {
+        Err(TensorError::ByteLenMismatch { .. }) => {}
+        other => panic!("short operand must reject, got {other:?}"),
+    }
+    // Output length disagreeing with the inferred shape.
+    match tg.execute_unary::<Relu>(&input, 7, &[&shape]) {
+        Err(TensorError::ByteLenMismatch { .. }) => {}
+        other => panic!("wrong output length must reject, got {other:?}"),
+    }
 }
 
 #[test]
