@@ -740,6 +740,7 @@ fn error_taxonomy_is_exhaustive() {
     fn slug(err: &TensorError) -> &'static str {
         match err {
             TensorError::UnalignedOffset { .. } => "unaligned_offset",
+            TensorError::GpuDispatch { .. } => "gpu_dispatch",
             TensorError::FlattenOverflow { .. } => "flatten_overflow",
             TensorError::ShapeOverflow { .. } => "shape_overflow",
             TensorError::ByteLenOverflow { .. } => "byte_len_overflow",
