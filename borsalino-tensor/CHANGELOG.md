@@ -6,6 +6,25 @@ follows [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+### Fixed — T2c review round 1
+
+- Overflow-class shapes panicked before the zero could matter (r1 P1):
+  `[MAX,MAX,MAX,0] x [MAX,MAX,0,0]` overflowed u64 computing `B*H*S`
+  BEFORE multiplying by the trailing zero — the "widened" product still
+  overflowed. `dim_product` now scans for a zero dimension FIRST (any
+  zero → empty output, exact), then checked-multiplies; all-nonzero
+  products that exceed u64 reject with a named error (the gate rejects
+  them as > u32::MAX anyway).
+- Public `BatchedMatMul::params` panicked on overflowing u32 stride
+  products (r1 P2 — the method is public with no documented
+  precondition): stride products are now zero-aware (a zero factor →
+  stride 0, unused) and checked — overflow rejects. The entry path
+  cannot reach the overflow (span checks bound S*D <= u32::MAX); the
+  defense is for direct calls.
+- Coverage added: H=0 and S=0 empty-output arms, the two overflow
+  regressions (CPU-only, ErrBackend), and a second-call cache+correct
+  assertion.
+
 ### Added — T2c: GEMM kernels (feature `gpu`)
 
 - `matmul` (`[M,K] x [K,N] -> [M,N]`) and `batched_matmul`

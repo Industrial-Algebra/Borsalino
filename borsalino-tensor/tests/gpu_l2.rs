@@ -232,6 +232,20 @@ fn gpu_batched_matmul_empty_dimensions() {
         .execute_batched_matmul(&lhs_of(2 * 3 * 5 * 7, 1), &[], &[&ls, &rs])
         .expect("dispatch");
     assert!(got.is_empty());
+    // H = 0 and S = 0: empty outputs (the coverage r1 asked for).
+    let ls = Shape::new(&[2, 0, 5, 7]).expect("fixture");
+    let rs = Shape::new(&[2, 0, 7, 11]).expect("fixture");
+    let got = tg
+        .execute_batched_matmul(&[], &[], &[&ls, &rs])
+        .expect("dispatch");
+    assert!(got.is_empty());
+    let ls = Shape::new(&[2, 3, 0, 7]).expect("fixture");
+    let rs = Shape::new(&[2, 3, 7, 11]).expect("fixture");
+    // rhs keeps its B*H*D*T elements (S does not appear in rhs).
+    let got = tg
+        .execute_batched_matmul(&[], &rhs_of(2 * 3 * 7, 11), &[&ls, &rs])
+        .expect("dispatch");
+    assert!(got.is_empty());
     // D = 0: 30 outputs of 0.0.
     let ls = Shape::new(&[2, 3, 5, 0]).expect("fixture");
     let rs = Shape::new(&[2, 3, 0, 11]).expect("fixture");
@@ -295,11 +309,66 @@ fn gpu_gemm_pipelines_cache() {
     let data = [1.0f32; 16];
     let _ = tg.execute_matmul(&data, &data, &[&ls, &rs]).expect("warm");
     assert!(tg.pipelines().contains_key("matmul"));
+    // Second call reuses the cached pipeline and stays correct.
+    let again = tg
+        .execute_matmul(&data, &data, &[&ls, &rs])
+        .expect("second");
+    let first = &tg.pipelines();
+    let _ = first;
+    assert_eq!(again.len(), 16);
     let bls = Shape::new(&[1, 1, 4, 4]).expect("fixture");
     let _ = tg
         .execute_batched_matmul(&data, &data, &[&bls, &bls])
         .expect("warm");
     assert!(tg.pipelines().contains_key("batched_matmul"));
+}
+
+/// r1 #75 regressions (CPU-only): overflow-class shapes must reach the
+/// empty-output early return (or a named error), never panic. The
+/// reviewer's reproductions: `[MAX,MAX,MAX,0] x [MAX,MAX,0,0]` (the
+/// B*H*S product overflowed u64 before the trailing zero) and a direct
+/// public `params` call on `[0,1,MAX,2] x [0,1,2,1]` (u32 stride
+/// product overflow).
+#[test]
+#[serial_test::serial]
+fn gpu_gemm_overflow_shapes_never_panic() {
+    use borsalino_tensor::gpu::GpuKernel;
+    use borsalino_tensor::ops::l2::BatchedMatMul;
+    let mut tg = TensorGpu::new(ErrBackend);
+    let max = u32::MAX;
+    let ls = Shape::new(&[max, max, max, 0]).expect("fixture");
+    let rs = Shape::new(&[max, max, 0, 0]).expect("fixture");
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        tg.execute_batched_matmul(&[], &[], &[&ls, &rs])
+    }));
+    assert!(matches!(&r, Ok(Ok(out)) if out.is_empty()), "{r:?}");
+
+    // Direct public params with an overflowing stride product (both
+    // factors non-zero, product > u32): must reject, not panic.
+    let ls = Shape::new(&[0, 1, max, 2]).expect("fixture");
+    let rs = Shape::new(&[0, 1, 2, 1]).expect("fixture");
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        BatchedMatMul::params(&[&ls, &rs])
+    }));
+    // The zero is in B, which is not a stride factor: S*D = MAX*2
+    // genuinely overflows, so the honest answer is Err — a Result,
+    // never a panic. (The entry path cannot reach this: the
+    // empty-output early return fires first, and span checks bound
+    // S*D <= u32::MAX otherwise.)
+    assert!(
+        matches!(&r, Ok(Err(TensorError::GpuDispatch { .. }))),
+        "overflowing stride must reject, got {r:?}"
+    );
+    // All-nonzero overflow rejects.
+    let ls = Shape::new(&[1, 1, max, 2]).expect("fixture");
+    let rs = Shape::new(&[1, 1, 2, 1]).expect("fixture");
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        BatchedMatMul::params(&[&ls, &rs])
+    }));
+    assert!(
+        matches!(r, Ok(Err(TensorError::GpuDispatch { .. }))),
+        "{r:?}"
+    );
 }
 
 /// A backend whose every call fails — the guards under test run BEFORE

@@ -394,6 +394,50 @@ fn broadcast_params(input_shapes: &[&Shape], out_shape: &Shape) -> Result<Vec<u3
     Ok(params)
 }
 
+/// Zero-aware checked u32 stride product: zero when either factor is
+/// zero (the stride is then unused — the executor's empty-output early
+/// return fires); overflow REJECTS rather than silently producing a
+/// wrong stride (the entry path cannot reach this — the gate bounds
+/// the spans — but the method is public with no documented
+/// precondition).
+fn stride_product(op: &'static str, a: u32, b: u32) -> Result<u32, TensorError> {
+    if a == 0 || b == 0 {
+        return Ok(0);
+    }
+    a.checked_mul(b).ok_or(TensorError::GpuDispatch {
+        op,
+        message: format!("stride product {a}x{b} overflows u32"),
+    })
+}
+
+/// Zero-aware checked output-count product (r1 #75 P1): a single zero
+/// dimension makes the output empty regardless of the others —
+/// `[MAX,MAX,MAX,0]` must reach the empty-output early return, not
+/// overflow u64 computing `MAX^3` first. All-nonzero products that
+/// exceed u64 reject (the gate would reject them as > u32::MAX anyway).
+fn dim_product(dims: &[u32]) -> Result<u64, TensorError> {
+    // Scan for a zero FIRST: any zero dimension makes the output empty
+    // regardless of the others — [MAX,MAX,MAX,0] must reach the
+    // empty-output early return, not overflow computing MAX^3 before
+    // meeting the zero.
+    if dims.iter().any(|&dim| dim == 0) {
+        return Ok(0);
+    }
+    let mut product: u64 = 1;
+    for &dim in dims {
+        if dim == 0 {
+            return Ok(0);
+        }
+        product = product
+            .checked_mul(u64::from(dim))
+            .ok_or_else(|| TensorError::GpuDispatch {
+                op: "output count",
+                message: "output element count overflows u64".to_string(),
+            })?;
+    }
+    Ok(product)
+}
+
 fn gpu_err<K: TensorOp>(e: borsalino::GpuError) -> TensorError {
     TensorError::GpuDispatch {
         op: K::NAME,
@@ -785,7 +829,7 @@ impl<B: GpuBackend> TensorGpu<B> {
         let out_shape = gate::<K>(
             input_shapes,
             &[lhs.len(), rhs.len()],
-            (u64::from(b) * u64::from(h) * u64::from(s) * u64::from(t)) as usize,
+            dim_product(&[b, h, s, t])? as usize,
         )?;
         if out_shape.element_count() == 0 {
             return Ok(Vec::new());
@@ -982,7 +1026,15 @@ impl GpuKernel for crate::ops::l2::BatchedMatMul {
             Some(second) => second.dims().get(3).copied().unwrap_or(0),
             None => 0,
         };
-        Ok(vec![*rows, columns, *inner, rows * inner, inner * columns])
+        // The slice strides are `S*D` and `D*T` in u32 — computed only
+        // when both factors are non-zero (a zero dimension makes the
+        // product unused: the executor's empty-output early return
+        // fires, and a direct public call gets well-defined zeros);
+        // otherwise checked, because the method is public with no
+        // documented precondition (r1 #75 P2).
+        let lhs_stride = stride_product(Self::NAME, *rows, *inner)?;
+        let rhs_stride = stride_product(Self::NAME, *inner, columns)?;
+        Ok(vec![*rows, columns, *inner, lhs_stride, rhs_stride])
     }
 }
 
