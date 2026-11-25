@@ -301,3 +301,70 @@ fn masked_mean(@builtin(global_invocation_id) gid: vec3<u32>) {
     output[i] = select(0.0, weighted / weight, weight != 0.0);
 }
 "#;
+
+/// `matmul` (T2c): `[M,K] x [K,N] -> [M,N]`, one invocation per output
+/// element, the K contraction accumulated strictly ascending with one
+/// `fma` request per term — the same request the CPU reference makes
+/// via `mul_add` (module docs: what that does and does not guarantee).
+/// FixedOrderGemm: the parenthesization is the contract. Params:
+/// `[K, N]` — the row and column recover from the flat output index
+/// given N, but K cannot be recovered from binding lengths.
+/// Bindings: lhs, rhs, output, params.
+pub const MATMUL: &str = r#"
+@group(0) @binding(0) var<storage, read> lhs: array<f32>;
+@group(0) @binding(1) var<storage, read> rhs: array<f32>;
+@group(0) @binding(2) var<storage, read_write> output: array<f32>;
+@group(0) @binding(3) var<storage, read> params: array<u32>;
+
+@compute @workgroup_size(256)
+fn matmul(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= arrayLength(&output)) { return; }
+    let k = params[0u];
+    let n = params[1u];
+    let row = i / n;
+    let col = i % n;
+    let base = row * k;
+    var acc = 0.0;
+    for (var c = 0u; c < k; c = c + 1u) {
+        acc = fma(lhs[base + c], rhs[c * n + col], acc);
+    }
+    output[i] = acc;
+}
+"#;
+
+/// `batched_matmul` (T2c): `[B,H,S,D] x [B,H,D,T] -> [B,H,S,T]`, one
+/// invocation per output element; the slice (batch,head) index, row and
+/// column are recovered from the flat output index, and the K
+/// contraction accumulates ascending with one `fma` request per term
+/// (same contract as `matmul`). Params: `[S, T, K, lhs_slice_stride,
+/// rhs_slice_stride]` where the slice strides are `S*D` and `D*T`.
+/// Bindings: lhs, rhs, output, params.
+pub const BATCHED_MATMUL: &str = r#"
+@group(0) @binding(0) var<storage, read> lhs: array<f32>;
+@group(0) @binding(1) var<storage, read> rhs: array<f32>;
+@group(0) @binding(2) var<storage, read_write> output: array<f32>;
+@group(0) @binding(3) var<storage, read> params: array<u32>;
+
+@compute @workgroup_size(256)
+fn batched_matmul(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= arrayLength(&output)) { return; }
+    let s_dim = params[0u];
+    let t_dim = params[1u];
+    let k = params[2u];
+    let lstride = params[3u];
+    let rstride = params[4u];
+    let t = i % t_dim;
+    let st = i / t_dim;
+    let s = st % s_dim;
+    let slice = st / s_dim;
+    let lhs_base = slice * lstride + s * k;
+    let rhs_base = slice * rstride + t;
+    var acc = 0.0;
+    for (var c = 0u; c < k; c = c + 1u) {
+        acc = fma(lhs[lhs_base + c], rhs[rhs_base + c * t_dim], acc);
+    }
+    output[i] = acc;
+}
+"#;

@@ -6,6 +6,51 @@ follows [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+### Fixed — T2c review round 1
+
+- Overflow-class shapes panicked before the zero could matter (r1 P1):
+  `[MAX,MAX,MAX,0] x [MAX,MAX,0,0]` overflowed u64 computing `B*H*S`
+  BEFORE multiplying by the trailing zero — the "widened" product still
+  overflowed. `dim_product` now scans for a zero dimension FIRST (any
+  zero → empty output, exact), then checked-multiplies; all-nonzero
+  products that exceed u64 reject with a named error (the gate rejects
+  them as > u32::MAX anyway).
+- Public `BatchedMatMul::params` panicked on overflowing u32 stride
+  products (r1 P2 — the method is public with no documented
+  precondition): stride products are now zero-aware (a zero factor →
+  stride 0, unused) and checked — overflow rejects. The entry path
+  cannot reach the overflow (span checks bound S*D <= u32::MAX); the
+  defense is for direct calls.
+- Coverage added: H=0 and S=0 empty-output arms, the two overflow
+  regressions (CPU-only, ErrBackend), and a second-call cache+correct
+  assertion.
+
+### Added — T2c: GEMM kernels (feature `gpu`)
+
+- `matmul` (`[M,K] x [K,N] -> [M,N]`) and `batched_matmul`
+  (`[B,H,S,D] x [B,H,D,T] -> [B,H,S,T]`) as FixedOrderGemm kernels:
+  one invocation per output element, K contraction strictly ascending,
+  one `fma` request per term — the CPU reference's accumulation order
+  and term granularity. The batch/head walk and the output-element
+  parallelism add no accumulation. Guards before indexing (the #74 r1
+  lesson applied from the start): missing-shape and wrong-rank calls
+  reject without panicking (CPU-only `ErrBackend` regressions);
+  u64-widened output counts.
+- Empty-output contracts: `M`/`N`/`B`/`H`/`S`/`T` zero writes nothing;
+  `K`/`D` zero produces an all-zero output (an empty contraction
+  accumulates to `0.0`, matching the CPU loop).
+- CPU gemm term granularity switched to one `mul_add` request per term
+  (the same explicit-fusion request as T2b's reductions; existing T1
+  fixtures are exact-product cases — unaffected).
+- 11-test `gpu_l2` suite: independent triple-loop oracles, order
+  sensitivity (ascending-vs-descending K differs in bits — pinned),
+  empty/zero-dimension contracts, mismatch rejections, determinism,
+  pipeline cache. Mutation-verified: reversed K order and swapped
+  batched slice strides each fail their oracle.
+- GEMM has no architecture-precision tail op: outputs compare
+  bit-exact (empirically, for tested fixtures, on stacks that pass the
+  `fma` semantics probe).
+
 ### Fixed — T2b review round 2
 
 - The "same rounding sequence by construction" claim was false (r2 P1,

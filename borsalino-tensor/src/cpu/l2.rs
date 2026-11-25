@@ -96,9 +96,16 @@ impl Executable for BatchedMatMul {
 fn gemm(lhs: &[f32], rhs: &[f32], output: &mut [f32], m: usize, k: usize, n: usize) {
     for row in 0..m {
         for column in 0..n {
+            // One fused multiply-add request per term, ascending in K —
+            // the same request the GPU kernel makes via `fma` (T2c,
+            // following T2b): drivers contract `acc + a*b` into an FMA,
+            // so both sides request the fused operation explicitly.
+            // Whether a given backend rounds once is checked by the
+            // GPU-side semantics probe — not guaranteed here.
             let mut accumulation = 0.0f32;
             for contracted in 0..k {
-                accumulation += lhs[row * k + contracted] * rhs[contracted * n + column];
+                accumulation =
+                    lhs[row * k + contracted].mul_add(rhs[contracted * n + column], accumulation);
             }
             output[row * n + column] = accumulation;
         }
