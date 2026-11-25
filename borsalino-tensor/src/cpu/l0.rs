@@ -160,7 +160,7 @@ fn binary<O: crate::op::TensorOp>(
 /// A missing leading axis broadcasts, and a `1` broadcasts — both become a
 /// stride of zero, which is what turns "repeat this element" into plain
 /// indexing.
-fn broadcast_strides(shape: &Shape, rank: usize) -> Vec<i64> {
+pub(crate) fn broadcast_strides(shape: &Shape, rank: usize) -> Vec<i64> {
     let offset = rank - shape.rank();
     let strides = shape.row_major_strides();
     let mut effective = vec![0i64; rank];

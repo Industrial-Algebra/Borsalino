@@ -189,6 +189,10 @@ mod vulkan;
 
 pub use error::{GpuError, Result};
 
+/// Re-exported so external [`GpuBackend`] implementors can name the
+/// `Pod` bound without matching borsalino's bytemuck version.
+pub use bytemuck;
+
 // ── Memory strategy ───────────────────────────────────────────────
 
 /// Memory allocation strategy for GPU buffers.

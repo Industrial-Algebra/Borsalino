@@ -385,44 +385,46 @@ fn gpu_executor_rejects_arity_and_dtype_bypass() {
         Err(TensorError::GpuDispatch { op, .. }) => assert_eq!(op, "add"),
         other => panic!("binary op at the unary entry must reject, got {other:?}"),
     }
-    match tg.execute_binary::<Relu>(&input, &input, 8, &[&shape]) {
-        Err(TensorError::GpuDispatch { op, .. }) => assert_eq!(op, "relu"),
-        other => panic!("unary op at the binary entry must reject, got {other:?}"),
-    }
+    // The reverse direction (a unary or mixed-dtype op at the binary
+    // entry — r2/r3's runtime rejections) is now a COMPILE-TIME error:
+    // execute_binary is bounded by BroadcastKernel, which only the
+    // 2-input all-f32 Broadcast-rule ops implement. Unrepresentable
+    // beats rejected; the runtime arms above cover what types cannot.
+    // (execute_binary::<Relu> and execute_binary::<Gather> no longer
+    // compile.)
 
-    // The generic f32 entry must refuse gather (its index port is u32 —
-    // same 4-byte width, so span checks alone cannot tell): this call
-    // previously dispatched Unchecked reads bypassing index validation.
-    match tg.execute_binary::<borsalino_tensor::ops::l0::Gather>(
+    // Binary arity excess still rejects at runtime: 3 shapes for a
+    // 2-input op.
+    match tg.execute_binary::<borsalino_tensor::ops::l0::Add>(
         &input,
-        &[0.0; 8],
+        &input,
         8,
-        &[&shape, &shape],
+        &[&shape, &shape, &shape],
     ) {
-        Err(TensorError::GpuDispatch { op, .. }) => assert_eq!(op, "gather"),
-        other => panic!("mixed-dtype op must reject at the generic entry, got {other:?}"),
+        Err(TensorError::GpuDispatch { op, .. }) => assert_eq!(op, "add"),
+        other => panic!("binary arity mismatch must reject, got {other:?}"),
     }
 }
 
-/// r2 P1 regression: broadcasting passes the op's shape rule but these
-/// kernels read elementwise — reject instead of reading past a short
-/// operand.
+/// r2 P1 regression, flipped by T2b: broadcasting USED to reject (the
+/// kernels read elementwise); it now executes stride-mapped. The
+/// equality and determinism oracles live in `gpu_l1.rs`; this test
+/// pins the flip itself — the exact call that rejected now succeeds
+/// with the correct broadcast result.
 #[test]
 #[serial_test::serial]
-fn gpu_executor_rejects_broadcasting() {
+fn gpu_executor_broadcast_path_executes() {
     let Some(g) = gpu() else { return };
     let mut tg = TensorGpu::new(g);
     let n = Shape::new(&[8]).expect("fixture");
     let one = Shape::new(&[1]).expect("fixture");
-    let lhs = vec![1.0f32; 8];
-    let rhs = vec![2.0f32; 1]; // [1] broadcasts to [8] on CPU
-    match tg.execute_binary::<Add>(&lhs, &rhs, 8, &[&n, &one]) {
-        Err(TensorError::GpuDispatch { op, message }) => {
-            assert_eq!(op, "add");
-            assert!(message.contains("broadcasting"), "{message}");
-        }
-        other => panic!("broadcast must reject, got {other:?}"),
-    }
+    let lhs: Vec<f32> = (0..8).map(|i| i as f32 * 0.5).collect();
+    let rhs = vec![2.0f32; 1]; // [1] broadcasts to [8]
+    let got = tg
+        .execute_binary::<Add>(&lhs, &rhs, 8, &[&n, &one])
+        .expect("broadcast now executes");
+    let expected: Vec<f32> = lhs.iter().map(|&x| x + 2.0).collect();
+    assert_eq!(bits(&got), bits(&expected));
 }
 
 #[test]
