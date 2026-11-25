@@ -14,8 +14,9 @@
 //! one invocation per output element, with one `fma` request per
 //! mul-into-add term — WGSL promises nothing about contraction OR
 //! about `fma` being single-rounded (accuracy "inherited from
-//! e1*e2+e3"); the accumulator contract is enforced per stack by the
-//! backend semantics probe (see [`super`]).
+//! e1*e2+e3"). Per-stack evidence, and its limits, are documented in
+//! [`super`]: the probe checks a standalone kernel; the oracle tests
+//! compare final outputs.
 //! That forecloses intra-axis parallelism (a tree or chunked split is
 //! a different parenthesization, hence different bits); parallelism is
 //! across output rows/columns, where it is free.
@@ -270,7 +271,8 @@ fn rowwise_l2_norm(@builtin(global_invocation_id) gid: vec3<u32>) {
 /// `(batch, column)` pair. Both the mask weight and the weighted sum
 /// accumulate strictly left-to-right over the token axis — the same
 /// single order the CPU reference pins for both — one explicit `fma`
-/// per term (the same cross-device fusion pin as rowwise_l2_norm). An all-zero mask row
+/// per term (the same `fma` request as rowwise_l2_norm — see the
+/// module docs for what that does and does not guarantee). An all-zero mask row
 /// defines the mean as zero, never NaN. Params: `[S, D]`. Bindings:
 /// values, mask, output, params.
 pub const MASKED_MEAN: &str = r#"

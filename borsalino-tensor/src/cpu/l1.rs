@@ -88,11 +88,12 @@ impl Executable for RowwiseL2Norm {
 
         let width = values.layout.shape().dims()[1] as usize;
         for (row, slot) in output.iter_mut().enumerate() {
-            // Term granularity is one fused multiply-add (single
-            // rounding): GPU drivers contract `acc + a*b` into an FMA,
-            // so the only way to pin identical bits cross-device is to
-            // make the fusion EXPLICIT on both sides (T2b). The
-            // left-to-right order is unchanged.
+            // Term granularity is one fused multiply-add request:
+            // GPU drivers contract `acc + a*b` into an FMA, so both
+            // sides request the fused operation explicitly (T2b).
+            // Whether a given backend actually rounds once is checked
+            // by the GPU-side semantics probe — not guaranteed here.
+            // The left-to-right order is unchanged.
             let mut sum_of_squares = 0.0f32;
             for &value in &values.data[row * width..][..width] {
                 sum_of_squares = value.mul_add(value, sum_of_squares);
@@ -137,8 +138,9 @@ impl Executable for MaskedMean {
                 weight += mask.data[index * tokens + token];
             }
             for column in 0..width {
-                // Fused per term — same rationale as rowwise_l2_norm:
-                // explicit FMA on both sides, order unchanged.
+                // Fused per term — same rationale and same caveat as
+                // rowwise_l2_norm: the fusion is requested on both
+                // sides, order unchanged.
                 let mut weighted = 0.0f32;
                 for token in 0..tokens {
                     let at = index * tokens + token;

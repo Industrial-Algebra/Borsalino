@@ -34,9 +34,10 @@ follows [Semantic Versioning](https://semver.org).
   tests pin all three reproductions (no GPU needed — the reviewer's
   technique, made permanent).
 - Documentation no longer claims WGSL forbids reassociation/fusion (it
-  promises nothing of the kind — r1 P1): bit-equality rests on the
-  explicit `fma`/`mul_add` pairing (one specified IEEE operation per
-  term, both sides) and is oracle-verified per stack.
+  promises nothing of the kind — r1 P1): both sides request the fused
+  operation explicitly, and the evidence is empirical — the standalone
+  semantics probe plus fixture oracles (r3/r4 scoped the wording
+  further).
 - Precision docs now include BroadcastDiv's finite results in the
   architecture-precision seam, and mark the ulp bounds as observed on
   this stack rather than portable guarantees (r1 P2).

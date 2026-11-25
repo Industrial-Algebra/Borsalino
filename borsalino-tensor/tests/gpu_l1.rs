@@ -572,11 +572,14 @@ fn gpu_reduction_entries_reject_malformed_shapes_without_panicking() {
 
 /// Backend `fma` semantics probe (r2 P1): WGSL permits a backend to
 /// evaluate `fma` unfused (accuracy "inherited from e1*e2+e3"), and
-/// naga cannot request NoContraction — so accumulator bit-equality is
-/// a PER-STACK property. This probe enforces it: adjacent floats
+/// naga cannot request NoContraction — so fused-term evaluation is a
+/// PER-STACK property. This probe checks it in a STANDALONE kernel:
+/// adjacent floats
 /// x = 1+2⁻²³, y = 1-2⁻²³, z = -1 have fused result exactly -2⁻⁴⁶ and
 /// unfused result exactly 0. A stack whose `fma` is unfused fails
-/// here — and thereby the accumulator contract of the reductions.
+/// here; the reduction oracles compare final outputs (ulp-bounded
+/// where division/sqrt tails apply), so THIS probe is the direct
+/// check of the fused-term property.
 #[test]
 #[serial_test::serial]
 fn gpu_fma_backend_semantics_probe() {
