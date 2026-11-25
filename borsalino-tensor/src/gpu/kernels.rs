@@ -242,9 +242,9 @@ fn max() {
 /// `rowwise_l2_norm` (T2b): `[R, C] -> [R]`, one invocation per row
 /// (parallel across rows), sequential accumulation across the row,
 /// `sqrt` at the end (architecture-precision — see the module docs).
-/// Per term: one EXPLICIT `fma` — matching the CPU reference's
-/// `mul_add`; drivers contract mul-into-add anyway, so the fusion is
-/// made explicit on both sides to pin identical bits. Params: `[C]`.
+/// Per term: one `fma` request — the same request the CPU reference
+/// makes via `mul_add`; see the module docs for what that does and
+/// does not guarantee. Params: `[C]`.
 /// Bindings: input, output, params.
 pub const ROWWISE_L2_NORM: &str = r#"
 @group(0) @binding(0) var<storage, read> input: array<f32>;

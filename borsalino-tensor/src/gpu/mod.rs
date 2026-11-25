@@ -28,13 +28,16 @@
 //!   legally evaluate it as separate rounded operations.
 //!
 //! There is therefore NO spec-level guarantee of accumulator
-//! bit-equality. What exists is per-stack enforcement: the
-//! `gpu_fma_backend_semantics_probe` test compiles a discriminator
-//! kernel (inputs whose fused result is `−2⁻⁴⁶` and whose unfused
-//! result is `0`) and requires the single-rounded answer — a stack
-//! whose `fma` is unfused fails the probe and thereby the accumulator
-//! contract. The reduction oracles then verify the full rounding
-//! sequence on stacks that pass.
+//! bit-equality. What exists is per-stack evidence, and it is exactly
+//! as strong as the tests: the `gpu_fma_backend_semantics_probe`
+//! requires the single-rounded answer from a standalone discriminator
+//! kernel (fused `−2⁻⁴⁶` vs unfused `0`), and the reduction oracle
+//! tests compare FINAL OUTPUTS — bit-exact for the ops with no
+//! architecture-precision tail op (`sum`, `max`), ulp-bounded for
+//! `masked_mean`/`rowwise_l2_norm` (whose division/sqrt tails could
+//! mask a sub-ulp accumulator deviation). Accumulator bit-equality is
+//! claimed for the tested fixtures and the probed `fma` semantics —
+//! not verified as a full rounding sequence.
 //! The order-preserving structure forecloses intra-axis parallelism (a
 //! tree or chunked split is a different parenthesization, hence
 //! different bits); parallelism is across output rows, where it is
@@ -67,9 +70,9 @@
 //! the CPU emits the canonical quiet NaN — NaN results compare by
 //! class, never by bits. Everything else (add/mul, broadcast mapping,
 //! gather, transpose, `sum`, `max`, and the reduction accumulations)
-//! is bit-exact against the CPU oracle on the normal range — as
-//! oracle-verified fact on stacks that pass the `fma` semantics probe,
-//! not spec promise.
+//! is bit-exact against the CPU oracle on the normal range for the
+//! tested fixtures — empirical fact on this stack (which passes the
+//! `fma` semantics probe), not spec promise.
 //!
 //! # Subnormal policy (FTZ/DAZ) — the first GPU equivalence seam
 //!

@@ -16,8 +16,11 @@ follows [Semantic Versioning](https://semver.org).
   accumulator guarantee; instead the `gpu_fma_backend_semantics_probe`
   test compiles the discriminator kernel through the backend and
   REQUIRES the single-rounded answer — a stack with unfused `fma`
-  fails the probe and thereby the accumulator contract. The 5080
-  passes (single-rounded, as the oracle equality already implied).
+  fails the probe. The 5080 passes (single-rounded). The probe checks
+  a STANDALONE kernel; the reduction oracle tests compare final
+  outputs (ulp-bounded where division/sqrt tails could mask sub-ulp
+  accumulator deviations) — accumulator equality is claimed for the
+  tested fixtures, not verified as a full rounding sequence.
 - bytemuck re-export moved out of the determinism module's doc block
   (r2 P3).
 
@@ -63,10 +66,12 @@ follows [Semantic Versioning](https://semver.org).
   outputs skip dispatch).
 - **Term granularity is now one fused multiply-add** in
   `masked_mean`/`rowwise_l2_norm` accumulations — WGSL `fma`, CPU
-  `mul_add`. WGSL makes no promise about contraction; making the fusion
-  explicit on both sides means each term is ONE specified IEEE fused
-  operation on both sides, so the same rounding sequence holds by
-  construction (oracle-verified per stack). Order unchanged; CPU T1
+  `mul_add`. WGSL guarantees nothing about contraction or `fma`
+  rounding (accuracy "inherited from e1*e2+e3"); both sides REQUEST
+  the fused operation so a conforming single-rounding backend computes
+  the same values, and the backend semantics probe checks that
+  property per stack. Accumulator equality is empirical (probe +
+  fixture oracles), not a spec guarantee. Order unchanged; CPU T1
   tests unaffected (their fixtures are exact-product cases).
 - **New GPU equivalence seam, documented in the `gpu` module docs**:
   f32 division and `sqrt` are architecture-precision on this stack
