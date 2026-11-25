@@ -420,7 +420,7 @@ fn dim_product(dims: &[u32]) -> Result<u64, TensorError> {
     // regardless of the others — [MAX,MAX,MAX,0] must reach the
     // empty-output early return, not overflow computing MAX^3 before
     // meeting the zero.
-    if dims.iter().any(|&dim| dim == 0) {
+    if dims.contains(&0) {
         return Ok(0);
     }
     let mut product: u64 = 1;
