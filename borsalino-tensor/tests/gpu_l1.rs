@@ -12,6 +12,7 @@
 
 #![cfg(feature = "gpu")]
 
+use borsalino::GpuBackend as _;
 use borsalino_tensor::error::TensorError;
 use borsalino_tensor::gpu::TensorGpu;
 use borsalino_tensor::layout::Shape;
@@ -566,6 +567,49 @@ fn gpu_reduction_entries_reject_malformed_shapes_without_panicking() {
     assert!(
         matches!(r, Ok(Err(TensorError::RankMismatch { .. }))),
         "rank-0 must reject, got {r:?}"
+    );
+}
+
+/// Backend `fma` semantics probe (r2 P1): WGSL permits a backend to
+/// evaluate `fma` unfused (accuracy "inherited from e1*e2+e3"), and
+/// naga cannot request NoContraction — so accumulator bit-equality is
+/// a PER-STACK property. This probe enforces it: adjacent floats
+/// x = 1+2⁻²³, y = 1-2⁻²³, z = -1 have fused result exactly -2⁻⁴⁶ and
+/// unfused result exactly 0. A stack whose `fma` is unfused fails
+/// here — and thereby the accumulator contract of the reductions.
+#[test]
+#[serial_test::serial]
+fn gpu_fma_backend_semantics_probe() {
+    let Some(backend) = gpu() else { return };
+    const PROBE: &str = r#"
+@group(0) @binding(0) var<storage, read> xyz: array<f32>;
+@group(0) @binding(1) var<storage, read_write> out: array<f32>;
+
+@compute @workgroup_size(1)
+fn probe() {
+    out[0] = fma(xyz[0], xyz[1], xyz[2]);
+}
+"#;
+    let x = 1.0f32 + 2.0f32.powi(-23);
+    let y = 1.0f32 - 2.0f32.powi(-23);
+    let z = -1.0f32;
+    // Fixture self-check: the two evaluation strategies differ in bits.
+    let fused = x.mul_add(y, z);
+    let unfused = x * y + z;
+    assert_eq!(fused.to_bits(), (-2.0f32.powi(-46)).to_bits());
+    assert_eq!(unfused.to_bits(), 0);
+
+    let pipeline = backend.compile("probe", PROBE).expect("compile");
+    let input = backend.create_buffer(&[x, y, z]).expect("buffer");
+    let output = backend.create_buffer_uninit::<f32>(1).expect("buffer");
+    backend
+        .dispatch(&pipeline, &[&input, &output], (1, 1, 1))
+        .expect("dispatch");
+    let got: Vec<f32> = backend.read_buffer(&output).expect("read");
+    assert_eq!(
+        got[0].to_bits(),
+        fused.to_bits(),
+        "backend fma is unfused — accumulator contract does not hold on this stack"
     );
 }
 

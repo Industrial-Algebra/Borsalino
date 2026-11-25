@@ -16,14 +16,25 @@
 //! and the fixed-order reductions (`sum`, `max`, `rowwise_l2_norm`,
 //! `masked_mean`). Reduction kernels preserve the CPU reference's
 //! accumulation order: one invocation per output element, accumulating
-//! strictly left-to-right, one **explicit fused multiply-add per term**
-//! (`fma` in WGSL, `mul_add` on the CPU). WGSL makes NO promise that a
-//! compiler will not contract `acc + a*b` into an FMA — which is
-//! precisely why the fusion is explicit on both sides: `fma` and
-//! `mul_add` each denote ONE IEEE-754 fused operation with a single
-//! rounding, so both sides compute the same rounding sequence by
-//! construction rather than by compiler grace. Bit-equality is then
-//! VERIFIED per stack by the oracle tests, not assumed from the spec.
+//! strictly left-to-right, one **fused multiply-add request per term**
+//! (`fma` in WGSL, `mul_add` on the CPU). Two spec facts shape the
+//! contract:
+//!
+//! - WGSL does not forbid contracting `acc + a*b` into an FMA — which
+//!   is why the fusion is requested EXPLICITLY on both sides instead of
+//!   left to the compiler.
+//! - WGSL does not guarantee `fma` is single-rounded either: its
+//!   accuracy is "inherited from `e1 * e2 + e3`", so a backend may
+//!   legally evaluate it as separate rounded operations.
+//!
+//! There is therefore NO spec-level guarantee of accumulator
+//! bit-equality. What exists is per-stack enforcement: the
+//! `gpu_fma_backend_semantics_probe` test compiles a discriminator
+//! kernel (inputs whose fused result is `−2⁻⁴⁶` and whose unfused
+//! result is `0`) and requires the single-rounded answer — a stack
+//! whose `fma` is unfused fails the probe and thereby the accumulator
+//! contract. The reduction oracles then verify the full rounding
+//! sequence on stacks that pass.
 //! The order-preserving structure forecloses intra-axis parallelism (a
 //! tree or chunked split is a different parenthesization, hence
 //! different bits); parallelism is across output rows, where it is
@@ -56,8 +67,9 @@
 //! the CPU emits the canonical quiet NaN — NaN results compare by
 //! class, never by bits. Everything else (add/mul, broadcast mapping,
 //! gather, transpose, `sum`, `max`, and the reduction accumulations)
-//! is bit-exact against the CPU oracle on the normal range — again as
-//! oracle-verified fact, not spec promise.
+//! is bit-exact against the CPU oracle on the normal range — as
+//! oracle-verified fact on stacks that pass the `fma` semantics probe,
+//! not spec promise.
 //!
 //! # Subnormal policy (FTZ/DAZ) — the first GPU equivalence seam
 //!

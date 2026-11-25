@@ -112,10 +112,6 @@ mod kani_harnesses;
 /// Statistical determinism verification for GPU kernels.
 ///
 /// See [`determinism`] module docs for the determinism protocol.
-/// Re-exported so external [`GpuBackend`] implementors can name the
-/// `Pod` bound without matching borsalino's bytemuck version.
-pub use bytemuck;
-
 pub mod determinism;
 
 /// Reusable WGSL kernels for the Industrial Algebra ecosystem.
@@ -192,6 +188,10 @@ fn gp_batched(@builtin(global_invocation_id) gid: vec3<u32>) {
 mod vulkan;
 
 pub use error::{GpuError, Result};
+
+/// Re-exported so external [`GpuBackend`] implementors can name the
+/// `Pod` bound without matching borsalino's bytemuck version.
+pub use bytemuck;
 
 // ── Memory strategy ───────────────────────────────────────────────
 

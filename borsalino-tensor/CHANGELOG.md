@@ -6,6 +6,21 @@ follows [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+### Fixed — T2b review round 2
+
+- The "same rounding sequence by construction" claim was false (r2 P1,
+  reopened with spec evidence): WGSL's `fma` accuracy is "inherited
+  from e1*e2+e3" — a backend may LEGALLY evaluate it unfused
+  (discriminator: x=1+2⁻²³, y=1-2⁻²³, z=-1 → fused exactly -2⁻⁴⁶,
+  unfused exactly 0). The docs now state there is NO spec-level
+  accumulator guarantee; instead the `gpu_fma_backend_semantics_probe`
+  test compiles the discriminator kernel through the backend and
+  REQUIRES the single-rounded answer — a stack with unfused `fma`
+  fails the probe and thereby the accumulator contract. The 5080
+  passes (single-rounded, as the oracle equality already implied).
+- bytemuck re-export moved out of the determinism module's doc block
+  (r2 P3).
+
 ### Fixed — T2b review round 1
 
 - Reduction entries indexed shapes before validating them (r1 P1):
