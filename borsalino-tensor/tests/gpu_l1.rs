@@ -303,7 +303,7 @@ fn gpu_max_of_empty_input_rejects() {
 }
 
 /// `rowwise_l2_norm`: parallel across rows (37 rows — partial final
-/// workgroup), sequential within. Bit-exact vs the hand-rolled
+/// workgroup), sequential within. Compared against the hand-rolled
 /// per-row loop.
 #[test]
 #[serial_test::serial]
@@ -328,10 +328,12 @@ fn gpu_rowwise_l2_norm_matches_oracle() {
             sos.sqrt()
         })
         .collect();
-    // The accumulation is fused and bit-exact; the final `sqrt` is
-    // architecture-precision (this driver's approx sqrt rounds up to
-    // 2 ulp off the correctly rounded result). Determinism is pinned
-    // separately (repeat-dispatch, identical bits).
+    // Final-output comparison, ulp-bounded: the accumulation is
+    // EXPECTED to match term-for-term (fused requests on both sides,
+    // per the probe), but this comparison observes only the output —
+    // the architecture-precision `sqrt` tail (up to 2 ulp on this
+    // driver) could mask a sub-ulp accumulator deviation. Determinism
+    // is pinned separately (repeat-dispatch, identical bits).
     for (gpu, cpu) in got.iter().zip(&expected) {
         assert!(ulps(*gpu, *cpu) <= 2, "sqrt seam: {gpu} vs {cpu}");
     }
@@ -350,7 +352,8 @@ fn gpu_rowwise_l2_norm_zero_rows_is_empty() {
 
 /// `masked_mean`: `[B,S,D] + [B,S] -> [B,D]` with mask rows that are
 /// fully zero (mean defined as 0.0, never NaN) and partially zero.
-/// Bit-exact vs the hand-rolled double loop.
+/// Compared against the hand-rolled double loop (ulp-bounded — see the
+/// comparison below; the division tail bounds what it can observe).
 #[test]
 #[serial_test::serial]
 fn gpu_masked_mean_matches_oracle_including_zero_rows() {
