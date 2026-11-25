@@ -43,6 +43,13 @@
 //! different bits); parallelism is across output rows, where it is
 //! free.
 //!
+//! T2c adds the GEMM pair (`matmul`, `batched_matmul`) — one invocation
+//! per output element, the K contraction strictly ascending, one `fma`
+//! request per term: the CPU reference's accumulation order and term
+//! granularity (FixedOrderGemm). Both the batch/head walk and the
+//! parallelism across output elements add no accumulation, so neither
+//! can change a bit pattern.
+//!
 //! The layer is thin by design: buffer lifetimes are per-call (created,
 //! dispatched, read back), matching the verification harness. Buffer
 //! reuse, manifest-driven zero-copy weight binding, and the Katakuri
@@ -57,7 +64,9 @@
 //!   correctly-rounded result (`1e10 / 7` observed);
 //! - **`sqrt`** — up to two ulp off (RTX 5080, observed).
 //!
-//! Affected results: `masked_mean` (ends in `weighted / weight`),
+//! The GEMMs end in no tail op — their outputs compare bit-exact
+//! (empirically, for the tested fixtures, on stacks that pass the
+//! `fma` probe). Affected results: `masked_mean` (ends in `weighted / weight`),
 //! `rowwise_l2_norm` (ends in `sqrt`), and the FINITE results of
 //! `BroadcastDiv`/elementwise `div` (divisions whose exact quotient is
 //! representable still land bit-exact; others may round one ulp off).
@@ -695,6 +704,123 @@ impl<B: GpuBackend> TensorGpu<B> {
         let result: Vec<f32> = self.backend.read_buffer(&out_buf).map_err(gpu_err::<K>)?;
         Ok(result)
     }
+
+    /// Execute `matmul` (T2c): `[M,K] x [K,N] -> [M,N]`. One invocation
+    /// per output element, K contraction ascending, one `fma` request
+    /// per term — the CPU reference's accumulation order and term
+    /// granularity. An empty output (`M` or `N` zero) writes nothing;
+    /// `K` zero produces an all-zero output (an empty contraction
+    /// accumulates to `0.0`, matching the CPU loop).
+    pub fn execute_matmul(
+        &mut self,
+        lhs: &[f32],
+        rhs: &[f32],
+        input_shapes: &[&Shape],
+    ) -> Result<Vec<f32>, TensorError> {
+        type K = crate::ops::l2::MatMul;
+        // Guards BEFORE indexing (#74 r1's lesson, applied from the
+        // start): presence + rank on both ports, then a u64-widened
+        // output count.
+        for (port, expected) in [(0usize, 2usize), (1, 2)] {
+            let Some(shape) = input_shapes.get(port) else {
+                return Err(TensorError::GpuDispatch {
+                    op: K::NAME,
+                    message: format!("missing input shape for port {port}"),
+                });
+            };
+            if shape.rank() != expected {
+                return Err(TensorError::RankMismatch {
+                    op: K::NAME,
+                    port,
+                    expected: "rank 2",
+                    got: shape.rank(),
+                });
+            }
+        }
+        let m = input_shapes[0].dims()[0];
+        let n = input_shapes[1].dims()[1];
+        let out_shape = gate::<K>(
+            input_shapes,
+            &[lhs.len(), rhs.len()],
+            (u64::from(m) * u64::from(n)) as usize,
+        )?;
+        if out_shape.element_count() == 0 {
+            return Ok(Vec::new());
+        }
+        self.gemm_dispatch::<K>(lhs, rhs, input_shapes, &out_shape)
+    }
+
+    /// Execute `batched_matmul` (T2c): `[B,H,S,D] x [B,H,D,T] ->
+    /// `[B,H,S,T]`. One invocation per output element, per-slice
+    /// independent GEMM (the batch/head walk adds no accumulation), K
+    /// ascending, one `fma` request per term. Empty `B`, `H`, `S` or
+    /// `T` writes nothing; zero `D` produces all zeros.
+    pub fn execute_batched_matmul(
+        &mut self,
+        lhs: &[f32],
+        rhs: &[f32],
+        input_shapes: &[&Shape],
+    ) -> Result<Vec<f32>, TensorError> {
+        type K = crate::ops::l2::BatchedMatMul;
+        for (port, expected) in [(0usize, 4usize), (1, 4)] {
+            let Some(shape) = input_shapes.get(port) else {
+                return Err(TensorError::GpuDispatch {
+                    op: K::NAME,
+                    message: format!("missing input shape for port {port}"),
+                });
+            };
+            if shape.rank() != expected {
+                return Err(TensorError::RankMismatch {
+                    op: K::NAME,
+                    port,
+                    expected: "rank 4",
+                    got: shape.rank(),
+                });
+            }
+        }
+        let b = input_shapes[0].dims()[0];
+        let h = input_shapes[0].dims()[1];
+        let s = input_shapes[0].dims()[2];
+        let t = input_shapes[1].dims()[3];
+        let out_shape = gate::<K>(
+            input_shapes,
+            &[lhs.len(), rhs.len()],
+            (u64::from(b) * u64::from(h) * u64::from(s) * u64::from(t)) as usize,
+        )?;
+        if out_shape.element_count() == 0 {
+            return Ok(Vec::new());
+        }
+        self.gemm_dispatch::<K>(lhs, rhs, input_shapes, &out_shape)
+    }
+
+    /// Shared GEMM dispatch: params buffer, one dispatch over the flat
+    /// output count, readback.
+    fn gemm_dispatch<K: GpuKernel>(
+        &mut self,
+        lhs: &[f32],
+        rhs: &[f32],
+        input_shapes: &[&Shape],
+        out_shape: &Shape,
+    ) -> Result<Vec<f32>, TensorError> {
+        require_f32_ports::<K>()?;
+        let params = K::params(input_shapes)?;
+        let params_buf = self.backend.create_buffer(&params).map_err(gpu_err::<K>)?;
+        let out_len = usize::try_from(out_shape.element_count()).expect("gate caps at u32::MAX");
+        Self::ensure_pipeline::<K>(&self.backend, &mut self.pipelines)?;
+        let pipeline = self.pipelines.get(K::NAME).expect("just ensured");
+        let lhs_buf = self.backend.create_buffer(lhs).map_err(gpu_err::<K>)?;
+        let rhs_buf = self.backend.create_buffer(rhs).map_err(gpu_err::<K>)?;
+        let out_buf = self
+            .backend
+            .create_buffer_uninit::<f32>(out_len)
+            .map_err(gpu_err::<K>)?;
+        let buffers: Vec<&GpuBuffer> = vec![&lhs_buf, &rhs_buf, &out_buf, &params_buf];
+        self.backend
+            .dispatch(pipeline, &buffers, workgroup_count(out_len))
+            .map_err(gpu_err::<K>)?;
+        let result: Vec<f32> = self.backend.read_buffer(&out_buf).map_err(gpu_err::<K>)?;
+        Ok(result)
+    }
 }
 
 fn workgroup_count(n: usize) -> (u32, u32, u32) {
@@ -803,6 +929,60 @@ impl GpuKernel for crate::ops::l1::MaskedMean {
             });
         };
         Ok(vec![*tokens, *width])
+    }
+}
+
+impl GpuKernel for crate::ops::l2::MatMul {
+    const SOURCE: &'static str = kernels::MATMUL;
+    const ENTRY: &'static str = "matmul";
+
+    fn params(input_shapes: &[&Shape]) -> Result<Vec<u32>, TensorError> {
+        let Some(first) = input_shapes.first() else {
+            return Err(TensorError::GpuDispatch {
+                op: Self::NAME,
+                message: "params called without input shapes".to_string(),
+            });
+        };
+        let [_, k] = first.dims() else {
+            return Err(TensorError::RankMismatch {
+                op: Self::NAME,
+                port: 0,
+                expected: "rank 2",
+                got: first.rank(),
+            });
+        };
+        let n = match input_shapes.get(1) {
+            Some(second) => second.dims().get(1).copied().unwrap_or(0),
+            None => 0,
+        };
+        Ok(vec![*k, n])
+    }
+}
+
+impl GpuKernel for crate::ops::l2::BatchedMatMul {
+    const SOURCE: &'static str = kernels::BATCHED_MATMUL;
+    const ENTRY: &'static str = "batched_matmul";
+
+    fn params(input_shapes: &[&Shape]) -> Result<Vec<u32>, TensorError> {
+        let Some(first) = input_shapes.first() else {
+            return Err(TensorError::GpuDispatch {
+                op: Self::NAME,
+                message: "params called without input shapes".to_string(),
+            });
+        };
+        let [_, _, rows, inner] = first.dims() else {
+            return Err(TensorError::RankMismatch {
+                op: Self::NAME,
+                port: 0,
+                expected: "rank 4",
+                got: first.rank(),
+            });
+        };
+        let columns = match input_shapes.get(1) {
+            Some(second) => second.dims().get(3).copied().unwrap_or(0),
+            None => 0,
+        };
+        Ok(vec![*rows, columns, *inner, rows * inner, inner * columns])
     }
 }
 

@@ -25,7 +25,7 @@ fn reference_gemm(lhs: &[f32], rhs: &[f32], m: usize, k: usize, n: usize) -> Vec
         for column in 0..n {
             let mut total = 0.0f32;
             for contracted in 0..k {
-                total += lhs[row * k + contracted] * rhs[contracted * n + column];
+                total = lhs[row * k + contracted].mul_add(rhs[contracted * n + column], total);
             }
             out[row * n + column] = total;
         }

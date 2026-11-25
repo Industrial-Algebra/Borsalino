@@ -6,6 +6,32 @@ follows [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+### Added — T2c: GEMM kernels (feature `gpu`)
+
+- `matmul` (`[M,K] x [K,N] -> [M,N]`) and `batched_matmul`
+  (`[B,H,S,D] x [B,H,D,T] -> [B,H,S,T]`) as FixedOrderGemm kernels:
+  one invocation per output element, K contraction strictly ascending,
+  one `fma` request per term — the CPU reference's accumulation order
+  and term granularity. The batch/head walk and the output-element
+  parallelism add no accumulation. Guards before indexing (the #74 r1
+  lesson applied from the start): missing-shape and wrong-rank calls
+  reject without panicking (CPU-only `ErrBackend` regressions);
+  u64-widened output counts.
+- Empty-output contracts: `M`/`N`/`B`/`H`/`S`/`T` zero writes nothing;
+  `K`/`D` zero produces an all-zero output (an empty contraction
+  accumulates to `0.0`, matching the CPU loop).
+- CPU gemm term granularity switched to one `mul_add` request per term
+  (the same explicit-fusion request as T2b's reductions; existing T1
+  fixtures are exact-product cases — unaffected).
+- 11-test `gpu_l2` suite: independent triple-loop oracles, order
+  sensitivity (ascending-vs-descending K differs in bits — pinned),
+  empty/zero-dimension contracts, mismatch rejections, determinism,
+  pipeline cache. Mutation-verified: reversed K order and swapped
+  batched slice strides each fail their oracle.
+- GEMM has no architecture-precision tail op: outputs compare
+  bit-exact (empirically, for tested fixtures, on stacks that pass the
+  `fma` semantics probe).
+
 ### Fixed — T2b review round 2
 
 - The "same rounding sequence by construction" claim was false (r2 P1,
