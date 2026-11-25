@@ -309,13 +309,14 @@ fn gpu_gemm_pipelines_cache() {
     let data = [1.0f32; 16];
     let _ = tg.execute_matmul(&data, &data, &[&ls, &rs]).expect("warm");
     assert!(tg.pipelines().contains_key("matmul"));
-    // Second call reuses the cached pipeline and stays correct.
+    // Second call reuses the cached pipeline and stays CORRECT — the
+    // value assertion matters (r2 P3: a length check alone would pass
+    // on zeros): an all-ones 4x4 GEMM yields exactly 4.0 in every
+    // output.
     let again = tg
         .execute_matmul(&data, &data, &[&ls, &rs])
         .expect("second");
-    let first = &tg.pipelines();
-    let _ = first;
-    assert_eq!(again.len(), 16);
+    assert_eq!(bits(&again), bits(&[4.0f32; 16]));
     let bls = Shape::new(&[1, 1, 4, 4]).expect("fixture");
     let _ = tg
         .execute_batched_matmul(&data, &data, &[&bls, &bls])
